@@ -1,0 +1,22 @@
+[package]
+name = "engine"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy_ecs = "0.16"
+bytemuck = { version = "1.25", features = ["derive"] }
+glam = "0.30"
+ron = "0.8"
+serde = { version = "1", features = ["derive"] }
+pollster = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+wgpu = "27"
+winit = "0.30"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
