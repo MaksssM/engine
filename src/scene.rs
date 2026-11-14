@@ -70,6 +70,7 @@ impl Scene {
 pub struct SceneManager {
     scenes: HashMap<String, Scene>,
     active: Option<String>,
+    active_entities: Vec<Entity>,
 }
 
 impl SceneManager {
@@ -124,6 +125,23 @@ impl SceneManager {
         }
         Some(entities)
     }
+
+    pub fn spawn_active(&mut self, world: &mut bevy_ecs::world::World) -> Option<&[Entity]> {
+        let name = self.active.clone()?;
+        let entities = self.spawn_into(&name, world)?;
+        self.active_entities = entities;
+        Some(&self.active_entities)
+    }
+
+    pub fn active_entities(&self) -> &[Entity] {
+        &self.active_entities
+    }
+
+    pub fn unload_active(&mut self, world: &mut bevy_ecs::world::World) {
+        for entity in self.active_entities.drain(..) {
+            world.despawn(entity);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -136,6 +154,23 @@ mod tests {
         assert!(scene.validate().is_err());
         scene.entities[0].parent = Some(0);
         assert!(scene.validate().is_err());
+    }
+
+    #[test]
+    fn spawn_active_unloads_previous_entities() {
+        let mut manager = SceneManager::default();
+        let mut world = bevy_ecs::world::World::new();
+        manager.create("first").add_entity("first", Vec3::X, None);
+        manager.activate("first");
+        let first = manager.spawn_active(&mut world).unwrap()[0];
+        assert!(world.get::<Transform>(first).is_some());
+
+        manager.create("second").add_entity("second", Vec3::Y, None);
+        manager.activate("second");
+        manager.unload_active(&mut world);
+        assert!(world.get::<Transform>(first).is_none());
+        let second = manager.spawn_active(&mut world).unwrap()[0];
+        assert!(world.get::<Transform>(second).is_some());
     }
 
     #[test]

@@ -1,6 +1,15 @@
-use bevy_ecs::{entity::Entity, world::World};
+use bevy_ecs::{component::Component, entity::Entity, world::World};
 
 pub type EngineEntity = Entity;
+
+#[derive(Component, Clone, Debug, PartialEq)]
+pub struct Name(pub String);
+
+impl Default for Name {
+    fn default() -> Self {
+        Self("entity".into())
+    }
+}
 
 #[derive(Default)]
 pub struct Ecs {

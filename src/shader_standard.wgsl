@@ -2,8 +2,13 @@ struct Camera {
     view_proj: mat4x4<f32>,
 };
 
-struct Model { model: mat4x4<f32>, };
+struct Model {
+    model: mat4x4<f32>,
+    normal_matrix: mat4x4<f32>,
+};
 struct Light { view_proj: mat4x4<f32>, params: vec4<f32>, direction: vec4<f32>, };
+struct Material { color: vec4<f32>, };
+@group(3) @binding(0) var<uniform> material: Material;
 @group(2) @binding(0) var<uniform> light: Light;
 @group(2) @binding(1) var shadow_map: texture_depth_2d;
 @group(2) @binding(2) var shadow_sampler: sampler_comparison;
@@ -31,7 +36,7 @@ fn vs_main(
     output.position = camera.view_proj * model_data.model * vec4<f32>(position, 1.0);
     output.color = color;
     output.shadow_pos = light.view_proj * model_data.model * vec4<f32>(position, 1.0);
-    output.normal = normalize((transpose(inverse(model_data.model)) * vec4<f32>(normal, 0.0)).xyz);
+    output.normal = normalize((model_data.normal_matrix * vec4<f32>(normal, 0.0)).xyz);
     return output;
 }
 
@@ -52,5 +57,5 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let light_direction = normalize(-light.direction.xyz);
     let diffuse = max(dot(input.normal, light_direction), 0.0);
     let lighting = light.params.x + light.params.y * diffuse * visibility;
-    return vec4<f32>(input.color * lighting, 1.0);
+    return vec4<f32>(input.color * lighting * material.color.xyz, material.color.w);
 }

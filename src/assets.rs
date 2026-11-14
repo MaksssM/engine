@@ -59,6 +59,12 @@ impl<T, K: Eq + Hash> AssetManager<T, K> {
         handle
     }
 
+    pub fn replace(&mut self, key: &K, asset: T) -> Option<Handle<T>> {
+        let handle = self.paths.get(key).copied()?;
+        self.assets.insert(handle, Arc::new(asset));
+        Some(handle)
+    }
+
     pub fn get(&self, handle: Handle<T>) -> Option<Arc<T>> {
         self.assets.get(&handle).cloned()
     }
@@ -97,5 +103,19 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(assets.len(), 1);
         assert_eq!(&*assets.get(a).unwrap(), "sprite");
+        let replacement = assets.replace(&"hero".into(), "updated".into());
+        assert_eq!(replacement, Some(a));
+        assert_eq!(assets.get_ref(a).map(String::as_str), Some("updated"));
+        assert_eq!(assets.len(), 1);
+    }
+
+    #[test]
+    fn replace_keeps_handle_stable() {
+        let mut assets = AssetManager::<u32>::default();
+        let handle = assets.insert("value".into(), 1);
+        let replacement = assets.replace(&"value".into(), 2);
+        assert_eq!(replacement, Some(handle));
+        assert_eq!(assets.get(handle).as_deref(), Some(&2));
+        assert_eq!(assets.len(), 1);
     }
 }

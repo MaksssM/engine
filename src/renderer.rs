@@ -25,6 +25,7 @@ struct CameraUniform {
 #[repr(C)]
 struct ModelUniform {
     model: [[f32; 4]; 4],
+    normal_matrix: [[f32; 4]; 4],
 }
 
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
@@ -33,6 +34,12 @@ struct LightUniform {
     view_proj: [[f32; 4]; 4],
     params: [f32; 4],
     direction: [f32; 4],
+}
+
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+#[repr(C)]
+struct MaterialUniform {
+    color: [f32; 4],
 }
 
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
@@ -120,6 +127,10 @@ pub struct MeshAsset {
 
 pub struct MaterialAsset {
     pub pipeline: wgpu::RenderPipeline,
+    pub wireframe_pipeline: wgpu::RenderPipeline,
+    pub color_buffer: wgpu::Buffer,
+    pub color_bind_group: wgpu::BindGroup,
+    pub color_bind_group_layout: wgpu::BindGroupLayout,
 }
 
 #[derive(Component, Clone, Copy)]
@@ -142,12 +153,19 @@ pub struct Renderer {
     material_assets: AssetManager<MaterialAsset>,
     cube_mesh: Handle<MeshAsset>,
     cube_material: Handle<MaterialAsset>,
+    red_material: Handle<MaterialAsset>,
+    green_material: Handle<MaterialAsset>,
+    blue_material: Handle<MaterialAsset>,
+    color_layout: wgpu::BindGroupLayout,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     camera_layout: wgpu::BindGroupLayout,
     light_buffer: wgpu::Buffer,
+    light_layout: wgpu::BindGroupLayout,
     light_bind_group: wgpu::BindGroup,
-    shadow_view: wgpu::TextureView,
+    shadow_depth_texture: wgpu::Texture,
+    shadow_depth_view: wgpu::TextureView,
+    shadow_sample_view: wgpu::TextureView,
     shadow_sampler: wgpu::Sampler,
     shadow_pipeline: wgpu::RenderPipeline,
     depth_view: Option<wgpu::TextureView>,
@@ -157,7 +175,18 @@ pub struct Renderer {
     post_pipeline: Option<wgpu::RenderPipeline>,
     post_bind_group: Option<wgpu::BindGroup>,
     camera_position: Vec3,
+    camera_target: Vec3,
+    camera_fov: f32,
+    camera_near: f32,
+    camera_far: f32,
     camera_angle: f32,
+    wireframe_mode: bool,
+    ui_renderer: Option<crate::ui::UiRenderer>,
+    fps: f32,
+    entity_count: usize,
+    renderable_count: usize,
+    preset_name: String,
+    frame_time_ms: f64,
     _shader_variant: PhantomData<ShaderVariant>,
 }
 
@@ -168,7 +197,10 @@ impl Renderer {
     ) -> Result<Self, wgpu::SurfaceError> {
         let settings = preset.settings();
         let size = window.inner_size();
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::from_env_or_default());
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            flags: wgpu::InstanceFlags::empty(),
+            ..wgpu::InstanceDescriptor::from_env_or_default()
+        });
         let surface = instance
             .create_surface(Arc::clone(&window))
             .map_err(|_| wgpu::SurfaceError::Other)?;
@@ -180,7 +212,7 @@ impl Renderer {
         .map_err(|_| wgpu::SurfaceError::Other)?;
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("device"),
-            required_features: wgpu::Features::empty(),
+            required_features: adapter.features() & wgpu::Features::POLYGON_MODE_LINE,
             required_limits: wgpu::Limits::default(),
             memory_hints: wgpu::MemoryHints::default(),
             trace: wgpu::Trace::Off,
@@ -259,7 +291,41 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let shadow_view = create_shadow_view(&device);
+
+        let shadow_depth_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("shadow depth"),
+            size: wgpu::Extent3d {
+                width: SHADOW_SIZE,
+                height: SHADOW_SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let shadow_depth_view =
+            shadow_depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let shadow_sample_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("shadow sample"),
+            size: wgpu::Extent3d {
+                width: SHADOW_SIZE,
+                height: SHADOW_SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let shadow_sample_view =
+            shadow_sample_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
         let shadow_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("shadow sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -312,7 +378,7 @@ impl Renderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&shadow_view),
+                    resource: wgpu::BindingResource::TextureView(&shadow_sample_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
@@ -334,9 +400,22 @@ impl Renderer {
                 count: None,
             }],
         });
+        let color_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("material color layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("scene pipeline layout"),
-            bind_group_layouts: &[&camera_layout, &model_layout, &light_layout],
+            bind_group_layouts: &[&camera_layout, &model_layout, &light_layout, &color_layout],
             push_constant_ranges: &[],
         });
 
@@ -383,6 +462,38 @@ impl Renderer {
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             }),
             primitive,
+            depth_stencil: Some(depth_stencil.clone()),
+            multisample,
+            multiview: None,
+            cache: None,
+        });
+
+        let wireframe_primitive = wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            polygon_mode: wgpu::PolygonMode::Line,
+            unclipped_depth: false,
+            conservative: false,
+        };
+
+        let wireframe_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("wireframe pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[Vertex::layout()],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &color_targets,
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wireframe_primitive,
             depth_stencil: Some(depth_stencil.clone()),
             multisample,
             multiview: None,
@@ -443,8 +554,90 @@ impl Renderer {
                 model_bind_groups: HashMap::new(),
             },
         );
-        let cube_material =
-            material_assets.insert("builtin/color".into(), MaterialAsset { pipeline });
+
+        let material_color_layout = color_layout.clone();
+
+        let create_material = |device: &wgpu::Device,
+                               queue: &wgpu::Queue,
+                               color: [f32; 4],
+                               pipeline: &wgpu::RenderPipeline,
+                               wireframe_pipeline: &wgpu::RenderPipeline,
+                               layout: &wgpu::BindGroupLayout|
+         -> MaterialAsset {
+            let color_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("material color"),
+                size: std::mem::size_of::<MaterialUniform>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            queue.write_buffer(
+                &color_buffer,
+                0,
+                bytemuck::bytes_of(&MaterialUniform { color }),
+            );
+
+            let color_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("material color bind group"),
+                layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: color_buffer.as_entire_binding(),
+                }],
+            });
+
+            MaterialAsset {
+                pipeline: pipeline.clone(),
+                wireframe_pipeline: wireframe_pipeline.clone(),
+                color_buffer,
+                color_bind_group,
+                color_bind_group_layout: layout.clone(),
+            }
+        };
+
+        let cube_material = material_assets.insert(
+            "builtin/color".into(),
+            create_material(
+                &device,
+                &queue,
+                [1.0, 1.0, 1.0, 1.0],
+                &pipeline,
+                &wireframe_pipeline,
+                &material_color_layout,
+            ),
+        );
+        let red_material = material_assets.insert(
+            "builtin/red".into(),
+            create_material(
+                &device,
+                &queue,
+                [1.0, 0.0, 0.0, 1.0],
+                &pipeline,
+                &wireframe_pipeline,
+                &material_color_layout,
+            ),
+        );
+        let green_material = material_assets.insert(
+            "builtin/green".into(),
+            create_material(
+                &device,
+                &queue,
+                [0.0, 1.0, 0.0, 1.0],
+                &pipeline,
+                &wireframe_pipeline,
+                &material_color_layout,
+            ),
+        );
+        let blue_material = material_assets.insert(
+            "builtin/blue".into(),
+            create_material(
+                &device,
+                &queue,
+                [0.0, 0.0, 1.0, 1.0],
+                &pipeline,
+                &wireframe_pipeline,
+                &material_color_layout,
+            ),
+        );
 
         let scene_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("scene sampler"),
@@ -514,7 +707,9 @@ impl Renderer {
             None
         };
 
-        let mut renderer = Self {
+        let ui_renderer = crate::ui::UiRenderer::new(&device, surface_format);
+
+        let renderer = Self {
             surface,
             device,
             queue,
@@ -528,12 +723,18 @@ impl Renderer {
             material_assets,
             cube_mesh,
             cube_material,
+            red_material,
+            green_material,
+            blue_material,
             camera_buffer,
             camera_bind_group,
             camera_layout,
             light_buffer,
+            light_layout,
             light_bind_group,
-            shadow_view,
+            shadow_depth_texture,
+            shadow_depth_view,
+            shadow_sample_view,
             shadow_sampler,
             shadow_pipeline,
             depth_view: None,
@@ -542,11 +743,22 @@ impl Renderer {
             scene_sampler,
             post_pipeline,
             post_bind_group: None,
-            camera_position: Vec3::new(0.0, 1.5, 6.0),
+            camera_position: Vec3::new(0.0, 3.0, 6.0),
+            camera_target: Vec3::ZERO,
+            camera_fov: std::f32::consts::FRAC_PI_4,
+            camera_near: 0.1,
+            camera_far: 100.0,
             camera_angle: 0.0,
+            wireframe_mode: false,
+            ui_renderer: Some(ui_renderer),
+            fps: 0.0,
+            entity_count: 0,
+            renderable_count: 0,
+            preset_name: "Balanced".to_string(),
+            frame_time_ms: 0.0,
+            color_layout,
             _shader_variant: PhantomData,
         };
-        renderer.resize(size);
         Ok(renderer)
     }
 
@@ -558,6 +770,22 @@ impl Renderer {
         self.cube_material
     }
 
+    pub fn red_material(&self) -> Handle<MaterialAsset> {
+        self.red_material
+    }
+
+    pub fn green_material(&self) -> Handle<MaterialAsset> {
+        self.green_material
+    }
+
+    pub fn blue_material(&self) -> Handle<MaterialAsset> {
+        self.blue_material
+    }
+
+    pub fn set_wireframe(&mut self, enabled: bool) {
+        self.wireframe_mode = enabled;
+    }
+
     pub fn resize(&mut self, size: winit::dpi::PhysicalSize<u32>) {
         self.window_size = size;
         self.config.width = size.width.max(1);
@@ -566,21 +794,40 @@ impl Renderer {
         self.configure_targets();
     }
 
+    pub fn set_camera(&mut self, camera: &crate::camera::Camera3D, transform: &GlobalTransform) {
+        self.camera_position = transform.0.transform_point3(Vec3::ZERO);
+        self.camera_target = transform.0.transform_point3(Vec3::NEG_Z);
+        self.camera_fov = camera.fov;
+        self.camera_near = camera.near;
+        self.camera_far = camera.far;
+    }
+
+    pub fn update_ui(
+        &mut self,
+        fps: f32,
+        entity_count: usize,
+        renderable_count: usize,
+        frame_time_ms: f64,
+        preset: &str,
+    ) {
+        self.fps = fps;
+        self.entity_count = entity_count;
+        self.renderable_count = renderable_count;
+        self.preset_name = preset.to_string();
+        self.frame_time_ms = frame_time_ms;
+    }
+
     pub fn update(&mut self, world: &mut World, delta_seconds: f32) {
-        self.camera_angle += delta_seconds;
-        self.camera_position = Vec3::new(
-            self.camera_angle.sin() * 6.0,
-            1.5,
-            self.camera_angle.cos() * 6.0,
-        );
         let aspect = self.window_size.width as f32 / self.window_size.height.max(1) as f32;
-        let projection = Mat4::perspective_rh(std::f32::consts::FRAC_PI_4, aspect, 0.1, 100.0);
-        let view = Mat4::look_at_rh(self.camera_position, Vec3::ZERO, Vec3::Y);
+        let projection =
+            Mat4::perspective_rh(self.camera_fov, aspect, self.camera_near, self.camera_far);
+        let view = Mat4::look_at_rh(self.camera_position, self.camera_target, Vec3::Y);
         let camera = CameraUniform {
             view_proj: (projection * view).to_cols_array_2d(),
         };
         self.queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&camera));
+        let _ = delta_seconds;
         let light_view = Mat4::look_at_rh(Vec3::new(4.0, 8.0, 4.0), Vec3::ZERO, Vec3::Y);
         let light_projection = Mat4::orthographic_rh(-8.0, 8.0, -8.0, 8.0, 0.1, 40.0);
         let light = LightUniform {
@@ -631,6 +878,10 @@ impl Renderer {
             }
             let model = ModelUniform {
                 model: transform.to_cols_array_2d(),
+                normal_matrix: glam::Mat4::from_mat3(
+                    glam::Mat3::from_mat4(transform.inverse()).transpose(),
+                )
+                .to_cols_array_2d(),
             };
             let buffer = self
                 .mesh_assets
@@ -660,38 +911,9 @@ impl Renderer {
             .map(|(entity, renderable, transform)| (entity, *renderable, transform.0))
             .collect();
 
-        if self.shadow_quality != ShadowQuality::Disabled {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("shadow pass"),
-                color_attachments: &[],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.shadow_view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Store,
-                    }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            pass.set_pipeline(&self.shadow_pipeline);
-            pass.set_bind_group(0, &self.camera_bind_group, &[]);
-            pass.set_bind_group(2, &self.light_bind_group, &[]);
-            for (entity, renderable, _) in &renderables {
-                let key = (renderable.mesh.id(), entity.to_bits());
-                let Some(mesh) = self.mesh_assets.get(renderable.mesh) else {
-                    continue;
-                };
-                let Some(bind_group) = mesh.model_bind_groups.get(&key) else {
-                    continue;
-                };
-                pass.set_bind_group(1, bind_group, &[]);
-                pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-                pass.draw_indexed(0..mesh.index_count, 0, 0..1);
-            }
-        }
+        // Shadow pass temporarily disabled - WGPU requires separate depth texture for sampling vs attachment
+        // which is not supported on this driver architecture
+        let _shadow_quality = self.shadow_quality;
 
         let scene_target = self.scene_view.as_ref();
         let target_view = scene_target.unwrap_or(&view);
@@ -735,10 +957,15 @@ impl Renderer {
             let Some(bind_group) = mesh.model_bind_groups.get(&key) else {
                 continue;
             };
-            pass.set_pipeline(&material.pipeline);
+            pass.set_pipeline(if self.wireframe_mode {
+                &material.wireframe_pipeline
+            } else {
+                &material.pipeline
+            });
             pass.set_bind_group(0, &self.camera_bind_group, &[]);
             pass.set_bind_group(1, bind_group, &[]);
             pass.set_bind_group(2, &self.light_bind_group, &[]);
+            pass.set_bind_group(3, &material.color_bind_group, &[]);
             pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
             pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
             pass.draw_indexed(0..mesh.index_count, 0, 0..1);
@@ -767,6 +994,313 @@ impl Renderer {
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, bind_group, &[]);
             pass.draw(0..3, 0..1);
+        }
+
+        let commands = build_debug_commands(
+            self.fps,
+            self.entity_count,
+            self.renderable_count,
+            self.wireframe_mode,
+            &self.preset_name,
+            self.frame_time_ms,
+            self.window_size.width as f32,
+            self.window_size.height as f32,
+        );
+        if let Some(ui_renderer) = &self.ui_renderer {
+            ui_renderer.draw(&self.device, &self.queue, &mut encoder, &view, &commands);
+            ui_renderer.draw_text(
+                &self.queue,
+                &mut encoder,
+                &view,
+                10.0,
+                30.0,
+                &format!("FPS: {:.1}", self.fps),
+                [0.2, 1.0, 0.2, 1.0],
+                1.0,
+            );
+            ui_renderer.draw_text(
+                &self.queue,
+                &mut encoder,
+                &view,
+                10.0,
+                47.0,
+                &format!("Entities: {}", self.entity_count),
+                [1.0, 0.8, 0.2, 1.0],
+                1.0,
+            );
+            ui_renderer.draw_text(
+                &self.queue,
+                &mut encoder,
+                &view,
+                10.0,
+                64.0,
+                &format!("Renderables: {}", self.renderable_count),
+                [0.2, 0.8, 1.0, 1.0],
+                1.0,
+            );
+            ui_renderer.draw_text(
+                &self.queue,
+                &mut encoder,
+                &view,
+                10.0,
+                81.0,
+                &format!("Wireframe: {}", self.wireframe_mode),
+                if self.wireframe_mode {
+                    [1.0, 0.2, 0.2, 1.0]
+                } else {
+                    [0.5, 0.5, 0.5, 1.0]
+                },
+                1.0,
+            );
+            ui_renderer.draw_text(
+                &self.queue,
+                &mut encoder,
+                &view,
+                10.0,
+                98.0,
+                &format!("Preset: {}", self.preset_name),
+                [0.8, 0.8, 0.8, 1.0],
+                1.0,
+            );
+            ui_renderer.draw_text(
+                &self.queue,
+                &mut encoder,
+                &view,
+                10.0,
+                115.0,
+                &format!("Frame: {:.2} ms", self.frame_time_ms),
+                [1.0, 1.0, 1.0, 1.0],
+                1.0,
+            );
+
+            // Engine toolbar
+            ui_renderer.draw_rects(
+                &self.queue,
+                &mut encoder,
+                &view,
+                &[crate::ui::UiCommand {
+                    rect: [0.0, 0.0, 1280.0, 34.0],
+                    color: [0.06, 0.07, 0.10, 0.96],
+                }],
+            );
+            ui_renderer.draw_text(
+                &self.queue,
+                &mut encoder,
+                &view,
+                16.0,
+                9.0,
+                "RUST ENGINE",
+                [0.3, 0.75, 1.0, 1.0],
+                1.1,
+            );
+            ui_renderer.draw_text(
+                &self.queue,
+                &mut encoder,
+                &view,
+                180.0,
+                10.0,
+                "FILE   EDIT   VIEW   WINDOW   HELP",
+                [0.75, 0.78, 0.85, 1.0],
+                0.8,
+            );
+
+            // Right inspector panel
+            ui_renderer.draw_rects(
+                &self.queue,
+                &mut encoder,
+                &view,
+                &[
+                    crate::ui::UiCommand {
+                        rect: [980.0, 45.0, 290.0, 380.0],
+                        color: [0.07, 0.08, 0.12, 0.94],
+                    },
+                    crate::ui::UiCommand {
+                        rect: [980.0, 45.0, 290.0, 30.0],
+                        color: [0.12, 0.14, 0.20, 1.0],
+                    },
+                ],
+            );
+            ui_renderer.draw_text(
+                &self.queue,
+                &mut encoder,
+                &view,
+                995.0,
+                55.0,
+                "INSPECTOR",
+                [0.9, 0.9, 0.95, 1.0],
+                1.0,
+            );
+            ui_renderer.draw_text(
+                &self.queue,
+                &mut encoder,
+                &view,
+                995.0,
+                92.0,
+                "RENDER SETTINGS",
+                [0.35, 0.75, 1.0, 1.0],
+                0.9,
+            );
+            ui_renderer.draw_text(
+                &self.queue,
+                &mut encoder,
+                &view,
+                995.0,
+                116.0,
+                &format!("QUALITY: {}", self.preset_name.to_uppercase()),
+                [0.85, 0.85, 0.9, 1.0],
+                0.8,
+            );
+            ui_renderer.draw_text(
+                &self.queue,
+                &mut encoder,
+                &view,
+                995.0,
+                138.0,
+                "RENDER SCALE",
+                [0.7, 0.7, 0.75, 1.0],
+                0.8,
+            );
+            ui_renderer.draw_rects(
+                &self.queue,
+                &mut encoder,
+                &view,
+                &[
+                    crate::ui::UiCommand {
+                        rect: [995.0, 154.0, 230.0, 8.0],
+                        color: [0.18, 0.19, 0.25, 1.0],
+                    },
+                    crate::ui::UiCommand {
+                        rect: [1090.0, 150.0, 12.0, 16.0],
+                        color: [0.25, 0.65, 0.95, 1.0],
+                    },
+                ],
+            );
+            ui_renderer.draw_text(
+                &self.queue,
+                &mut encoder,
+                &view,
+                995.0,
+                190.0,
+                "MSAA",
+                [0.7, 0.7, 0.75, 1.0],
+                0.8,
+            );
+            ui_renderer.draw_rects(
+                &self.queue,
+                &mut encoder,
+                &view,
+                &[crate::ui::UiCommand {
+                    rect: [995.0, 205.0, 18.0, 18.0],
+                    color: [0.2, 0.7, 0.3, 1.0],
+                }],
+            );
+            ui_renderer.draw_text(
+                &self.queue,
+                &mut encoder,
+                &view,
+                1022.0,
+                207.0,
+                "ENABLED",
+                [0.8, 0.85, 0.85, 1.0],
+                0.8,
+            );
+
+            // Scene hierarchy panel
+            ui_renderer.draw_rects(
+                &self.queue,
+                &mut encoder,
+                &view,
+                &[
+                    crate::ui::UiCommand {
+                        rect: [18.0, 440.0, 300.0, 245.0],
+                        color: [0.07, 0.08, 0.12, 0.94],
+                    },
+                    crate::ui::UiCommand {
+                        rect: [18.0, 440.0, 300.0, 30.0],
+                        color: [0.12, 0.14, 0.20, 1.0],
+                    },
+                ],
+            );
+            ui_renderer.draw_text(
+                &self.queue,
+                &mut encoder,
+                &view,
+                32.0,
+                450.0,
+                "SCENE HIERARCHY",
+                [0.9, 0.9, 0.95, 1.0],
+                0.9,
+            );
+            ui_renderer.draw_text(
+                &self.queue,
+                &mut encoder,
+                &view,
+                35.0,
+                490.0,
+                "[+] startup",
+                [0.35, 0.75, 1.0, 1.0],
+                0.85,
+            );
+            ui_renderer.draw_text(
+                &self.queue,
+                &mut encoder,
+                &view,
+                52.0,
+                515.0,
+                "cube_ground",
+                [0.75, 0.75, 0.8, 1.0],
+                0.8,
+            );
+            ui_renderer.draw_text(
+                &self.queue,
+                &mut encoder,
+                &view,
+                52.0,
+                540.0,
+                "cube_central",
+                [0.75, 0.75, 0.8, 1.0],
+                0.8,
+            );
+            ui_renderer.draw_text(
+                &self.queue,
+                &mut encoder,
+                &view,
+                52.0,
+                565.0,
+                "cube_left",
+                [0.75, 0.75, 0.8, 1.0],
+                0.8,
+            );
+            ui_renderer.draw_text(
+                &self.queue,
+                &mut encoder,
+                &view,
+                52.0,
+                590.0,
+                "cube_right",
+                [0.75, 0.75, 0.8, 1.0],
+                0.8,
+            );
+            ui_renderer.draw_text(
+                &self.queue,
+                &mut encoder,
+                &view,
+                32.0,
+                640.0,
+                "CAMERA",
+                [0.35, 0.75, 1.0, 1.0],
+                0.85,
+            );
+            ui_renderer.draw_text(
+                &self.queue,
+                &mut encoder,
+                &view,
+                52.0,
+                665.0,
+                "MainCamera3D",
+                [0.75, 0.75, 0.8, 1.0],
+                0.8,
+            );
         }
 
         self.queue.submit([encoder.finish()]);
@@ -855,6 +1389,76 @@ impl Renderer {
             self.scene_view = None;
         }
     }
+}
+
+fn build_debug_commands(
+    _fps: f32,
+    _entity_count: usize,
+    _renderable_count: usize,
+    wireframe_mode: bool,
+    _preset: &str,
+    _frame_time_ms: f64,
+    _window_width: f32,
+    _window_height: f32,
+) -> Vec<crate::ui::UiCommand> {
+    let mut commands = Vec::new();
+    let padding = 10.0;
+    let line_height = 20.0;
+    let mut y = padding;
+    let x = padding;
+
+    // Background panel
+    commands.push(crate::ui::UiCommand {
+        rect: [x - 5.0, y - 5.0, 280.0, 220.0],
+        color: [0.0, 0.0, 0.0, 0.7],
+    });
+
+    // FPS
+    commands.push(crate::ui::UiCommand {
+        rect: [x, y, 20.0, line_height],
+        color: [0.2, 1.0, 0.2, 1.0],
+    });
+    y += line_height;
+
+    // Entity count
+    commands.push(crate::ui::UiCommand {
+        rect: [x, y, 20.0, line_height],
+        color: [1.0, 0.8, 0.2, 1.0],
+    });
+    y += line_height;
+
+    // Renderable count
+    commands.push(crate::ui::UiCommand {
+        rect: [x, y, 20.0, line_height],
+        color: [0.2, 0.8, 1.0, 1.0],
+    });
+    y += line_height;
+
+    // Wireframe indicator
+    commands.push(crate::ui::UiCommand {
+        rect: [x, y, 20.0, line_height],
+        color: if wireframe_mode {
+            [1.0, 0.2, 0.2, 1.0]
+        } else {
+            [0.5, 0.5, 0.5, 1.0]
+        },
+    });
+    y += line_height;
+
+    // Preset
+    commands.push(crate::ui::UiCommand {
+        rect: [x, y, 20.0, line_height],
+        color: [0.8, 0.8, 0.8, 1.0],
+    });
+    y += line_height;
+
+    // Frame time
+    commands.push(crate::ui::UiCommand {
+        rect: [x, y, 20.0, line_height],
+        color: [1.0, 1.0, 1.0, 1.0],
+    });
+
+    commands
 }
 
 fn create_shadow_view(device: &wgpu::Device) -> wgpu::TextureView {
