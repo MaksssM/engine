@@ -7,6 +7,8 @@ mod dock;
 mod ecs;
 mod editor;
 mod events;
+mod feedback;
+mod icons;
 mod input;
 mod quality;
 mod renderer;

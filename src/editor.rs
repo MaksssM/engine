@@ -17,6 +17,11 @@ use crate::{
     camera::CameraController,
     dock::{DockAction, EditorTab, WorkspacePreset, editor_dock_style},
     ecs::Name,
+    feedback::{
+        apply_feedback_styles, ConfirmDialog, DialogResult, NotificationManager, PendingAction,
+        TooltipExt,
+    },
+    icons::{IconSize, Icons},
     scene::{Scene, SceneEntity},
     transform::{Parent, Transform},
 };
@@ -251,11 +256,16 @@ pub struct Editor {
     pub graphics_shadows: String,
     pub camera_fov: f32,
     pub mouse_sensitivity: f32,
+
+    // Feedback & Notifications
+    pub notifications: NotificationManager,
+    pub confirm_dialog: Option<ConfirmDialog>,
 }
 
 impl Editor {
     pub fn new(window: &Window, device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         let context = Context::default();
+        apply_feedback_styles(&context);
         let platform = egui_winit::State::new(
             context.clone(),
             egui::ViewportId::ROOT,
@@ -315,6 +325,8 @@ impl Editor {
             graphics_shadows: "High".into(),
             camera_fov: 75.0,
             mouse_sensitivity: 1.0,
+            notifications: NotificationManager::default(),
+            confirm_dialog: None,
         }
     }
     pub fn on_window_event(&mut self, window: &Window, event: &WindowEvent) -> bool {
@@ -432,149 +444,235 @@ impl Editor {
         let mut actions = Vec::new();
 
         egui::TopBottomPanel::top("menu")
-            .exact_height(28.0)
+            .exact_height(30.0)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("R  ENGINE")
-                            .strong()
-                            .color(Color32::from_rgb(82, 166, 235)),
-                    );
+                    // App title with icon
+                    ui.horizontal(|ui| {
+                        Icons::show(ui, Icons::PROJECT, IconSize::Large, Some(Color32::from_rgb(82, 166, 235)));
+                        ui.label(
+                            RichText::new("R  ENGINE")
+                                .strong()
+                                .color(Color32::from_rgb(82, 166, 235)),
+                        );
+                    });
                     ui.separator();
-                    for menu in ["File", "Edit", "Window", "Tools", "Build", "Help"] {
-                        ui.menu_button(menu, |ui| match menu {
-                            "File" => {
-                                if ui.button("Save Scene  (Ctrl+S)").clicked() {
-                                    self.save_scene(world);
-                                    ui.close();
-                                }
-                                if ui.button("Reload Scene").clicked() {
-                                    self.load_scene(world);
-                                    ui.close();
-                                }
-                                ui.separator();
-                                if ui.button("Save Layout").clicked() {
-                                    self.dock_state = Some(dock_state.clone());
-                                    self.save_layout();
-                                    self.dock_state = None;
-                                    self.status = "Layout saved".into();
-                                    ui.close();
-                                }
-                                if ui.button("Reset Layout to Default").clicked() {
-                                    actions.push(DockAction::ResetDefault);
-                                    self.current_workspace = WorkspacePreset::Default;
-                                    ui.close();
-                                }
-                            }
-                            "Edit" => {
-                                if ui.button("Select All (Ctrl+A)").clicked() {
-                                    self.select_all(world);
-                                    ui.close();
-                                }
-                                if ui.button("Deselect All (Esc)").clicked() {
-                                    self.selected = None;
-                                    self.selected_entities.clear();
-                                    ui.close();
-                                }
-                                if ui.button("Delete Selected (Del)").clicked() {
-                                    self.delete_selected(world);
-                                    ui.close();
-                                }
-                                if ui.button("Duplicate Selected (Ctrl+D)").clicked() {
-                                    self.duplicate_selected(world);
-                                    ui.close();
-                                }
-                                ui.separator();
-                                if ui.button("Focus Selected (F)").clicked() {
-                                    if let Some(e) = self.selected {
-                                        if let Some(t) = world.get::<Transform>(e) {
-                                            self.orbit_target = t.translation;
-                                            self.update_camera(world);
-                                        }
-                                    }
-                                    ui.close();
-                                }
-                            }
-                            "Window" => {
-                                ui.menu_button("Workspaces", |ui| {
-                                    for preset in WorkspacePreset::ALL {
-                                        let active = self.current_workspace == preset;
-                                        if ui.selectable_label(active, preset.name()).clicked() {
-                                            self.current_workspace = preset;
-                                            actions.push(DockAction::ApplyPreset(preset));
-                                            self.status =
-                                                format!("Switched to {} workspace", preset.name());
-                                            ui.close();
-                                        }
-                                    }
-                                });
-                                ui.separator();
-                                for tab in EditorTab::ALL {
-                                    let is_open = dock_state.find_tab(&tab).is_some();
-                                    let mut toggle = is_open;
-                                    if ui.checkbox(&mut toggle, tab.title()).clicked() {
-                                        if toggle {
-                                            actions.push(DockAction::Open(tab));
+                    // Save button (always visible)
+                    if ui
+                        .button(
+                            RichText::new(format!("{} Save", Icons::SAVE))
+                                .size(11.0)
+                                .color(Color32::WHITE)
+                        )
+                        .engine_tooltip("Save Scene", "Save current scene to disk", Some("Ctrl+S"))
+                        .clicked()
+                    {
+                        self.save_scene(world);
+                    }
+                    // Play controls
+                    if ui
+                        .button(
+                            RichText::new(Icons::PLAY)
+                                .size(12.0)
+                                .color(Color32::from_rgb(80, 200, 100))
+                        )
+                        .engine_tooltip("Play", "Start simulation mode", Some("F5"))
+                        .clicked()
+                    {
+                        self.notifications.info("Simulation", "Play mode activated");
+                    }
+                    if ui
+                        .button(
+                            RichText::new(Icons::STOP)
+                                .size(12.0)
+                                .color(Color32::from_rgb(200, 80, 80))
+                        )
+                        .engine_tooltip("Stop", "Stop simulation", Some("Shift+F5"))
+                        .clicked()
+                    {
+                        self.notifications.info("Simulation", "Simulation stopped");
+                    }
+                    ui.separator();
+                    // Menu buttons with icons
+                    for (icon, menu) in [
+                        (Icons::FILE_BLANK, "File"),
+                        (Icons::SETTINGS, "Edit"),
+                        (Icons::GRID_VIEW, "Window"),
+                        (Icons::TOOLBOX, "Tools"),
+                        (Icons::BUILD, "Build"),
+                        (Icons::INFO, "Help"),
+                    ] {
+                        ui.horizontal(|ui| {
+                            Icons::show(ui, icon, IconSize::Small, Some(Color32::from_rgb(160, 165, 175)));
+                            ui.menu_button(menu, |ui| match menu {
+                                "File" => {
+                                    if ui.button(format!("{} New Scene", Icons::FILE_BLANK)).clicked() {
+                                        if self.dirty {
+                                            self.confirm_dialog = Some(ConfirmDialog::unsaved_changes(PendingAction::NewScene));
                                         } else {
-                                            actions.push(DockAction::Close(tab));
+                                            self.new_scene(world);
                                         }
+                                        ui.close();
+                                    }
+                                    if ui.button(format!("{} Save Scene  (Ctrl+S)", Icons::SAVE)).clicked() {
+                                        self.save_scene(world);
+                                        ui.close();
+                                    }
+                                    if ui.button(format!("{} Reload Scene", Icons::REFRESH)).clicked() {
+                                        self.prompt_reload_scene(world);
+                                        ui.close();
+                                    }
+                                    ui.separator();
+                                    if ui.button(format!("{} Save Layout", Icons::SETTINGS_FILE)).clicked() {
+                                        self.dock_state = Some(dock_state.clone());
+                                        self.save_layout();
+                                        self.dock_state = None;
+                                        self.status = "Layout saved".into();
+                                        self.notifications.success(
+                                            "Layout Saved",
+                                            "Saved window dock layout configuration",
+                                        );
+                                        ui.close();
+                                    }
+                                    if ui.button(format!("{} Reset Layout to Default", Icons::HOME)).clicked() {
+                                        actions.push(DockAction::ResetDefault);
+                                        self.current_workspace = WorkspacePreset::Default;
+                                        self.notifications.info(
+                                            "Layout Reset",
+                                            "Reset docking panels to default layout",
+                                        );
+                                        ui.close();
                                     }
                                 }
-                                ui.separator();
-                                ui.menu_button("Detach to Floating Window", |ui| {
-                                    for tab in EditorTab::ALL {
-                                        if dock_state.find_tab(&tab).is_some() {
-                                            if ui.button(tab.title()).clicked() {
-                                                actions.push(DockAction::Detach(tab));
+                                "Edit" => {
+                                    if ui.button(format!("{} Select All (Ctrl+A)", Icons::ENTITY)).clicked() {
+                                        self.select_all(world);
+                                        ui.close();
+                                    }
+                                    if ui.button(format!("{} Deselect All (Esc)", Icons::EMPTY_ENTITY)).clicked() {
+                                        self.selected = None;
+                                        self.selected_entities.clear();
+                                        ui.close();
+                                    }
+                                    if ui.button(format!("{} Delete Selected (Del)", Icons::DELETE)).clicked() {
+                                        self.prompt_delete_selected(world);
+                                        ui.close();
+                                    }
+                                    if ui.button(format!("{} Duplicate Selected (Ctrl+D)", Icons::DUPLICATE)).clicked() {
+                                        self.duplicate_selected(world);
+                                        ui.close();
+                                    }
+                                    ui.separator();
+                                    if ui.button(format!("{} Focus Selected (F)", Icons::CAMERA)).clicked() {
+                                        if let Some(e) = self.selected {
+                                            if let Some(t) = world.get::<Transform>(e) {
+                                                self.orbit_target = t.translation;
+                                                self.update_camera(world);
+                                            }
+                                        }
+                                        ui.close();
+                                    }
+                                }
+                                "Window" => {
+                                    ui.menu_button("Workspaces", |ui| {
+                                        for preset in WorkspacePreset::ALL {
+                                            let active = self.current_workspace == preset;
+                                            if ui.selectable_label(active, preset.name()).clicked() {
+                                                self.current_workspace = preset;
+                                                actions.push(DockAction::ApplyPreset(preset));
+                                                self.status =
+                                                    format!("Switched to {} workspace", preset.name());
+                                                self.notifications.info(
+                                                    "Workspace Switched",
+                                                    format!("Activated {} layout", preset.name()),
+                                                );
                                                 ui.close();
                                             }
                                         }
+                                    });
+                                    ui.separator();
+                                    for tab in EditorTab::ALL {
+                                        let is_open = dock_state.find_tab(&tab).is_some();
+                                        let mut toggle = is_open;
+                                        if ui.checkbox(&mut toggle, tab.title()).clicked() {
+                                            if toggle {
+                                                actions.push(DockAction::Open(tab));
+                                            } else {
+                                                actions.push(DockAction::Close(tab));
+                                            }
+                                        }
                                     }
-                                });
-                                ui.separator();
-                                if ui.button("Reset Layout to Default").clicked() {
-                                    self.current_workspace = WorkspacePreset::Default;
-                                    actions.push(DockAction::ResetDefault);
-                                    ui.close();
+                                    ui.separator();
+                                    ui.menu_button("Detach to Floating Window", |ui| {
+                                        for tab in EditorTab::ALL {
+                                            if dock_state.find_tab(&tab).is_some() {
+                                                if ui.button(tab.title()).clicked() {
+                                                    actions.push(DockAction::Detach(tab));
+                                                    ui.close();
+                                                }
+                                            }
+                                        }
+                                    });
+                                    ui.separator();
+                                    if ui.button(format!("{} Reset Layout to Default", Icons::HOME)).clicked() {
+                                        self.current_workspace = WorkspacePreset::Default;
+                                        actions.push(DockAction::ResetDefault);
+                                        self.notifications.info(
+                                            "Layout Reset",
+                                            "Restored default window workspace",
+                                        );
+                                        ui.close();
+                                    }
                                 }
-                            }
-                            "Tools" => {
-                                ui.checkbox(&mut self.grid, "Show Grid");
-                                ui.checkbox(&mut self.show_gizmos, "Show Gizmos");
-                                ui.checkbox(&mut self.show_collision, "Show Collision");
-                                ui.checkbox(&mut self.wireframe, "Wireframe");
-                                ui.separator();
-                                if ui.button("Reset Camera Orbit").clicked() {
-                                    self.orbit_target = Vec3::ZERO;
-                                    self.orbit_distance = 8.0;
-                                    self.update_camera(world);
-                                    ui.close();
+                                "Tools" => {
+                                    ui.checkbox(&mut self.grid, format!("{} Show Grid", Icons::GRID_VIEW));
+                                    ui.checkbox(&mut self.show_gizmos, format!("{} Show Gizmos", Icons::TRANSFORM));
+                                    ui.checkbox(&mut self.show_collision, format!("{} Show Collision", Icons::HIDDEN));
+                                    ui.checkbox(&mut self.wireframe, format!("{} Wireframe", Icons::LIST_VIEW));
+                                    ui.separator();
+                                    if ui.button(format!("{} Reset Camera Orbit", Icons::CAMERA)).clicked() {
+                                        self.orbit_target = Vec3::ZERO;
+                                        self.orbit_distance = 8.0;
+                                        self.update_camera(world);
+                                        ui.close();
+                                    }
                                 }
-                            }
-                            "Build" => {
-                                if ui.button("Build Lighting").clicked() {
-                                    self.log.push((
-                                        "INFO".into(),
-                                        "Build Lighting completed (0 static lights baked)".into(),
-                                    ));
-                                    ui.close();
+                                "Build" => {
+                                    if ui.button(format!("{} Build Lighting", Icons::LIGHT)).clicked() {
+                                        self.log.push((
+                                            "INFO".into(),
+                                            "Build Lighting completed (0 static lights baked)".into(),
+                                        ));
+                                        self.notifications.success(
+                                            "Lighting Built",
+                                            "Static lighting baked successfully (0 warnings)",
+                                        );
+                                        ui.close();
+                                    }
+                                    if ui.button(format!("{} Build Navigation Mesh", Icons::BUILD)).clicked() {
+                                        self.log.push((
+                                            "INFO".into(),
+                                            "NavMesh generated (1 polygon island, 24 nodes)".into(),
+                                        ));
+                                        self.notifications.success(
+                                            "NavMesh Built",
+                                            "Generated 1 polygon island (24 nodes)",
+                                        );
+                                        ui.close();
+                                    }
+                                    if ui.button(format!("{} Build All", Icons::COMPILE)).clicked() {
+                                        self.log.push((
+                                            "INFO".into(),
+                                            "Full scene build completed successfully".into(),
+                                        ));
+                                        self.notifications.success(
+                                            "Build Complete",
+                                            "Lighting, navigation, and geometry built",
+                                        );
+                                        ui.close();
+                                    }
                                 }
-                                if ui.button("Build Navigation Mesh").clicked() {
-                                    self.log.push((
-                                        "INFO".into(),
-                                        "NavMesh generated (1 polygon island, 24 nodes)".into(),
-                                    ));
-                                    ui.close();
-                                }
-                                if ui.button("Build All").clicked() {
-                                    self.log.push((
-                                        "INFO".into(),
-                                        "Full scene build completed successfully".into(),
-                                    ));
-                                    ui.close();
-                                }
-                            }
-                            "Help" => {
+                                "Help" => {
                                 ui.label("Rust Engine Editor");
                                 ui.separator();
                                 ui.label("Shortcuts:");
@@ -589,54 +687,126 @@ impl Editor {
                             }
                             _ => {}
                         });
+                        });
                     }
-                    if ui.button("Save").clicked() {
+                    if ui
+                        .button("Save")
+                        .engine_tooltip(
+                            "Save Scene",
+                            "Save scene hierarchy and transforms to file",
+                            Some("Ctrl+S"),
+                        )
+                        .clicked()
+                    {
                         self.save_scene(world);
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(format!("{}  |  {:.0} FPS", self.status, fps));
+                        ui.label(
+                            RichText::new("Rust Engine v0.1.0-dev")
+                                .size(11.0)
+                                .color(Color32::from_rgb(120, 135, 155)),
+                        );
                     });
                 })
             });
 
         egui::TopBottomPanel::top("toolbar")
-            .exact_height(34.0)
+            .exact_height(36.0)
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
-                    for (i, label) in ["Select (Q)", "Move (W)", "Rotate (E)", "Scale (R)"]
-                        .iter()
-                        .enumerate()
-                    {
-                        if ui.selectable_label(self.active_tool == i, *label).clicked() {
+                    // Transform tools with icons
+                    let tool_info = [
+                        (Icons::SELECT, "Select", "Select Tool", "Pick entities in viewport", Some("Q")),
+                        (Icons::MOVE, "Move", "Move Tool", "Translate selected entity along axes", Some("W")),
+                        (Icons::ROTATE, "Rotate", "Rotate Tool", "Rotate selected entity in 3D space", Some("E")),
+                        (Icons::SCALE, "Scale", "Scale Tool", "Scale selected entity per axis", Some("R")),
+                    ];
+                    for (i, (icon, label, title, desc, shortcut)) in tool_info.iter().enumerate() {
+                        let is_active = self.active_tool == i;
+                        let response = ui.add(
+                            egui::Button::new(
+                                RichText::new(format!("{} {}", icon, label))
+                                    .size(11.0)
+                                    .color(if is_active { Color32::WHITE } else { Color32::from_rgb(180, 185, 195) })
+                            )
+                            .frame(false)
+                            .min_size(egui::vec2(64.0, 28.0))
+                            .fill(if is_active { Color32::from_rgb(60, 80, 120) } else { Color32::TRANSPARENT })
+                            .corner_radius(egui::CornerRadius::same(4))
+                        );
+                        let response = response.engine_tooltip(title, desc, *shortcut);
+                        if response.clicked() {
                             self.active_tool = i;
                         }
                     }
                     ui.separator();
-                    if ui.button("Add Actor").clicked() {
+                    // Add Actor with icon
+                    if ui
+                        .button(
+                            RichText::new(format!("{} Add Actor", Icons::ADD))
+                                .size(11.0)
+                                .color(Color32::WHITE)
+                        )
+                        .engine_tooltip("Add Actor", "Spawn a new actor entity at scene origin", None)
+                        .clicked()
+                    {
                         self.create_entity(world);
                     }
-                    if ui.button("Save").clicked() {
+                    // Save with icon
+                    if ui
+                        .button(
+                            RichText::new(format!("{} Save", Icons::SAVE))
+                                .size(11.0)
+                                .color(Color32::WHITE)
+                        )
+                        .engine_tooltip(
+                            "Save Scene",
+                            "Save all actors and components to scene file",
+                            Some("Ctrl+S"),
+                        )
+                        .clicked()
+                    {
                         self.save_scene(world);
                     }
                     ui.separator();
+                    // View modes with icons
                     ui.label("View:");
-                    for (label, mode) in [
-                        ("Persp", ViewMode::Perspective),
-                        ("Top", ViewMode::Top),
-                        ("Front", ViewMode::Front),
-                        ("Side", ViewMode::Side),
-                        ("Ortho", ViewMode::Orthographic),
-                    ] {
-                        if ui.selectable_label(self.view_mode == mode, label).clicked() {
-                            self.view_mode = mode;
+                    let view_modes = [
+                        (Icons::PERSPECTIVE, "Persp", ViewMode::Perspective, "Perspective", "Perspective 3D camera projection"),
+                        (Icons::UP, "Top", ViewMode::Top, "Top View", "Orthographic top-down projection looking down Y"),
+                        (Icons::FRONT, "Front", ViewMode::Front, "Front View", "Orthographic front projection looking along Z"),
+                        (Icons::SIDE, "Side", ViewMode::Side, "Side View", "Orthographic side projection looking along X"),
+                        (Icons::ORTHOGRAPHIC, "Ortho", ViewMode::Orthographic, "Orthographic", "Orthographic 3D camera projection"),
+                    ];
+                    for (icon, label, mode, title, desc) in view_modes.iter() {
+                        let is_active = self.view_mode == *mode;
+                        let response = ui.add(
+                            egui::Button::new(
+                                RichText::new(format!("{} {}", icon, label))
+                                    .size(11.0)
+                                    .color(if is_active { Color32::WHITE } else { Color32::from_rgb(180, 185, 195) })
+                            )
+                            .frame(false)
+                            .min_size(egui::vec2(56.0, 28.0))
+                            .fill(if is_active { Color32::from_rgb(60, 80, 120) } else { Color32::TRANSPARENT })
+                            .corner_radius(egui::CornerRadius::same(4))
+                        );
+                        let response = response.engine_tooltip(title, desc, None);
+                        if response.clicked() {
+                            self.view_mode = *mode;
                         }
                     }
                     ui.separator();
-                    ui.checkbox(&mut self.grid, "Grid");
-                    ui.checkbox(&mut self.show_gizmos, "Gizmos");
-                    ui.checkbox(&mut self.wireframe, "Wireframe");
+                    // View toggles with icons
+                    ui.add(egui::Checkbox::new(&mut self.grid, format!("{} Grid", Icons::GRID_VIEW)))
+                        .engine_tooltip("Toggle Grid", "Show or hide the coordinate ground grid", None);
+                    ui.add(egui::Checkbox::new(&mut self.show_gizmos, format!("{} Gizmos", Icons::TRANSFORM)))
+                        .engine_tooltip("Toggle Gizmos", "Show or hide 3D transformation manipulators", None);
+                    ui.add(egui::Checkbox::new(&mut self.wireframe, format!("{} Wireframe", Icons::LIST_VIEW)))
+                        .engine_tooltip("Toggle Wireframe", "Render models in polygon wireframe mode", None);
 
                     ui.separator();
+                    // Workspace selector with icons
                     ui.label("Workspace:");
                     for preset in WorkspacePreset::ALL {
                         let active = self.current_workspace == preset;
@@ -647,17 +817,173 @@ impl Editor {
                             WorkspacePreset::Scripting => "Script",
                             WorkspacePreset::Minimal => "Minimal",
                         };
-                        if ui
-                            .selectable_label(active, short_name)
-                            .on_hover_text(preset.description())
-                            .clicked()
-                        {
+                        let response = ui.add(
+                            egui::Button::new(
+                                RichText::new(short_name)
+                                    .size(11.0)
+                                    .color(if active { Color32::WHITE } else { Color32::from_rgb(180, 185, 195) })
+                            )
+                            .frame(false)
+                            .min_size(egui::vec2(52.0, 28.0))
+                            .fill(if active { Color32::from_rgb(60, 80, 120) } else { Color32::TRANSPARENT })
+                            .corner_radius(egui::CornerRadius::same(4))
+                        );
+                        let response = response.engine_tooltip(preset.name(), preset.description(), None);
+                        if response.clicked() {
                             self.current_workspace = preset;
                             actions.push(DockAction::ApplyPreset(preset));
                             self.status = format!("Switched to {} workspace", preset.name());
+                            self.notifications.info(
+                                "Workspace Switched",
+                                format!("Activated {} layout", preset.name()),
+                            );
                         }
                     }
                 })
+            });
+
+        // Bottom Status Bar
+        egui::TopBottomPanel::bottom("status_bar")
+            .exact_height(24.0)
+            .show(ctx, |ui| {
+                ui.horizontal_centered(|ui| {
+                    ui.style_mut().spacing.item_spacing.x = 8.0;
+
+                    // Scene save / dirty indicator
+                    if self.dirty {
+                        ui.label(
+                            RichText::new(format!("{} Unsaved Changes", Icons::WARN))
+                                .size(11.0)
+                                .color(Color32::from_rgb(240, 180, 80)),
+                        )
+                        .engine_tooltip(
+                            "Unsaved Changes",
+                            "The active scene has unsaved modifications. Press Ctrl+S to save.",
+                            Some("Ctrl+S"),
+                        );
+                    } else {
+                        ui.label(
+                            RichText::new(format!("{} Saved", Icons::SAVE))
+                                .size(11.0)
+                                .color(Color32::from_rgb(100, 205, 130)),
+                        )
+                        .engine_tooltip(
+                            "Scene Saved",
+                            "All scene entities and transforms are saved to disk.",
+                            None,
+                        );
+                    }
+
+                    ui.separator();
+
+                    // Total actors and selection count
+                    let total_actors = world.query::<&Name>().iter(world).count();
+                    let selection_count = if !self.selected_entities.is_empty() {
+                        self.selected_entities.len()
+                    } else if self.selected.is_some() {
+                        1
+                    } else {
+                        0
+                    };
+
+                    let actor_label = if selection_count > 0 {
+                        format!("{} Actors ({} selected)", Icons::ENTITY, selection_count)
+                    } else {
+                        format!("{} {} Actors", Icons::ENTITY, total_actors)
+                    };
+                    ui.label(
+                        RichText::new(actor_label)
+                            .size(11.0)
+                            .color(Color32::from_rgb(160, 175, 195)),
+                    );
+
+                    ui.separator();
+
+                    // Active tool indicator
+                    let tool_name = match self.active_tool {
+                        0 => "Select (Q)",
+                        1 => "Move (W)",
+                        2 => "Rotate (E)",
+                        3 => "Scale (R)",
+                        _ => "None",
+                    };
+                    ui.label(
+                        RichText::new(format!("Tool: {tool_name}"))
+                            .size(11.0)
+                            .color(Color32::from_rgb(160, 175, 195)),
+                    );
+
+                    ui.separator();
+
+                    // Current workspace
+                    ui.label(
+                        RichText::new(format!("Workspace: {}", self.current_workspace.name()))
+                            .size(11.0)
+                            .color(Color32::from_rgb(160, 175, 195)),
+                    );
+
+                    ui.separator();
+
+                    // Status text
+                    ui.label(
+                        RichText::new(&self.status)
+                            .size(11.0)
+                            .color(Color32::from_rgb(200, 210, 225)),
+                    );
+
+                    // Right side metrics & error badges
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let frame_ms = if fps > 0.0 { 1000.0 / fps } else { 0.0 };
+                        ui.label(
+                            RichText::new(format!("{:.0} FPS ({:.1} ms)", fps, frame_ms))
+                                .size(11.0)
+                                .color(Color32::from_rgb(140, 150, 165)),
+                        );
+
+                        ui.separator();
+
+                        let err_count = self.log.iter().filter(|(l, _)| l == "ERROR").count();
+                        let warn_count = self.log.iter().filter(|(l, _)| l == "WARN").count();
+
+                        if err_count > 0 {
+                            let btn = ui.add(
+                                egui::Button::new(
+                                    RichText::new(format!("✕ {err_count} errors"))
+                                        .size(11.0)
+                                        .color(Color32::WHITE),
+                                )
+                                .fill(Color32::from_rgb(160, 40, 40)),
+                            )
+                            .engine_tooltip(
+                                "Errors Logged",
+                                "Click to view error log entries in Output Log",
+                                None,
+                            );
+                            if btn.clicked() {
+                                actions.push(DockAction::Open(EditorTab::OutputLog));
+                            }
+                        }
+
+                        if warn_count > 0 {
+                            let btn = ui.add(
+                                egui::Button::new(
+                                    RichText::new(format!("⚠ {warn_count} warnings"))
+                                        .size(11.0)
+                                        .color(Color32::BLACK),
+                                )
+                                .fill(Color32::from_rgb(230, 180, 50)),
+                            )
+                            .engine_tooltip(
+                                "Warnings Logged",
+                                "Click to view warnings in Output Log",
+                                None,
+                            );
+                            if btn.clicked() {
+                                actions.push(DockAction::Open(EditorTab::OutputLog));
+                            }
+                        }
+                    });
+                });
             });
 
         // Shortcuts
@@ -694,7 +1020,7 @@ impl Editor {
                     self.duplicate_selected(world);
                 }
             }
-            if !i.modifiers.ctrl && !i.modifiers.alt {
+            if !i.modifiers.ctrl && !i.modifiers.alt && self.confirm_dialog.is_none() {
                 if i.key_pressed(Key::Q) {
                     self.active_tool = 0;
                 }
@@ -708,7 +1034,7 @@ impl Editor {
                     self.active_tool = 3;
                 }
                 if i.key_pressed(Key::Delete) {
-                    self.delete_selected(world);
+                    self.prompt_delete_selected(world);
                 }
                 if i.key_pressed(Key::F) {
                     if let Some(e) = self.selected {
@@ -751,6 +1077,101 @@ impl Editor {
         if let Some(single) = self.selected {
             self.selected_entities.insert(single);
         }
+
+        let mut close_dialog = false;
+        if let Some(dialog) = self.confirm_dialog.take() {
+            if let Some(res) = dialog.show(ctx) {
+                match res {
+                    DialogResult::Confirmed => {
+                        match dialog {
+                            ConfirmDialog::DeleteEntities { targets, .. } => {
+                                let count = targets.len();
+                                for e in targets {
+                                    let _ = world.despawn(e);
+                                }
+                                self.selected = None;
+                                self.selected_entities.clear();
+                                self.dirty = true;
+                                self.status = format!("Deleted {count} actor(s)");
+                                self.log.push(("INFO".into(), format!("Deleted {count} actor(s)")));
+                                self.notifications.warning(
+                                    "Actor Deleted",
+                                    format!("Permanently removed {count} actor(s) from scene"),
+                                );
+                            }
+                            ConfirmDialog::DeleteContent { path, .. } => {
+                                let name = path
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_default();
+                                let res = if path.is_dir() {
+                                    std::fs::remove_dir_all(&path)
+                                } else {
+                                    std::fs::remove_file(&path)
+                                };
+                                match res {
+                                    Ok(_) => {
+                                        if self.content_selected.as_ref() == Some(&path) {
+                                            self.content_selected = None;
+                                        }
+                                        self.status = format!("Deleted {name}");
+                                        self.log.push(("INFO".into(), format!("Deleted resource: {name}")));
+                                        self.notifications.warning(
+                                            "Resource Deleted",
+                                            format!("Permanently deleted '{name}'"),
+                                        );
+                                    }
+                                    Err(e) => {
+                                        self.status = format!("Failed to delete {name}: {e}");
+                                        self.log.push(("ERROR".into(), self.status.clone()));
+                                        self.notifications.error("Delete Failed", format!("{e}"));
+                                    }
+                                }
+                            }
+                            ConfirmDialog::UnsavedChanges { .. } => {}
+                        }
+                        close_dialog = true;
+                    }
+                    DialogResult::SaveAndProceed => {
+                        self.save_scene(world);
+                        if let ConfirmDialog::UnsavedChanges { action } = dialog {
+                            match action {
+                                PendingAction::LoadScene => self.load_scene(world),
+                                PendingAction::NewScene => self.new_scene(world),
+                                PendingAction::ResetLayout => {
+                                    self.dock_state = Some(self.current_workspace.create_dock_state());
+                                }
+                            }
+                        }
+                        close_dialog = true;
+                    }
+                    DialogResult::DiscardAndProceed => {
+                        if let ConfirmDialog::UnsavedChanges { action } = dialog {
+                            match action {
+                                PendingAction::LoadScene => self.load_scene(world),
+                                PendingAction::NewScene => self.new_scene(world),
+                                PendingAction::ResetLayout => {
+                                    self.dock_state = Some(self.current_workspace.create_dock_state());
+                                }
+                            }
+                        }
+                        close_dialog = true;
+                    }
+                    DialogResult::Cancelled => {
+                        close_dialog = true;
+                    }
+                }
+            } else {
+                // Dialog still open, put it back
+                self.confirm_dialog = Some(dialog);
+            }
+        }
+        if close_dialog {
+            self.confirm_dialog = None;
+        }
+
+        // Render floating toast notifications stack
+        self.notifications.show(ctx, 28.0);
     }
 
     pub fn select_all(&mut self, world: &mut World) {
@@ -806,40 +1227,82 @@ impl Editor {
         self.selected = new_entities.first().copied();
         self.dirty = true;
         self.status = format!("Duplicated {} entities", new_entities.len());
+        self.notifications.info(
+            "Actor Duplicated",
+            format!("Duplicated {} entity/entities", new_entities.len()),
+        );
     }
 
     fn draw_viewport(&mut self, ui: &mut egui::Ui, world: &mut World) {
         ui.horizontal(|ui| {
             ui.label(
-                RichText::new(match self.view_mode {
-                    ViewMode::Perspective => "PERSPECTIVE",
-                    ViewMode::Top => "TOP",
-                    ViewMode::Front => "FRONT",
-                    ViewMode::Side => "SIDE",
-                    ViewMode::Orthographic => "ORTHOGRAPHIC",
-                })
-                .strong(),
+                RichText::new(format!(
+                    "{} {}",
+                    match self.view_mode {
+                        ViewMode::Perspective => Icons::VIEW,
+                        ViewMode::Top => Icons::TOP,
+                        ViewMode::Front => Icons::FRONT,
+                        ViewMode::Side => Icons::SIDE,
+                        ViewMode::Orthographic => Icons::ORTHO,
+                    },
+                    match self.view_mode {
+                        ViewMode::Perspective => "PERSPECTIVE",
+                        ViewMode::Top => "TOP",
+                        ViewMode::Front => "FRONT",
+                        ViewMode::Side => "SIDE",
+                        ViewMode::Orthographic => "ORTHOGRAPHIC",
+                    }
+                ))
+                .strong()
+                .size(11.0),
             );
             ui.separator();
-            ui.label(if self.wireframe { "WIREFRAME" } else { "LIT" });
+            ui.label(
+                RichText::new(if self.wireframe {
+                    format!("{} WIREFRAME", Icons::WIREFRAME)
+                } else {
+                    format!("{} LIT", Icons::LIT)
+                })
+                .size(11.0),
+            );
             ui.separator();
-            ui.label(format!(
-                "Tool: {}",
-                match self.active_tool {
-                    1 => "Move",
-                    2 => "Rotate",
-                    3 => "Scale",
-                    _ => "Select",
-                }
-            ));
+            ui.label(
+                RichText::new(format!(
+                    "{} {}",
+                    Icons::TOOL,
+                    match self.active_tool {
+                        1 => "Move",
+                        2 => "Rotate",
+                        3 => "Scale",
+                        _ => "Select",
+                    }
+                ))
+                .size(11.0),
+            );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Reset Camera").clicked() {
+                if ui
+                    .button(
+                        RichText::new(format!("{} Reset Camera", Icons::RESET))
+                            .size(11.0)
+                            .color(Color32::WHITE),
+                    )
+                    .engine_tooltip("Reset Camera", "Reset camera to default position", Some("R"))
+                    .clicked()
+                {
                     self.orbit_target = Vec3::ZERO;
                     self.orbit_distance = 8.0;
                     self.update_camera(world);
                 }
                 if let Some(e) = self.selected {
-                    if ui.button("Focus (F)").clicked() {
+                    if ui
+                        .button(
+                            RichText::new(format!("{} Focus (F)", Icons::FOCUS))
+                                .size(11.0)
+                                .color(Color32::WHITE),
+                        )
+                        .engine_tooltip("Focus Actor", "Focus camera on the selected actor", Some("F"))
+                        .clicked()
+                    {
                         if let Some(t) = world.get::<Transform>(e) {
                             self.orbit_target = t.translation;
                             self.update_camera(world);
@@ -923,14 +1386,26 @@ impl Editor {
             }
         }
         response.context_menu(|ui| {
-            ui.label(RichText::new("Viewport").strong());
+            ui.label(RichText::new(format!("{} Viewport", Icons::VIEW)).strong());
             ui.separator();
-            ui.checkbox(&mut self.grid, "Show Grid");
-            ui.checkbox(&mut self.show_gizmos, "Show Gizmos");
-            ui.checkbox(&mut self.show_collision, "Show Collision");
-            ui.checkbox(&mut self.wireframe, "Wireframe");
+            if ui.button(format!("{} Show Grid", Icons::GRID)).clicked() {
+                self.grid = !self.grid;
+                ui.close();
+            }
+            if ui.button(format!("{} Show Gizmos", Icons::GIZMO)).clicked() {
+                self.show_gizmos = !self.show_gizmos;
+                ui.close();
+            }
+            if ui.button(format!("{} Show Collision", Icons::COLLISION)).clicked() {
+                self.show_collision = !self.show_collision;
+                ui.close();
+            }
+            if ui.button(format!("{} Wireframe", Icons::WIREFRAME)).clicked() {
+                self.wireframe = !self.wireframe;
+                ui.close();
+            }
             ui.separator();
-            if ui.button("Focus Selected (F)").clicked() {
+            if ui.button(format!("{} Focus Selected (F)", Icons::FOCUS)).clicked() {
                 if let Some(e) = self.selected {
                     if let Some(t) = world.get::<Transform>(e) {
                         self.orbit_target = t.translation;
@@ -939,7 +1414,7 @@ impl Editor {
                 }
                 ui.close();
             }
-            if ui.button("Reset Camera Orbit").clicked() {
+            if ui.button(format!("{} Reset Camera Orbit", Icons::RESET)).clicked() {
                 self.orbit_target = Vec3::ZERO;
                 self.orbit_distance = 8.0;
                 self.update_camera(world);
@@ -989,12 +1464,40 @@ impl Editor {
             );
         }
         if self.show_gizmos {
+            let gizmo_origin = rect.left_bottom() + Vec2::new(24.0, -24.0);
+            // Colored axis indicators (X red, Y green, Z blue)
             p.text(
-                rect.left_bottom() + Vec2::new(12.0, -12.0),
-                egui::Align2::LEFT_BOTTOM,
-                "X  Y  Z",
+                gizmo_origin + Vec2::new(-14.0, 0.0),
+                egui::Align2::CENTER_CENTER,
+                "X",
                 egui::FontId::proportional(11.0),
-                Color32::from_rgb(150, 170, 195),
+                Color32::from_rgb(220, 90, 90),
+            );
+            p.text(
+                gizmo_origin + Vec2::new(14.0, 0.0),
+                egui::Align2::CENTER_CENTER,
+                "Y",
+                egui::FontId::proportional(11.0),
+                Color32::from_rgb(90, 220, 120),
+            );
+            p.text(
+                gizmo_origin + Vec2::new(0.0, -14.0),
+                egui::Align2::CENTER_CENTER,
+                "Z",
+                egui::FontId::proportional(11.0),
+                Color32::from_rgb(90, 140, 230),
+            );
+            p.line_segment(
+                [gizmo_origin, gizmo_origin + Vec2::new(14.0, 0.0)],
+                egui::Stroke::new(1.0, Color32::from_rgb(220, 90, 90)),
+            );
+            p.line_segment(
+                [gizmo_origin, gizmo_origin + Vec2::new(-14.0, 0.0)],
+                egui::Stroke::new(1.0, Color32::from_rgb(90, 220, 120)),
+            );
+            p.line_segment(
+                [gizmo_origin, gizmo_origin + Vec2::new(0.0, -14.0)],
+                egui::Stroke::new(1.0, Color32::from_rgb(90, 140, 230)),
             );
         }
         for entity in &self.selected_entities {
@@ -1027,37 +1530,52 @@ impl Editor {
             let warn_count = self.log.iter().filter(|(l, _)| l == "WARN").count();
             let info_count = self.log.iter().filter(|(l, _)| l == "INFO").count();
 
-            ui.label(format!("Total: {total_count}"));
+            ui.label(
+                RichText::new(format!("{} Total: {total_count}", Icons::LOG))
+                    .size(10.0)
+                    .color(Color32::from_rgb(140, 145, 155)),
+            );
             if err_count > 0 {
                 ui.label(
-                    RichText::new(format!("Errors: {err_count}"))
+                    RichText::new(format!("{} Errors: {err_count}", Icons::ERROR))
+                        .size(10.0)
                         .color(Color32::from_rgb(255, 90, 90)),
                 );
             }
             if warn_count > 0 {
                 ui.label(
-                    RichText::new(format!("Warnings: {warn_count}"))
+                    RichText::new(format!("{} Warnings: {warn_count}", Icons::WARN))
+                        .size(10.0)
                         .color(Color32::from_rgb(255, 200, 70)),
                 );
             }
             ui.label(
-                RichText::new(format!("Info: {info_count}"))
+                RichText::new(format!("{} Info: {info_count}", Icons::INFO))
+                    .size(10.0)
                     .color(Color32::from_rgb(140, 180, 220)),
             );
 
             ui.separator();
-            ui.label("Filter:");
+            Icons::show(ui, Icons::SEARCH, IconSize::Small, Some(Color32::from_rgb(120, 135, 155)));
             ui.add(
                 egui::TextEdit::singleline(&mut self.log_filter)
                     .hint_text("Search log...")
                     .desired_width(180.0),
             );
-            if !self.log_filter.is_empty() && ui.small_button("×").clicked() {
+            if !self.log_filter.is_empty() && ui.small_button("×").engine_tooltip("Clear Search", "Clear the log search filter", None).clicked() {
                 self.log_filter.clear();
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Clear Log").clicked() {
+                if ui
+                    .button(
+                        RichText::new(format!("{} Clear Log", Icons::DELETE))
+                            .size(11.0)
+                            .color(Color32::WHITE),
+                    )
+                    .engine_tooltip("Clear Log", "Remove all entries from the output log", None)
+                    .clicked()
+                {
                     self.log.clear();
                 }
             });
@@ -1077,18 +1595,21 @@ impl Editor {
                             .contains(&self.log_filter.to_lowercase())
                     {
                         ui.horizontal(|ui| {
-                            let (badge_bg, text_col) = match level.as_str() {
+                            let (badge_bg, text_col, icon) = match level.as_str() {
                                 "ERROR" => (
                                     Color32::from_rgb(180, 40, 40),
                                     Color32::from_rgb(255, 120, 120),
+                                    Icons::ERROR,
                                 ),
                                 "WARN" => (
                                     Color32::from_rgb(160, 120, 20),
                                     Color32::from_rgb(255, 210, 80),
+                                    Icons::WARNING,
                                 ),
                                 _ => (
                                     Color32::from_rgb(35, 75, 130),
                                     Color32::from_rgb(180, 210, 240),
+                                    Icons::INFO,
                                 ),
                             };
                             let badge = RichText::new(format!(" {level} "))
@@ -1096,6 +1617,8 @@ impl Editor {
                                 .color(Color32::WHITE)
                                 .background_color(badge_bg);
                             ui.label(badge);
+                            Icons::show(ui, icon, IconSize::Small, Some(text_col));
+                            ui.add_space(4.0);
                             ui.label(RichText::new(msg).monospace().color(text_col));
                         });
                     }
@@ -1251,17 +1774,41 @@ impl Editor {
         let _ = fs::create_dir_all(&self.content_root);
         ui.horizontal(|ui| {
             ui.heading("CONTENT BROWSER");
-            if ui.button("◧").on_hover_text("List view").clicked() {
+            if ui
+                .button(
+                    RichText::new(Icons::LIST_VIEW)
+                        .size(14.0)
+                        .color(if self.content_list_view {
+                            Color32::WHITE
+                        } else {
+                            Color32::from_rgb(140, 145, 155)
+                        }),
+                )
+                .engine_tooltip("List View", "Show assets in a compact list", None)
+                .clicked()
+            {
                 self.content_list_view = true;
             }
-            if ui.button("▦").on_hover_text("Grid view").clicked() {
+            if ui
+                .button(
+                    RichText::new(Icons::GRID_VIEW)
+                        .size(14.0)
+                        .color(if !self.content_list_view {
+                            Color32::WHITE
+                        } else {
+                            Color32::from_rgb(140, 145, 155)
+                        }),
+                )
+                .engine_tooltip("Grid View", "Show assets as thumbnails in a grid", None)
+                .clicked()
+            {
                 self.content_list_view = false;
             }
         });
         ui.horizontal(|ui| {
             if ui
-                .add_enabled(self.history_index > 0, egui::Button::new("‹"))
-                .on_hover_text("Back")
+                .add_enabled(self.history_index > 0, egui::Button::new(RichText::new(Icons::BACK).size(13.0)))
+                .engine_tooltip("Back", "Return to the previous folder", Some("Alt+Left"))
                 .clicked()
             {
                 self.history_index -= 1;
@@ -1270,15 +1817,19 @@ impl Editor {
             if ui
                 .add_enabled(
                     self.history_index + 1 < self.content_history.len(),
-                    egui::Button::new("›"),
+                    egui::Button::new(RichText::new(Icons::FORWARD).size(13.0)),
                 )
-                .on_hover_text("Forward")
+                .engine_tooltip("Forward", "Return to the next folder", Some("Alt+Right"))
                 .clicked()
             {
                 self.history_index += 1;
                 self.content_dir = self.content_history[self.history_index].clone();
             }
-            if ui.button("⌂").on_hover_text("Content root").clicked() {
+            if ui
+                .button(RichText::new(Icons::HOME).size(13.0))
+                .engine_tooltip("Content Root", "Navigate to the root content folder", None)
+                .clicked()
+            {
                 self.navigate_content(self.content_root.clone());
             }
         });
@@ -1306,7 +1857,7 @@ impl Editor {
             }
         });
         ui.horizontal(|ui| {
-            ui.label("⌕");
+            Icons::show(ui, Icons::SEARCH, IconSize::Small, Some(Color32::from_rgb(120, 135, 155)));
             ui.add(
                 egui::TextEdit::singleline(&mut self.filter)
                     .hint_text("Search assets…")
@@ -1332,16 +1883,22 @@ impl Editor {
                         ui.selectable_value(&mut self.content_type_filter, kind.into(), kind);
                     }
                 });
-            ui.menu_button("+ Create", |ui| {
-                if ui.button("Folder").clicked() {
+            ui.menu_button(format!("{} Create", Icons::ADD), |ui| {
+                if ui.button(format!("{} Folder", Icons::FOLDER)).clicked() {
                     self.create_content_folder();
                     ui.close();
                 }
                 for (label, ext) in [("Scene", "ron"), ("Material", "mat"), ("Script", "rs")] {
-                    if ui.button(label).clicked() {
+                    if ui.button(format!("{} {}", Icons::FILE, label)).clicked() {
                         self.create_content_file(ext);
                         ui.close();
                     }
+                }
+                ui.separator();
+                if ui.button(format!("{} Import Sample Texture…", Icons::IMPORT)).clicked() {
+                    let dir = self.content_dir.clone();
+                    self.import_dummy_resource(&dir);
+                    ui.close();
                 }
             });
         });
@@ -1398,13 +1955,15 @@ impl Editor {
                         .to_string_lossy()
                         .to_string();
                     let kind = content_kind(&path);
+                    let is_dir = path.is_dir();
+                    let icon = content_icon(&path);
                     let response = ui.selectable_label(
                         self.content_selected.as_ref() == Some(&path),
-                        format!("{}  {}   · {}", content_icon(&path), name, kind),
+                        format!("{}  {}   · {}", icon, name, kind),
                     );
                     if response.clicked() {
                         self.content_selected = Some(path.clone());
-                        if path.is_dir() {
+                        if is_dir {
                             self.navigate_content(path.clone());
                         }
                     }
@@ -1433,10 +1992,16 @@ impl Editor {
                                         } else {
                                             Color32::from_rgb(39, 41, 46)
                                         };
+                                        let border = if selected {
+                                            Color32::from_rgb(82, 166, 235)
+                                        } else {
+                                            Color32::from_rgb(50, 53, 58)
+                                        };
                                         egui::Frame::new()
                                             .fill(fill)
                                             .corner_radius(4)
                                             .inner_margin(6.0)
+                                            .stroke(egui::Stroke::new(1.0, border))
                                             .show(ui, |ui| {
                                                 ui.set_min_width(68.0);
                                                 ui.set_min_height(70.0);
@@ -1496,31 +2061,33 @@ impl Editor {
     }
 
     fn content_context_menu(&mut self, ui: &mut egui::Ui, path: &Path) {
-        if path.is_dir() && ui.button("Open").clicked() {
+        if path.is_dir() && ui.button(format!("{} Open", Icons::FOLDER_OPEN)).clicked() {
             self.navigate_content(path.to_path_buf());
             ui.close();
         }
-        if ui.button("Create Folder").clicked() {
+        if ui.button(format!("{} Create Folder", Icons::FOLDER_NEW)).clicked() {
             self.create_content_folder();
             ui.close();
         }
-        if ui.button("Rename").clicked() {
+        if ui.button(format!("{} Rename", Icons::RENAME)).clicked() {
             self.rename_content(path);
             ui.close();
         }
-        if ui.button("Duplicate").clicked() {
+        if ui.button(format!("{} Duplicate", Icons::DUPLICATE)).clicked() {
             self.duplicate_content(path);
             ui.close();
         }
-        if ui.button("Delete").clicked() {
-            self.delete_content(path);
+        if ui.button(format!("{} Delete", Icons::DELETE)).clicked() {
+            self.prompt_delete_resource(path.to_path_buf());
             ui.close();
         }
-        if ui
-            .button("Import…")
-            .on_hover_text("Unavailable: file picker integration is not implemented")
-            .clicked()
-        {
+        if ui.button(format!("{} Import Sample Texture…", Icons::IMPORT)).clicked() {
+            let target = if path.is_dir() {
+                path.to_path_buf()
+            } else {
+                path.parent().unwrap_or(path).to_path_buf()
+            };
+            self.import_dummy_resource(&target);
             ui.close();
         }
         if ui.button("Show in Explorer").clicked() {
@@ -1644,10 +2211,26 @@ impl Editor {
         ui.horizontal(|ui| {
             ui.heading("WORLD OUTLINER");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("+ Actor").clicked() {
+                if ui
+                    .button(
+                        RichText::new(format!("{} Actor", Icons::ADD))
+                            .size(11.0)
+                            .color(Color32::WHITE),
+                    )
+                    .engine_tooltip("Add Actor", "Add a new actor to the scene", Some("Ctrl+A"))
+                    .clicked()
+                {
                     self.create_entity(world);
                 }
-                if ui.button("+ Group").clicked() {
+                if ui
+                    .button(
+                        RichText::new(format!("{} Group", Icons::FOLDER_NEW))
+                            .size(11.0)
+                            .color(Color32::WHITE),
+                    )
+                    .engine_tooltip("Create Group", "Create a new folder group to organize actors", None)
+                    .clicked()
+                {
                     let e = world
                         .spawn((
                             Name("New Folder".into()),
@@ -1661,7 +2244,7 @@ impl Editor {
             });
         });
         ui.horizontal(|ui| {
-            ui.label("⌕");
+            Icons::show(ui, Icons::SEARCH, IconSize::Small, Some(Color32::from_rgb(120, 135, 155)));
             ui.add(
                 egui::TextEdit::singleline(&mut self.filter)
                     .hint_text("Search actors…")
@@ -1774,7 +2357,7 @@ impl Editor {
                 if depth > 0 {
                     ui.add_space((depth as f32) * 12.0);
                 }
-                let icon = if is_folder { "📁" } else { "◇" };
+                let icon = if is_folder { Icons::FOLDER } else { Icons::ENTITY };
                 let is_selected = self.selected_entities.contains(&entity);
                 let label = format!("{icon}  {name}");
                 let response = ui.selectable_label(is_selected, label);
@@ -1782,8 +2365,20 @@ impl Editor {
                 if response.clicked() {
                     self.set_selected_entity(Some(entity), ctrl);
                 }
-                let vis_icon = if visible { "👁" } else { "⊘" };
-                if ui.small_button(vis_icon).clicked() {
+                let vis_icon = if visible { Icons::VISIBLE } else { Icons::HIDDEN };
+                if ui
+                    .button(
+                        RichText::new(vis_icon)
+                            .size(12.0)
+                            .color(if visible { Color32::from_rgb(100, 200, 100) } else { Color32::from_rgb(120, 120, 120) }),
+                    )
+                    .engine_tooltip(
+                        if visible { "Hide Actor" } else { "Show Actor" },
+                        if visible { "Hide this actor from the viewport" } else { "Make this actor visible in the viewport" },
+                        None,
+                    )
+                    .clicked()
+                {
                     if let Some(mut v) = world.get_mut::<Visible>(entity) {
                         v.0 = !v.0;
                     } else {
@@ -1791,8 +2386,20 @@ impl Editor {
                     }
                     self.dirty = true;
                 }
-                let lock_icon = if locked { "🔒" } else { "🔓" };
-                if ui.small_button(lock_icon).clicked() {
+                let lock_icon = if locked { Icons::LOCKED } else { Icons::UNLOCKED };
+                if ui
+                    .button(
+                        RichText::new(lock_icon)
+                            .size(12.0)
+                            .color(if locked { Color32::from_rgb(220, 180, 60) } else { Color32::from_rgb(120, 120, 120) }),
+                    )
+                    .engine_tooltip(
+                        if locked { "Unlock Actor" } else { "Lock Actor" },
+                        if locked { "Allow this actor to be selected and modified" } else { "Prevent this actor from being selected or modified" },
+                        None,
+                    )
+                    .clicked()
+                {
                     if let Some(mut l) = world.get_mut::<Locked>(entity) {
                         l.0 = !l.0;
                     } else {
@@ -1801,12 +2408,12 @@ impl Editor {
                     self.dirty = true;
                 }
                 response.context_menu(|ui| {
-                    if ui.button("Rename").clicked() {
+                    if ui.button(format!("{} Rename", Icons::RENAME)).clicked() {
                         self.rename_entity = Some(entity);
                         self.rename_buffer = name.clone();
                         ui.close();
                     }
-                    if ui.button("Make Child of Selected").clicked() {
+                    if ui.button(format!("{} Make Child of Selected", Icons::ENTITY)).clicked() {
                         if let Some(parent) = self.selected {
                             if parent != entity {
                                 world.entity_mut(entity).insert(Parent(parent));
@@ -1815,14 +2422,14 @@ impl Editor {
                         }
                         ui.close();
                     }
-                    if ui.button("Detach From Parent").clicked() {
+                    if ui.button(format!("{} Detach From Parent", Icons::EMPTY_ENTITY)).clicked() {
                         world.entity_mut(entity).remove::<Parent>();
                         self.dirty = true;
                         ui.close();
                     }
-                    if ui.button("Delete").clicked() {
+                    if ui.button(format!("{} Delete", Icons::DELETE)).clicked() {
                         self.set_selected_entity(Some(entity), false);
-                        self.delete_selected(world);
+                        self.prompt_delete_selected(world);
                         ui.close();
                     }
                 });
@@ -1841,7 +2448,15 @@ impl Editor {
         ui.separator();
 
         let Some(entity) = self.selected else {
-            ui.label("Select an actor to inspect properties");
+            ui.vertical_centered(|ui| {
+                Icons::show(ui, Icons::EMPTY_ENTITY, IconSize::Large, Some(Color32::from_rgb(100, 105, 115)));
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new("Select an actor to inspect properties")
+                        .size(12.0)
+                        .color(Color32::from_rgb(130, 135, 145)),
+                );
+            });
             return;
         };
 
@@ -1851,7 +2466,15 @@ impl Editor {
             .unwrap_or_else(|| "Unnamed".into());
         ui.horizontal(|ui| {
             ui.label(RichText::new(&entity_name).strong());
-            if ui.button("Rename").clicked() {
+            if ui
+                .button(
+                    RichText::new(format!("{} Rename", Icons::RENAME))
+                        .size(11.0)
+                        .color(Color32::WHITE),
+                )
+                .engine_tooltip("Rename Actor", "Rename the selected actor", Some("F2"))
+                .clicked()
+            {
                 self.rename_entity = Some(entity);
                 self.rename_buffer = entity_name.clone();
             }
@@ -1859,169 +2482,218 @@ impl Editor {
         ui.separator();
 
         egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.collapsing("Transform", |ui| {
-                ui.horizontal(|ui| {
-                    if ui.button("Copy").clicked() {
-                        if let Some(t) = world.get::<Transform>(entity) {
-                            self.copied_transform = Some(*t);
-                            self.log.push(("INFO".into(), "Transform copied".into()));
-                        }
-                    }
-                    if ui
-                        .add_enabled(self.copied_transform.is_some(), egui::Button::new("Paste"))
-                        .clicked()
-                    {
-                        if let (Some(mut t), Some(src)) =
-                            (world.get_mut::<Transform>(entity), self.copied_transform)
-                        {
-                            *t = src;
-                            self.dirty = true;
-                            self.log.push(("INFO".into(), "Transform pasted".into()));
-                        }
-                    }
-                    if ui.button("Reset All").clicked() {
-                        if let Some(mut t) = world.get_mut::<Transform>(entity) {
-                            *t = Transform::default();
-                            self.dirty = true;
-                        }
-                    }
-                });
-
-                if let Some(mut t) = world.get_mut::<Transform>(entity) {
+            ui.collapsing(
+                format!("{} Transform", Icons::TRANSFORM),
+                |ui| {
                     ui.horizontal(|ui| {
-                        ui.label("Location");
-                        if ui.small_button("↺").on_hover_text("Reset to 0").clicked() {
-                            t.translation = Vec3::ZERO;
-                            self.dirty = true;
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.add(
-                            egui::DragValue::new(&mut t.translation.x)
-                                .prefix("X ")
-                                .speed(0.1),
-                        );
-                        ui.add(
-                            egui::DragValue::new(&mut t.translation.y)
-                                .prefix("Y ")
-                                .speed(0.1),
-                        );
-                        ui.add(
-                            egui::DragValue::new(&mut t.translation.z)
-                                .prefix("Z ")
-                                .speed(0.1),
-                        );
-                    });
-
-                    let (mut rx, mut ry, mut rz) = t.rotation.to_euler(glam::EulerRot::XYZ);
-                    ui.horizontal(|ui| {
-                        ui.label("Rotation");
                         if ui
-                            .small_button("↺")
-                            .on_hover_text("Reset rotation")
+                            .button(
+                                RichText::new(format!("{} Copy", Icons::COPY))
+                                    .size(11.0)
+                                    .color(Color32::WHITE),
+                            )
+                            .engine_tooltip("Copy Transform", "Copy the transform to clipboard", Some("Ctrl+C"))
                             .clicked()
                         {
-                            t.rotation = glam::Quat::IDENTITY;
-                            self.dirty = true;
+                            if let Some(t) = world.get::<Transform>(entity) {
+                                self.copied_transform = Some(*t);
+                                self.log.push(("INFO".into(), "Transform copied".into()));
+                            }
+                        }
+                        if ui
+                            .add_enabled(
+                                self.copied_transform.is_some(),
+                                egui::Button::new(
+                                    RichText::new(format!("{} Paste", Icons::PASTE)).size(11.0),
+                                ),
+                            )
+                            .engine_tooltip("Paste Transform", "Paste transform from clipboard", Some("Ctrl+V"))
+                            .clicked()
+                        {
+                            if let (Some(mut t), Some(src)) =
+                                (world.get_mut::<Transform>(entity), self.copied_transform)
+                            {
+                                *t = src;
+                                self.dirty = true;
+                                self.log.push(("INFO".into(), "Transform pasted".into()));
+                            }
+                        }
+                        if ui
+                            .button(
+                                RichText::new(format!("{} Reset All", Icons::RESET))
+                                    .size(11.0)
+                                    .color(Color32::WHITE),
+                            )
+                            .engine_tooltip("Reset Transform", "Reset transform to default values", None)
+                            .clicked()
+                        {
+                            if let Some(mut t) = world.get_mut::<Transform>(entity) {
+                                *t = Transform::default();
+                                self.dirty = true;
+                            }
                         }
                     });
-                    let rot_changed = ui
-                        .horizontal(|ui| {
-                            let mut changed = false;
-                            changed |= ui
-                                .add(egui::DragValue::new(&mut rx).prefix("X ").speed(0.02))
-                                .changed();
-                            changed |= ui
-                                .add(egui::DragValue::new(&mut ry).prefix("Y ").speed(0.02))
-                                .changed();
-                            changed |= ui
-                                .add(egui::DragValue::new(&mut rz).prefix("Z ").speed(0.02))
-                                .changed();
-                            changed
-                        })
-                        .inner;
-                    if rot_changed {
-                        t.rotation = glam::Quat::from_euler(glam::EulerRot::XYZ, rx, ry, rz);
-                        self.dirty = true;
-                    }
 
-                    ui.horizontal(|ui| {
-                        ui.label("Scale");
-                        if ui.small_button("↺").on_hover_text("Reset to 1").clicked() {
-                            t.scale = Vec3::ONE;
-                            self.dirty = true;
-                        }
-                    });
-                    let mut scale_changed = false;
-                    ui.horizontal(|ui| {
-                        scale_changed |= ui
-                            .add(
-                                egui::DragValue::new(&mut t.scale.x)
+                    if let Some(mut t) = world.get_mut::<Transform>(entity) {
+                        ui.horizontal(|ui| {
+                            ui.label("Location");
+                            if ui
+                                .button(
+                                    RichText::new(Icons::RESET)
+                                        .size(11.0)
+                                        .color(Color32::from_rgb(140, 145, 155)),
+                                )
+                                .engine_tooltip("Reset Location", "Set location to (0, 0, 0)", None)
+                                .clicked()
+                            {
+                                t.translation = Vec3::ZERO;
+                                self.dirty = true;
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::DragValue::new(&mut t.translation.x)
                                     .prefix("X ")
-                                    .speed(0.02)
-                                    .range(0.001..=1000.0),
-                            )
-                            .changed();
-                        scale_changed |= ui
-                            .add(
-                                egui::DragValue::new(&mut t.scale.y)
+                                    .speed(0.1),
+                            );
+                            ui.add(
+                                egui::DragValue::new(&mut t.translation.y)
                                     .prefix("Y ")
-                                    .speed(0.02)
-                                    .range(0.001..=1000.0),
-                            )
-                            .changed();
-                        scale_changed |= ui
-                            .add(
-                                egui::DragValue::new(&mut t.scale.z)
+                                    .speed(0.1),
+                            );
+                            ui.add(
+                                egui::DragValue::new(&mut t.translation.z)
                                     .prefix("Z ")
-                                    .speed(0.02)
-                                    .range(0.001..=1000.0),
-                            )
-                            .changed();
-                    });
-                    if scale_changed {
-                        self.dirty = true;
-                    }
-                }
-            });
+                                    .speed(0.1),
+                            );
+                        });
 
-            ui.collapsing("Components", |ui| {
-                let has_parent = world.get::<Parent>(entity).is_some();
-                let has_group = world.get::<FolderGroup>(entity).is_some();
-                let has_visible = world.get::<Visible>(entity).is_some();
-                let has_locked = world.get::<Locked>(entity).is_some();
-                ui.label(format!("• Name ({entity_name})"));
-                ui.label("• Transform");
-                if has_parent {
-                    ui.label("• Parent");
-                }
-                if has_group {
-                    ui.label("• FolderGroup");
-                }
-                if has_visible {
-                    ui.label("• Visible");
-                }
-                if has_locked {
-                    ui.label("• Locked");
-                }
-                ui.separator();
-                ui.menu_button("+ Add Component", |ui| {
-                    if !has_group && ui.button("FolderGroup").clicked() {
-                        world
-                            .entity_mut(entity)
-                            .insert(FolderGroup("Folder".into()));
-                        self.dirty = true;
-                        ui.close();
+                        let (mut rx, mut ry, mut rz) = t.rotation.to_euler(glam::EulerRot::XYZ);
+                        ui.horizontal(|ui| {
+                            ui.label("Rotation");
+                            if ui
+                                .button(
+                                    RichText::new(Icons::RESET)
+                                        .size(11.0)
+                                        .color(Color32::from_rgb(140, 145, 155)),
+                                )
+                                .engine_tooltip("Reset Rotation", "Set rotation to identity (no rotation)", None)
+                                .clicked()
+                            {
+                                t.rotation = glam::Quat::IDENTITY;
+                                self.dirty = true;
+                            }
+                        });
+                        let rot_changed = ui
+                            .horizontal(|ui| {
+                                let mut changed = false;
+                                changed |= ui
+                                    .add(egui::DragValue::new(&mut rx).prefix("X ").speed(0.02))
+                                    .changed();
+                                changed |= ui
+                                    .add(egui::DragValue::new(&mut ry).prefix("Y ").speed(0.02))
+                                    .changed();
+                                changed |= ui
+                                    .add(egui::DragValue::new(&mut rz).prefix("Z ").speed(0.02))
+                                    .changed();
+                                changed
+                            })
+                            .inner;
+                        if rot_changed {
+                            t.rotation = glam::Quat::from_euler(glam::EulerRot::XYZ, rx, ry, rz);
+                            self.dirty = true;
+                        }
+
+                        ui.horizontal(|ui| {
+                            ui.label("Scale");
+                            if ui
+                                .button(
+                                    RichText::new(Icons::RESET)
+                                        .size(11.0)
+                                        .color(Color32::from_rgb(140, 145, 155)),
+                                )
+                                .engine_tooltip("Reset Scale", "Set scale to (1, 1, 1)", None)
+                                .clicked()
+                            {
+                                t.scale = Vec3::ONE;
+                                self.dirty = true;
+                            }
+                        });
+                        let mut scale_changed = false;
+                        ui.horizontal(|ui| {
+                            scale_changed |= ui
+                                .add(
+                                    egui::DragValue::new(&mut t.scale.x)
+                                        .prefix("X ")
+                                        .speed(0.02)
+                                        .range(0.001..=1000.0),
+                                )
+                                .changed();
+                            scale_changed |= ui
+                                .add(
+                                    egui::DragValue::new(&mut t.scale.y)
+                                        .prefix("Y ")
+                                        .speed(0.02)
+                                        .range(0.001..=1000.0),
+                                )
+                                .changed();
+                            scale_changed |= ui
+                                .add(
+                                    egui::DragValue::new(&mut t.scale.z)
+                                        .prefix("Z ")
+                                        .speed(0.02)
+                                        .range(0.001..=1000.0),
+                                )
+                                .changed();
+                        });
+                        if scale_changed {
+                            self.dirty = true;
+                        }
                     }
-                    if !has_visible && ui.button("Visible").clicked() {
-                        world.entity_mut(entity).insert(Visible(true));
-                        self.dirty = true;
-                        ui.close();
+                },
+            );
+
+            ui.collapsing(
+                format!("{} Components", Icons::COMPONENTS),
+                |ui| {
+                    let has_parent = world.get::<Parent>(entity).is_some();
+                    let has_group = world.get::<FolderGroup>(entity).is_some();
+                    let has_visible = world.get::<Visible>(entity).is_some();
+                    let has_locked = world.get::<Locked>(entity).is_some();
+                    ui.label(format!("{} Name ({entity_name})", Icons::ENTITY));
+                    ui.label(format!("{} Transform", Icons::TRANSFORM));
+                    if has_parent {
+                        ui.label(format!("{} Parent", Icons::ENTITY));
                     }
-                    if !has_locked && ui.button("Locked").clicked() {
-                        world.entity_mut(entity).insert(Locked(false));
-                        self.dirty = true;
-                        ui.close();
+                    if has_group {
+                        ui.label(format!("{} FolderGroup", Icons::FOLDER));
+                    }
+                    if has_visible {
+                        ui.label(format!("{} Visible", Icons::VISIBLE));
+                    }
+                    if has_locked {
+                        ui.label(format!("{} Locked", Icons::LOCKED));
+                    }
+                    ui.separator();
+                    ui.menu_button(
+                        format!("{} Add Component", Icons::ADD),
+                        |ui| {
+                            if !has_group && ui.button(format!("{} FolderGroup", Icons::FOLDER)).clicked() {
+                                world
+                                    .entity_mut(entity)
+                                    .insert(FolderGroup("Folder".into()));
+                                self.dirty = true;
+                                ui.close();
+                            }
+                            if !has_visible && ui.button(format!("{} Visible", Icons::VISIBLE)).clicked() {
+                                world.entity_mut(entity).insert(Visible(true));
+                                self.dirty = true;
+                                ui.close();
+                            }
+                            if !has_locked && ui.button(format!("{} Locked", Icons::LOCKED)).clicked() {
+                                world.entity_mut(entity).insert(Locked(false));
+                                self.dirty = true;
+                                ui.close();
                     }
                     ui.label("Custom scripts/components ready for expansion");
                 });
@@ -2029,7 +2701,7 @@ impl Editor {
 
             ui.separator();
             if ui.button("Delete Actor").clicked() {
-                self.delete_selected(world);
+                self.prompt_delete_selected(world);
             }
         });
     }
@@ -2053,6 +2725,78 @@ impl Editor {
         self.set_selected_entity(Some(e), false);
         self.dirty = true;
         self.log.push(("INFO".into(), "Created actor".into()));
+        self.notifications
+            .success("Actor Spawned", "Added 'New Actor' at scene origin");
+    }
+    pub fn prompt_delete_selected(&mut self, world: &World) {
+        let targets = if !self.selected_entities.is_empty() {
+            self.selected_entities.iter().copied().collect::<Vec<_>>()
+        } else if let Some(e) = self.selected {
+            vec![e]
+        } else {
+            return;
+        };
+
+        if targets.is_empty() {
+            return;
+        }
+
+        let names: Vec<String> = targets
+            .iter()
+            .map(|&e| {
+                world
+                    .get::<Name>(e)
+                    .map(|n| n.0.clone())
+                    .unwrap_or_else(|| "Unnamed Actor".into())
+            })
+            .collect();
+
+        self.confirm_dialog = Some(ConfirmDialog::delete_entities(targets, names));
+    }
+    pub fn prompt_delete_resource(&mut self, path: PathBuf) {
+        self.confirm_dialog = Some(ConfirmDialog::delete_content(path));
+    }
+    pub fn prompt_reload_scene(&mut self, world: &mut World) {
+        if self.dirty {
+            self.confirm_dialog = Some(ConfirmDialog::unsaved_changes(PendingAction::LoadScene));
+        } else {
+            self.load_scene(world);
+        }
+    }
+    pub fn new_scene(&mut self, world: &mut World) {
+        let entities: Vec<Entity> = world
+            .query_filtered::<Entity, (
+                bevy_ecs::query::With<Transform>,
+                bevy_ecs::query::With<Name>,
+                bevy_ecs::query::Without<CameraController>,
+            )>()
+            .iter(world)
+            .collect();
+        for e in entities {
+            let _ = world.despawn(e);
+        }
+        self.selected = None;
+        self.selected_entities.clear();
+        self.dirty = false;
+        self.status = "New scene created".into();
+        self.log.push(("INFO".into(), "Created empty scene".into()));
+        self.notifications.success("New Scene", "Initialized new empty scene");
+    }
+    fn import_dummy_resource(&mut self, target_dir: &Path) {
+        let dest = target_dir.join("sample_asset.obj");
+        let content = "# Wavefront OBJ mesh\nv 0.0 0.0 0.0\nv 1.0 0.0 0.0\nv 0.0 1.0 0.0\nf 1 2 3\n";
+        if let Err(e) = std::fs::write(&dest, content) {
+            self.notifications.error("Import Failed", format!("{e}"));
+            self.log.push(("ERROR".into(), format!("Import failed: {e}")));
+        } else {
+            self.notifications.success(
+                "Resource Imported",
+                "Successfully imported 'sample_asset.obj'",
+            );
+            self.log
+                .push(("INFO".into(), "Imported resource: sample_asset.obj".into()));
+            self.content_selected = Some(dest);
+        }
     }
     fn delete_selected(&mut self, world: &mut World) {
         let targets = if !self.selected_entities.is_empty() {
@@ -2095,10 +2839,22 @@ impl Editor {
                     "INFO".into(),
                     format!("Saved {}", self.scene_path.display()),
                 ));
+                self.notifications.success(
+                    "Scene Saved",
+                    format!(
+                        "Saved {} actor(s) to {}",
+                        scene.entities.len(),
+                        self.scene_path
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                    ),
+                );
             }
             Err(e) => {
                 self.status = format!("Save failed: {e}");
                 self.log.push(("ERROR".into(), self.status.clone()));
+                self.notifications.error("Save Failed", format!("{e}"));
             }
         }
     }
@@ -2118,6 +2874,7 @@ impl Editor {
                 for e in entities {
                     let _ = world.despawn(e);
                 }
+                let count = scene.entities.len();
                 for item in scene.entities {
                     let mut t = Transform::from_translation(Vec3::from_array(item.translation));
                     t.rotation = glam::Quat::from_array(item.rotation);
@@ -2126,6 +2883,18 @@ impl Editor {
                 }
                 self.dirty = false;
                 self.status = "Loaded".into();
+                self.log
+                    .push(("INFO".into(), format!("Loaded scene with {count} actor(s)")));
+                self.notifications.info(
+                    "Scene Reloaded",
+                    format!(
+                        "Restored {count} actor(s) from {}",
+                        self.scene_path
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                    ),
+                );
             }
             None => {
                 self.status = "Scene load failed".into();
@@ -2257,12 +3026,12 @@ fn content_kind(path: &Path) -> &'static str {
 }
 fn content_icon(path: &Path) -> &'static str {
     match content_kind(path) {
-        "Folder" => "▰",
-        "Scene" => "▣",
-        "Material" => "◈",
-        "Texture" => "▧",
-        "Model" => "⬡",
-        "Script" => "⌘",
-        _ => "▤",
+        "Folder" => Icons::FOLDER,
+        "Scene" => Icons::SCENE,
+        "Material" => Icons::MATERIAL,
+        "Texture" => Icons::TEXTURE,
+        "Model" => Icons::MODEL,
+        "Script" => Icons::SCRIPT,
+        _ => Icons::FILE,
     }
 }
