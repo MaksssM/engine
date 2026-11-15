@@ -13,13 +13,14 @@ use winit::{
 use crate::{
     camera::{Camera3D, CameraController},
     ecs::Ecs,
+    editor::Editor,
     events::Events,
     input::InputState,
     quality::QualityPreset,
     renderer::{Renderable, Renderer},
     time::{Clock, FixedTimestep, FpsMeter},
     transform::{GlobalTransform, Transform, propagate_transforms},
-    ui::MouseInput,
+    ui_new::MouseInput,
 };
 
 pub fn run() -> Result<(), winit::error::EventLoopError> {
@@ -58,6 +59,9 @@ struct EngineApp {
     show_debug_panel: bool,
     show_quality_panel: bool,
     show_camera_panel: bool,
+    // UI state - now handled by renderer's UI system
+    quality_preset_index: usize,
+    editor: Option<Editor>,
 }
 
 impl ApplicationHandler for EngineApp {
@@ -89,6 +93,7 @@ impl ApplicationHandler for EngineApp {
                 );
                 match pollster::block_on(Renderer::new(Arc::clone(&window), preset)) {
                     Ok(renderer) => {
+                        let editor = Editor::new(&window, &renderer.device, renderer.config.format);
                         let cube_mesh = renderer.cube_mesh();
                         let cube_material = renderer.cube_material();
                         let red_material = renderer.red_material();
@@ -157,7 +162,8 @@ impl ApplicationHandler for EngineApp {
                             Transform::from_translation(camera_position),
                         ));
                         info!(?camera, "ECS camera spawned");
-                        self.window = Some(window);
+                        self.editor = Some(editor);
+                        self.window = Some(window.clone());
                         self.clock = Some(Clock::new());
                         self.timestep =
                             Some(FixedTimestep::new(Duration::from_secs_f64(1.0 / 60.0)));
@@ -180,6 +186,12 @@ impl ApplicationHandler for EngineApp {
             return;
         }
 
+        if let (Some(editor), Some(window)) = (self.editor.as_mut(), self.window.as_ref()) {
+            if editor.on_window_event(window, &event) {
+                return;
+            }
+        }
+
         match event {
             WindowEvent::CloseRequested => {
                 info!("shutting down engine");
@@ -195,12 +207,10 @@ impl ApplicationHandler for EngineApp {
                 button: MouseButton::Left,
                 ..
             } => {
+                let was_down = self.mouse.left_down;
                 self.mouse.left_down = matches!(state, ElementState::Pressed);
-                if matches!(state, ElementState::Released) {
-                    self.mouse.left_clicked = true;
-                } else {
-                    self.mouse.left_clicked = false;
-                }
+                self.mouse.left_clicked = !was_down && self.mouse.left_down;
+                self.mouse.left_released = was_down && !self.mouse.left_down;
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.mouse.x = position.x as f32;
@@ -219,6 +229,126 @@ impl ApplicationHandler for EngineApp {
 }
 
 impl EngineApp {
+    fn update(&mut self) {
+        let frame_time = {
+            let Some(clock) = self.clock.as_mut() else {
+                return;
+            };
+            clock.tick()
+        };
+        self.input.begin_frame();
+        self.process_events();
+
+        let updates = self
+            .timestep
+            .as_mut()
+            .expect("timestep initialized with clock")
+            .add_frame(frame_time);
+        let step_seconds = self
+            .timestep
+            .as_ref()
+            .expect("timestep initialized")
+            .step()
+            .as_secs_f32();
+
+        // Always run renderer.update at least once so model buffers are created
+        // before the first render_scene call. Camera controller only advances when
+        // there are actual fixed-timestep updates.
+        if updates > 0 {
+            self.update_camera_controller(step_seconds);
+        }
+        for _ in 0..updates.max(1) {
+            if let Some(renderer) = self.renderer.as_mut() {
+                renderer.update(&mut self.ecs.world, step_seconds);
+            }
+        }
+
+        propagate_transforms(&mut self.ecs.world);
+        let entity_count = self
+            .ecs
+            .world
+            .query::<bevy_ecs::entity::Entity>()
+            .iter(&self.ecs.world)
+            .count();
+        let renderable_count = self
+            .ecs
+            .world
+            .query::<&Renderable>()
+            .iter(&self.ecs.world)
+            .count();
+        let fps = self.fps.fps();
+        let frame_time_ms = frame_time.as_secs_f64() * 1000.0;
+
+        // Process UI widgets before rendering (writes to renderer state)
+        self.process_ui();
+        if let Some(editor) = self.editor.as_mut() {
+            editor.apply_view_camera(&mut self.ecs.world);
+        }
+
+        if let Some(renderer) = self.renderer.as_mut() {
+            let camera_data = self
+                .ecs
+                .world
+                .query::<(&Camera3D, &GlobalTransform)>()
+                .iter(&self.ecs.world)
+                .next()
+                .map(|(camera, transform)| (*camera, *transform));
+            if let Some((camera, transform)) = camera_data {
+                renderer.set_camera(&camera, &transform);
+            }
+            match renderer.render_scene(&mut self.ecs.world) {
+                Ok((frame, view)) => {
+                    if let (Some(window), Some(editor)) =
+                        (self.window.as_ref(), self.editor.as_mut())
+                    {
+                        editor.draw(
+                            window,
+                            frame,
+                            &view,
+                            &renderer.device,
+                            &renderer.queue,
+                            &mut self.ecs.world,
+                            fps as f32,
+                        );
+                        renderer.wireframe_mode = editor.wireframe;
+                    }
+                }
+                Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                    if let Some(window) = self.window.as_ref() {
+                        renderer.resize(window.inner_size());
+                    }
+                }
+                Err(wgpu::SurfaceError::OutOfMemory) => warn!("GPU is out of memory"),
+                Err(wgpu::SurfaceError::Timeout) => warn!("GPU frame timed out"),
+                Err(wgpu::SurfaceError::Other) => warn!("GPU surface error"),
+            }
+        }
+
+        if self.fps.record_frame(frame_time).is_some() {
+            let fixed_step_ms = self
+                .timestep
+                .as_ref()
+                .expect("timestep initialized with clock")
+                .step()
+                .as_secs_f64()
+                * 1000.0;
+            info!(
+                fps,
+                entities = entity_count,
+                renderables = renderable_count,
+                frame_ms = frame_time_ms,
+                fixed_step_ms,
+                elapsed_seconds = self
+                    .clock
+                    .as_ref()
+                    .expect("clock initialized")
+                    .elapsed()
+                    .as_secs_f64(),
+                "performance"
+            );
+        }
+    }
+
     fn update_camera_controller(&mut self, delta_seconds: f32) {
         let mut query = self
             .ecs
@@ -338,114 +468,17 @@ impl EngineApp {
         }
     }
 
-    fn update(&mut self) {
-        let frame_time = {
-            let Some(clock) = self.clock.as_mut() else {
-                return;
-            };
-            clock.tick()
-        };
-        self.input.begin_frame();
-        self.process_events();
-
-        let updates = self
-            .timestep
-            .as_mut()
-            .expect("timestep initialized with clock")
-            .add_frame(frame_time);
-        if updates > 0 {
-            let step_seconds = self
-                .timestep
-                .as_ref()
-                .expect("timestep initialized")
-                .step()
-                .as_secs_f32();
-            self.update_camera_controller(step_seconds);
-            for _ in 0..updates {
-                if let Some(renderer) = self.renderer.as_mut() {
-                    renderer.update(&mut self.ecs.world, step_seconds);
-                }
+    fn process_ui(&mut self) {
+        if let Some(renderer) = &mut self.renderer {
+            if let Some(ui) = &mut renderer.ui {
+                ui.mouse_x = self.mouse.x;
+                ui.mouse_y = self.mouse.y;
+                ui.mouse_down = self.mouse.left_down;
+                ui.mouse_clicked = self.mouse.left_clicked;
+                ui.mouse_released = self.mouse.left_released;
             }
         }
-
-        propagate_transforms(&mut self.ecs.world);
-        if let Some(renderer) = self.renderer.as_mut() {
-            let camera_data = self
-                .ecs
-                .world
-                .query::<(&Camera3D, &GlobalTransform)>()
-                .iter(&self.ecs.world)
-                .next()
-                .map(|(camera, transform)| (*camera, *transform));
-            if let Some((camera, transform)) = camera_data {
-                renderer.set_camera(&camera, &transform);
-            }
-            match renderer.render(&mut self.ecs.world) {
-                Ok(()) => {}
-                Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
-                    if let Some(window) = self.window.as_ref() {
-                        renderer.resize(window.inner_size());
-                    }
-                }
-                Err(wgpu::SurfaceError::OutOfMemory) => warn!("GPU is out of memory"),
-                Err(wgpu::SurfaceError::Timeout) => warn!("GPU frame timed out"),
-                Err(wgpu::SurfaceError::Other) => warn!("GPU surface error"),
-            }
-        }
-
-        if self.fps.record_frame(frame_time).is_some() {
-            let entity_count = self
-                .ecs
-                .world
-                .query::<bevy_ecs::entity::Entity>()
-                .iter(&self.ecs.world)
-                .count();
-            let renderable_count = self
-                .ecs
-                .world
-                .query::<&Renderable>()
-                .iter(&self.ecs.world)
-                .count();
-            let fixed_step_ms = self
-                .timestep
-                .as_ref()
-                .expect("timestep initialized with clock")
-                .step()
-                .as_secs_f64()
-                * 1000.0;
-            let fps = self.fps.fps();
-            let preset = QualityPreset::from_environment();
-            let preset_settings = preset.settings();
-            let preset_name = match preset_settings.render_scale_percent {
-                75 => "Performance",
-                100 if !preset_settings.post_processing => "Balanced",
-                _ => "Quality",
-            }
-            .to_string();
-            let frame_time_ms = frame_time.as_secs_f64() * 1000.0;
-            if let Some(renderer) = self.renderer.as_mut() {
-                renderer.update_ui(
-                    fps as f32,
-                    entity_count,
-                    renderable_count,
-                    frame_time_ms,
-                    &preset_name,
-                );
-            }
-            info!(
-                fps,
-                entities = entity_count,
-                renderables = renderable_count,
-                frame_ms = frame_time_ms,
-                fixed_step_ms,
-                elapsed_seconds = self
-                    .clock
-                    .as_ref()
-                    .expect("clock initialized")
-                    .elapsed()
-                    .as_secs_f64(),
-                "performance"
-            );
-        }
+        self.mouse.left_clicked = false;
+        self.mouse.left_released = false;
     }
 }

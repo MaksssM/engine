@@ -4,10 +4,21 @@ use glam::Vec3;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+fn default_rotation() -> [f32; 4] {
+    [0.0, 0.0, 0.0, 1.0]
+}
+fn default_scale() -> [f32; 3] {
+    [1.0, 1.0, 1.0]
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SceneEntity {
     pub name: String,
     pub translation: [f32; 3],
+    #[serde(default = "default_rotation")]
+    pub rotation: [f32; 4],
+    #[serde(default = "default_scale")]
+    pub scale: [f32; 3],
     pub parent: Option<usize>,
 }
 
@@ -54,6 +65,8 @@ impl Scene {
         self.entities.push(SceneEntity {
             name: name.into(),
             translation: translation.to_array(),
+            rotation: default_rotation(),
+            scale: default_scale(),
             parent,
         });
         index

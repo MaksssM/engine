@@ -49,16 +49,13 @@ impl Default for CameraController {
 
 impl CameraController {
     pub fn forward(&self) -> Vec3 {
-        Vec3::new(
-            self.yaw.cos() * self.pitch.cos(),
-            self.pitch.sin(),
-            self.yaw.sin() * self.pitch.cos(),
-        )
-        .normalize()
+        let rot = glam::Quat::from_rotation_y(self.yaw) * glam::Quat::from_rotation_x(self.pitch);
+        rot.mul_vec3(Vec3::NEG_Z)
     }
 
     pub fn right(&self) -> Vec3 {
-        Vec3::new(-self.yaw.sin(), 0.0, self.yaw.cos()).normalize()
+        let rot = glam::Quat::from_rotation_y(self.yaw) * glam::Quat::from_rotation_x(self.pitch);
+        rot.mul_vec3(Vec3::X)
     }
 }
 

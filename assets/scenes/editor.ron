@@ -1,0 +1,39 @@
+(
+    entities: [
+        (
+            name: "scene-0",
+            translation: (0.0, -1.0, 0.0),
+            rotation: (0.0, 0.0, 0.0, 1.0),
+            scale: (4.0, 0.2, 4.0),
+            parent: None,
+        ),
+        (
+            name: "scene-1",
+            translation: (0.0, 0.5, 0.0),
+            rotation: (0.0, 0.0, 0.0, 1.0),
+            scale: (1.0, 1.0, 1.0),
+            parent: None,
+        ),
+        (
+            name: "scene-2",
+            translation: (-2.5, 0.5, -1.0),
+            rotation: (0.0, 0.0, 0.0, 1.0),
+            scale: (0.6, 0.6, 0.6),
+            parent: None,
+        ),
+        (
+            name: "scene-3",
+            translation: (2.5, 0.5, 1.0),
+            rotation: (0.0, 0.0, 0.0, 1.0),
+            scale: (0.6, 0.6, 0.6),
+            parent: None,
+        ),
+        (
+            name: "scene-4",
+            translation: (0.0, 0.5, -2.5),
+            rotation: (0.0, 0.0, 0.0, 1.0),
+            scale: (0.6, 0.6, 0.6),
+            parent: None,
+        ),
+    ],
+)

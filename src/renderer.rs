@@ -4,6 +4,7 @@ use crate::{
     assets::{AssetManager, Handle},
     quality::{QualityPreset, ShaderVariant, ShadowQuality},
     transform::GlobalTransform,
+    ui_new::{Rect, Ui, UiRenderer},
 };
 use bevy_ecs::{component::Component, entity::Entity, world::World};
 use bytemuck::{Pod, Zeroable};
@@ -126,8 +127,10 @@ pub struct MeshAsset {
 }
 
 pub struct MaterialAsset {
-    pub pipeline: wgpu::RenderPipeline,
-    pub wireframe_pipeline: wgpu::RenderPipeline,
+    pub pipeline_1x: wgpu::RenderPipeline,
+    pub wireframe_pipeline_1x: wgpu::RenderPipeline,
+    pub pipeline_4x: wgpu::RenderPipeline,
+    pub wireframe_pipeline_4x: wgpu::RenderPipeline,
     pub color_buffer: wgpu::Buffer,
     pub color_bind_group: wgpu::BindGroup,
     pub color_bind_group_layout: wgpu::BindGroupLayout,
@@ -140,54 +143,60 @@ pub struct Renderable {
 }
 
 pub struct Renderer {
-    surface: wgpu::Surface<'static>,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    config: wgpu::SurfaceConfiguration,
-    window_size: winit::dpi::PhysicalSize<u32>,
-    render_scale_percent: u32,
-    post_processing: bool,
-    msaa_samples: u32,
-    shadow_quality: ShadowQuality,
-    mesh_assets: AssetManager<MeshAsset>,
-    material_assets: AssetManager<MaterialAsset>,
-    cube_mesh: Handle<MeshAsset>,
-    cube_material: Handle<MaterialAsset>,
-    red_material: Handle<MaterialAsset>,
-    green_material: Handle<MaterialAsset>,
-    blue_material: Handle<MaterialAsset>,
-    color_layout: wgpu::BindGroupLayout,
-    camera_buffer: wgpu::Buffer,
-    camera_bind_group: wgpu::BindGroup,
-    camera_layout: wgpu::BindGroupLayout,
-    light_buffer: wgpu::Buffer,
-    light_layout: wgpu::BindGroupLayout,
-    light_bind_group: wgpu::BindGroup,
-    shadow_depth_texture: wgpu::Texture,
-    shadow_depth_view: wgpu::TextureView,
-    shadow_sample_view: wgpu::TextureView,
-    shadow_sampler: wgpu::Sampler,
-    shadow_pipeline: wgpu::RenderPipeline,
-    depth_view: Option<wgpu::TextureView>,
-    msaa_view: Option<wgpu::TextureView>,
-    scene_view: Option<wgpu::TextureView>,
-    scene_sampler: wgpu::Sampler,
-    post_pipeline: Option<wgpu::RenderPipeline>,
-    post_bind_group: Option<wgpu::BindGroup>,
-    camera_position: Vec3,
-    camera_target: Vec3,
-    camera_fov: f32,
-    camera_near: f32,
-    camera_far: f32,
-    camera_angle: f32,
-    wireframe_mode: bool,
-    ui_renderer: Option<crate::ui::UiRenderer>,
-    fps: f32,
-    entity_count: usize,
-    renderable_count: usize,
-    preset_name: String,
-    frame_time_ms: f64,
-    _shader_variant: PhantomData<ShaderVariant>,
+    pub surface: wgpu::Surface<'static>,
+    pub device: wgpu::Device,
+    pub queue: wgpu::Queue,
+    pub config: wgpu::SurfaceConfiguration,
+    pub window_size: winit::dpi::PhysicalSize<u32>,
+    pub render_scale_percent: u32,
+    pub post_processing: bool,
+    pub msaa_samples: u32,
+    pub shadow_quality: ShadowQuality,
+    pub mesh_assets: AssetManager<MeshAsset>,
+    pub material_assets: AssetManager<MaterialAsset>,
+    pub cube_mesh: Handle<MeshAsset>,
+    pub cube_material: Handle<MaterialAsset>,
+    pub red_material: Handle<MaterialAsset>,
+    pub green_material: Handle<MaterialAsset>,
+    pub blue_material: Handle<MaterialAsset>,
+    pub color_layout: wgpu::BindGroupLayout,
+    pub camera_buffer: wgpu::Buffer,
+    pub camera_bind_group: wgpu::BindGroup,
+    pub camera_layout: wgpu::BindGroupLayout,
+    pub light_buffer: wgpu::Buffer,
+    pub light_layout: wgpu::BindGroupLayout,
+    pub light_bind_group: wgpu::BindGroup,
+    pub shadow_depth_texture: wgpu::Texture,
+    pub shadow_depth_view: wgpu::TextureView,
+    pub shadow_sample_view: wgpu::TextureView,
+    pub shadow_sampler: wgpu::Sampler,
+    pub shadow_pipeline: wgpu::RenderPipeline,
+    pub depth_view: Option<wgpu::TextureView>,
+    pub msaa_view: Option<wgpu::TextureView>,
+    pub scene_view: Option<wgpu::TextureView>,
+    pub scene_sampler: wgpu::Sampler,
+    pub post_pipeline: Option<wgpu::RenderPipeline>,
+    pub post_bind_group: Option<wgpu::BindGroup>,
+    pub post_shader: wgpu::ShaderModule,
+    pub post_pipeline_layout: wgpu::PipelineLayout,
+    pub color_targets: [Option<wgpu::ColorTargetState>; 1],
+    pub camera_position: Vec3,
+    pub camera_target: Vec3,
+    pub camera_fov: f32,
+    pub camera_near: f32,
+    pub camera_far: f32,
+    pub camera_angle: f32,
+    pub wireframe_mode: bool,
+    pub ui: Option<Ui>,
+    pub ui_renderer: Option<UiRenderer>,
+    pub fps: f32,
+    pub entity_count: usize,
+    pub renderable_count: usize,
+    pub preset_name: String,
+    pub menu_open: Option<usize>,
+    pub show_stats: bool,
+    pub frame_time_ms: f64,
+    pub _shader_variant: PhantomData<ShaderVariant>,
 }
 
 impl Renderer {
@@ -426,10 +435,37 @@ impl Renderer {
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         };
-        let multisample = wgpu::MultisampleState {
-            count: settings.msaa_samples,
-            mask: !0,
-            alpha_to_coverage_enabled: false,
+        let color_targets = [Some(wgpu::ColorTargetState {
+            format: surface_format,
+            blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+            write_mask: wgpu::ColorWrites::ALL,
+        })];
+        let create_scene_pipeline = |label, primitive, sample_count| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[Vertex::layout()],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    targets: &color_targets,
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive,
+                depth_stencil: Some(depth_stencil.clone()),
+                multisample: wgpu::MultisampleState {
+                    count: sample_count,
+                    mask: !0,
+                    alpha_to_coverage_enabled: false,
+                },
+                multiview: None,
+                cache: None,
+            })
         };
         let primitive = wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleList,
@@ -446,27 +482,8 @@ impl Renderer {
             write_mask: wgpu::ColorWrites::ALL,
         })];
 
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("scene pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[Vertex::layout()],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                targets: &color_targets,
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive,
-            depth_stencil: Some(depth_stencil.clone()),
-            multisample,
-            multiview: None,
-            cache: None,
-        });
+        let pipeline_1x = create_scene_pipeline("scene pipeline 1x", primitive, 1);
+        let pipeline_4x = create_scene_pipeline("scene pipeline 4x", primitive, 4);
 
         let wireframe_primitive = wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleList,
@@ -478,27 +495,10 @@ impl Renderer {
             conservative: false,
         };
 
-        let wireframe_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("wireframe pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[Vertex::layout()],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                targets: &color_targets,
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wireframe_primitive,
-            depth_stencil: Some(depth_stencil.clone()),
-            multisample,
-            multiview: None,
-            cache: None,
-        });
+        let wireframe_pipeline_1x =
+            create_scene_pipeline("wireframe pipeline 1x", wireframe_primitive, 1);
+        let wireframe_pipeline_4x =
+            create_scene_pipeline("wireframe pipeline 4x", wireframe_primitive, 4);
 
         let shadow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("shadow pipeline"),
@@ -560,8 +560,10 @@ impl Renderer {
         let create_material = |device: &wgpu::Device,
                                queue: &wgpu::Queue,
                                color: [f32; 4],
-                               pipeline: &wgpu::RenderPipeline,
-                               wireframe_pipeline: &wgpu::RenderPipeline,
+                               pipeline_1x: &wgpu::RenderPipeline,
+                               wireframe_pipeline_1x: &wgpu::RenderPipeline,
+                               pipeline_4x: &wgpu::RenderPipeline,
+                               wireframe_pipeline_4x: &wgpu::RenderPipeline,
                                layout: &wgpu::BindGroupLayout|
          -> MaterialAsset {
             let color_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -586,8 +588,10 @@ impl Renderer {
             });
 
             MaterialAsset {
-                pipeline: pipeline.clone(),
-                wireframe_pipeline: wireframe_pipeline.clone(),
+                pipeline_1x: pipeline_1x.clone(),
+                wireframe_pipeline_1x: wireframe_pipeline_1x.clone(),
+                pipeline_4x: pipeline_4x.clone(),
+                wireframe_pipeline_4x: wireframe_pipeline_4x.clone(),
                 color_buffer,
                 color_bind_group,
                 color_bind_group_layout: layout.clone(),
@@ -600,8 +604,10 @@ impl Renderer {
                 &device,
                 &queue,
                 [1.0, 1.0, 1.0, 1.0],
-                &pipeline,
-                &wireframe_pipeline,
+                &pipeline_1x,
+                &wireframe_pipeline_1x,
+                &pipeline_4x,
+                &wireframe_pipeline_4x,
                 &material_color_layout,
             ),
         );
@@ -611,8 +617,10 @@ impl Renderer {
                 &device,
                 &queue,
                 [1.0, 0.0, 0.0, 1.0],
-                &pipeline,
-                &wireframe_pipeline,
+                &pipeline_1x,
+                &wireframe_pipeline_1x,
+                &pipeline_4x,
+                &wireframe_pipeline_4x,
                 &material_color_layout,
             ),
         );
@@ -622,8 +630,10 @@ impl Renderer {
                 &device,
                 &queue,
                 [0.0, 1.0, 0.0, 1.0],
-                &pipeline,
-                &wireframe_pipeline,
+                &pipeline_1x,
+                &wireframe_pipeline_1x,
+                &pipeline_4x,
+                &wireframe_pipeline_4x,
                 &material_color_layout,
             ),
         );
@@ -633,8 +643,10 @@ impl Renderer {
                 &device,
                 &queue,
                 [0.0, 0.0, 1.0, 1.0],
-                &pipeline,
-                &wireframe_pipeline,
+                &pipeline_1x,
+                &wireframe_pipeline_1x,
+                &pipeline_4x,
+                &wireframe_pipeline_4x,
                 &material_color_layout,
             ),
         );
@@ -707,9 +719,10 @@ impl Renderer {
             None
         };
 
-        let ui_renderer = crate::ui::UiRenderer::new(&device, surface_format);
+        let ui = Ui::new();
+        let ui_renderer = UiRenderer::new(&device, &queue, surface_format);
 
-        let renderer = Self {
+        let mut renderer = Self {
             surface,
             device,
             queue,
@@ -743,6 +756,9 @@ impl Renderer {
             scene_sampler,
             post_pipeline,
             post_bind_group: None,
+            post_shader,
+            post_pipeline_layout,
+            color_targets,
             camera_position: Vec3::new(0.0, 3.0, 6.0),
             camera_target: Vec3::ZERO,
             camera_fov: std::f32::consts::FRAC_PI_4,
@@ -750,15 +766,20 @@ impl Renderer {
             camera_far: 100.0,
             camera_angle: 0.0,
             wireframe_mode: false,
+            ui: Some(ui),
             ui_renderer: Some(ui_renderer),
             fps: 0.0,
             entity_count: 0,
             renderable_count: 0,
             preset_name: "Balanced".to_string(),
+            menu_open: None,
+            show_stats: true,
             frame_time_ms: 0.0,
             color_layout,
             _shader_variant: PhantomData,
         };
+        // Initialize render targets (depth, MSAA, scene texture for post-processing)
+        renderer.configure_targets();
         Ok(renderer)
     }
 
@@ -786,12 +807,80 @@ impl Renderer {
         self.wireframe_mode = enabled;
     }
 
+    pub fn set_render_scale(&mut self, scale_percent: u32) {
+        self.render_scale_percent = scale_percent.clamp(50, 200);
+        self.configure_targets();
+    }
+
+    pub fn set_msaa(&mut self, enabled: bool) {
+        let sample_count = if enabled { 4 } else { 1 };
+        if self.msaa_samples == sample_count {
+            return;
+        }
+        self.msaa_samples = sample_count;
+        self.configure_targets();
+    }
+
+    pub fn set_post_processing(&mut self, enabled: bool) {
+        if enabled == self.post_processing {
+            return;
+        }
+
+        if enabled && self.post_pipeline.is_none() {
+            self.post_pipeline = Some(self.device.create_render_pipeline(
+                &wgpu::RenderPipelineDescriptor {
+                    label: Some("post pipeline"),
+                    layout: Some(&self.post_pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &self.post_shader,
+                        entry_point: Some("vs_main"),
+                        buffers: &[],
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &self.post_shader,
+                        entry_point: Some("fs_main"),
+                        targets: &self.color_targets,
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    }),
+                    primitive: wgpu::PrimitiveState::default(),
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview: None,
+                    cache: None,
+                },
+            ));
+        }
+
+        self.post_processing = enabled;
+        self.configure_targets();
+    }
+
+    pub fn set_shadow_quality(&mut self, quality: crate::quality::ShadowQuality) {
+        self.shadow_quality = quality;
+    }
+
+    pub fn msaa_samples(&self) -> u32 {
+        self.msaa_samples
+    }
+
+    pub fn post_processing_enabled(&self) -> bool {
+        self.post_processing
+    }
+
+    pub fn ui_renderer_mut(&mut self) -> &mut crate::ui_new::UiRenderer {
+        self.ui_renderer.as_mut().expect("ui_renderer initialized")
+    }
+
     pub fn resize(&mut self, size: winit::dpi::PhysicalSize<u32>) {
         self.window_size = size;
         self.config.width = size.width.max(1);
         self.config.height = size.height.max(1);
         self.surface.configure(&self.device, &self.config);
         self.configure_targets();
+        if let Some(ui_renderer) = &mut self.ui_renderer {
+            ui_renderer.resize(size.width, size.height);
+        }
     }
 
     pub fn set_camera(&mut self, camera: &crate::camera::Camera3D, transform: &GlobalTransform) {
@@ -894,7 +983,10 @@ impl Renderer {
         }
     }
 
-    pub fn render(&mut self, world: &mut World) -> Result<(), wgpu::SurfaceError> {
+    pub fn render_scene(
+        &mut self,
+        world: &mut World,
+    ) -> Result<(wgpu::SurfaceTexture, wgpu::TextureView), wgpu::SurfaceError> {
         let frame = self.surface.get_current_texture()?;
         let view = frame
             .texture
@@ -915,17 +1007,30 @@ impl Renderer {
         // which is not supported on this driver architecture
         let _shadow_quality = self.shadow_quality;
 
-        let scene_target = self.scene_view.as_ref();
-        let target_view = scene_target.unwrap_or(&view);
+        // Render to the offscreen target only when a complete post-processing
+        // pipeline is available. Otherwise the scene must be rendered directly
+        // to the surface; rendering only to an offscreen texture leaves a black
+        // window when post-processing is enabled but not initialized.
+        let use_post_processing =
+            self.post_processing && self.post_pipeline.is_some() && self.post_bind_group.is_some();
+        let target_view = if use_post_processing {
+            self.scene_view.as_ref().unwrap_or(&view)
+        } else {
+            &view
+        };
         let resolve_target = if self.msaa_view.is_some() {
-            scene_target
+            Some(target_view)
         } else {
             None
         };
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("scene pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: self.msaa_view.as_ref().unwrap_or(target_view),
+                view: if self.msaa_view.is_some() {
+                    self.msaa_view.as_ref().unwrap()
+                } else {
+                    target_view
+                },
                 resolve_target,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -957,10 +1062,11 @@ impl Renderer {
             let Some(bind_group) = mesh.model_bind_groups.get(&key) else {
                 continue;
             };
-            pass.set_pipeline(if self.wireframe_mode {
-                &material.wireframe_pipeline
-            } else {
-                &material.pipeline
+            pass.set_pipeline(match (self.msaa_samples, self.wireframe_mode) {
+                (1, true) => &material.wireframe_pipeline_1x,
+                (1, false) => &material.pipeline_1x,
+                (_, true) => &material.wireframe_pipeline_4x,
+                (_, false) => &material.pipeline_4x,
             });
             pass.set_bind_group(0, &self.camera_bind_group, &[]);
             pass.set_bind_group(1, bind_group, &[]);
@@ -972,7 +1078,7 @@ impl Renderer {
         }
         drop(pass);
 
-        if self.post_processing
+        if use_post_processing
             && let (Some(pipeline), Some(bind_group)) =
                 (self.post_pipeline.as_ref(), self.post_bind_group.as_ref())
         {
@@ -996,325 +1102,361 @@ impl Renderer {
             pass.draw(0..3, 0..1);
         }
 
-        let commands = build_debug_commands(
-            self.fps,
-            self.entity_count,
-            self.renderable_count,
-            self.wireframe_mode,
-            &self.preset_name,
-            self.frame_time_ms,
-            self.window_size.width as f32,
-            self.window_size.height as f32,
-        );
-        if let Some(ui_renderer) = &self.ui_renderer {
-            ui_renderer.draw(&self.device, &self.queue, &mut encoder, &view, &commands);
-            ui_renderer.draw_text(
-                &self.queue,
-                &mut encoder,
-                &view,
-                10.0,
-                30.0,
-                &format!("FPS: {:.1}", self.fps),
-                [0.2, 1.0, 0.2, 1.0],
+        self.queue.submit([encoder.finish()]);
+        Ok((frame, view))
+    }
+
+    /// Draw interactive UI widgets and overlay text onto the current frame, then present.
+    pub fn render_ui(
+        &mut self,
+        frame: wgpu::SurfaceTexture,
+        view: &wgpu::TextureView,
+        fps: f32,
+        entity_count: usize,
+        _renderable_count: usize,
+        frame_time_ms: f64,
+        _preset_name: &str,
+        render_scale_percent: u32,
+        msaa_enabled: bool,
+        post_processing_enabled: bool,
+        wireframe_mode: bool,
+        width: f32,
+        height: f32,
+    ) {
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("ui commands"),
+            });
+
+        // Get mouse state from UI before mutating it
+        let (mouse_x, mouse_y, mouse_down, mouse_clicked, mouse_released) =
+            if let Some(ui) = &self.ui {
+                (
+                    ui.mouse_x,
+                    ui.mouse_y,
+                    ui.mouse_down,
+                    ui.mouse_clicked,
+                    ui.mouse_released,
+                )
+            } else {
+                (0.0, 0.0, false, false, false)
+            };
+
+        let mut requested_render_scale = None;
+        let mut requested_msaa = None;
+        let mut requested_post_processing = None;
+        let mut requested_wireframe = None;
+        let mut requested_preset = None;
+        let mut render_scale_changed = false;
+        let mut clicked_menu = None;
+        let mut clicked_menu_action = None;
+        let mut clicked_outside_menu = false;
+
+        // Begin UI frame
+        if let Some(ui) = &mut self.ui {
+            ui.begin_frame(mouse_x, mouse_y, mouse_down, mouse_clicked, mouse_released);
+
+            ui.theme.font_scale = 2.0;
+            ui.theme.padding = 16.0;
+            ui.theme.spacing = 11.0;
+            ui.theme.bg = crate::ui_new::Color::rgb(0.055, 0.07, 0.10);
+            ui.theme.border = crate::ui_new::Color::rgb(0.16, 0.22, 0.30);
+            ui.theme.accent = crate::ui_new::Color::rgb(0.22, 0.62, 0.88);
+            ui.theme.border_radius = 7.0;
+            let menu_bar_height = 40.0;
+            ui.draw_rect(
+                Rect::new(0.0, 0.0, width, menu_bar_height),
+                crate::ui_new::Color::rgb(0.035, 0.045, 0.065),
+                crate::ui_new::Color::rgb(0.12, 0.16, 0.22),
                 1.0,
             );
-            ui_renderer.draw_text(
-                &self.queue,
-                &mut encoder,
-                &view,
-                10.0,
-                47.0,
-                &format!("Entities: {}", self.entity_count),
-                [1.0, 0.8, 0.2, 1.0],
-                1.0,
+            let menus = ["File", "Edit", "Window", "Tools", "Build", "Help"];
+            let mut menu_x = 14.0;
+            for (index, name) in menus.iter().enumerate() {
+                let (text_w, text_h, _) = crate::ui_new::text_uv_rect(name, 2.0);
+                let rect = Rect::new(menu_x, 4.0, text_w + 22.0, 32.0);
+                let id = ui.gen_id(name);
+                let result = ui.button_behavior(id, rect, true);
+                if result.clicked {
+                    clicked_menu = Some(index);
+                }
+                let selected = self.menu_open == Some(index);
+                if selected || result.hovered {
+                    ui.draw_rect(
+                        rect,
+                        if selected {
+                            ui.theme.bg_active
+                        } else {
+                            ui.theme.bg_hover
+                        },
+                        ui.theme.border,
+                        1.0,
+                    );
+                }
+                ui.draw_text(
+                    rect.x + (rect.w - text_w) * 0.5,
+                    rect.y + (rect.h - text_h) * 0.5,
+                    name,
+                    ui.theme.text,
+                    2.0,
+                );
+                menu_x += rect.w + 2.0;
+            }
+
+            if let Some(menu_index) = self.menu_open {
+                let items: &[&str] = match menu_index {
+                    0 => &["Reload scene (F5)"],
+                    1 => &["No edit actions"],
+                    2 => &["Toggle statistics"],
+                    3 => &["Toggle wireframe"],
+                    4 => &["Build controls unavailable"],
+                    _ => &["WASD move  |  Mouse look  |  F2 wireframe"],
+                };
+                let menu_rect = Rect::new(
+                    14.0,
+                    menu_bar_height,
+                    250.0,
+                    items.len() as f32 * 34.0 + 12.0,
+                );
+                ui.draw_rect(
+                    menu_rect,
+                    crate::ui_new::Color::rgb(0.055, 0.07, 0.10),
+                    ui.theme.border,
+                    1.0,
+                );
+                for (item_index, item) in items.iter().enumerate() {
+                    let row = Rect::new(
+                        menu_rect.x + 6.0,
+                        menu_rect.y + 6.0 + item_index as f32 * 34.0,
+                        menu_rect.w - 12.0,
+                        30.0,
+                    );
+                    let id = ui.gen_id(item);
+                    let result = ui.button_behavior(id, row, menu_index == 2 || menu_index == 3);
+                    if result.hovered {
+                        ui.draw_rect(row, ui.theme.bg_hover, ui.theme.bg_hover, 0.0);
+                    }
+                    let item_color = if menu_index == 4 || menu_index == 1 {
+                        ui.theme.text_disabled
+                    } else {
+                        ui.theme.text
+                    };
+                    ui.draw_text(row.x + 10.0, row.y + 8.0, item, item_color, 2.0);
+                    if result.clicked {
+                        clicked_menu_action = Some(menu_index);
+                    }
+                }
+                if mouse_clicked
+                    && !menu_rect.contains(mouse_x, mouse_y)
+                    && mouse_y > menu_bar_height
+                {
+                    clicked_outside_menu = true;
+                }
+            }
+
+            let panel_width = (width - 32.0).clamp(320.0, 390.0).min(width - 16.0);
+            let panel_x = 16.0;
+            let panel_y = menu_bar_height + 12.0;
+            let panel_height = 390.0_f32.min(height - panel_y - 16.0);
+            ui.begin_panel(panel_x, panel_y, panel_width, panel_height);
+
+            ui.draw_rect(
+                Rect::new(panel_x + 1.0, panel_y + 1.0, 4.0, 48.0),
+                ui.theme.accent,
+                ui.theme.accent,
+                0.0,
             );
-            ui_renderer.draw_text(
-                &self.queue,
-                &mut encoder,
-                &view,
-                10.0,
-                64.0,
-                &format!("Renderables: {}", self.renderable_count),
-                [0.2, 0.8, 1.0, 1.0],
-                1.0,
+            ui.label("RUST ENGINE");
+            ui.draw_text(
+                ui.current_layout.next_x,
+                ui.current_layout.next_y - 4.0,
+                "GRAPHICS CONTROL",
+                crate::ui_new::Color::rgb(0.52, 0.63, 0.74),
+                1.5,
             );
-            ui_renderer.draw_text(
-                &self.queue,
-                &mut encoder,
-                &view,
-                10.0,
-                81.0,
-                &format!("Wireframe: {}", self.wireframe_mode),
-                if self.wireframe_mode {
-                    [1.0, 0.2, 0.2, 1.0]
+            ui.current_layout.next_y += 8.0;
+            ui.separator();
+            ui.spacing(2.0);
+            ui.label("QUALITY PRESET");
+            ui.spacing(4.0);
+
+            let presets = ["FAST", "BALANCED", "QUALITY"];
+            let preset_index = match _preset_name {
+                "Performance" => 0,
+                "Balanced" => 1,
+                "Quality" => 2,
+                _ => usize::MAX,
+            };
+            let gap = 6.0;
+            let button_h = 36.0;
+            let button_w = (ui.current_layout.width - gap * 2.0) / 3.0;
+            for (i, name) in presets.iter().enumerate() {
+                let rect = Rect::new(
+                    ui.current_layout.next_x,
+                    ui.current_layout.next_y,
+                    button_w,
+                    button_h,
+                );
+                let id = ui.gen_id(name);
+                let result = ui.button_behavior(id, rect, true);
+                if result.clicked {
+                    requested_preset = Some(i);
+                }
+                let (bg_color, border_color) = if i == preset_index {
+                    (ui.theme.accent, ui.theme.accent)
+                } else if result.hovered {
+                    (ui.theme.bg_hover, ui.theme.border_hover)
                 } else {
-                    [0.5, 0.5, 0.5, 1.0]
-                },
-                1.0,
-            );
-            ui_renderer.draw_text(
-                &self.queue,
-                &mut encoder,
-                &view,
-                10.0,
-                98.0,
-                &format!("Preset: {}", self.preset_name),
-                [0.8, 0.8, 0.8, 1.0],
-                1.0,
-            );
-            ui_renderer.draw_text(
-                &self.queue,
-                &mut encoder,
-                &view,
-                10.0,
-                115.0,
-                &format!("Frame: {:.2} ms", self.frame_time_ms),
-                [1.0, 1.0, 1.0, 1.0],
-                1.0,
-            );
+                    (ui.theme.bg, ui.theme.border)
+                };
+                ui.draw_rect(rect, bg_color, border_color, ui.theme.border_width);
+                let (tw, th, _) = crate::ui_new::text_uv_rect(name, ui.theme.font_scale);
+                ui.draw_text(
+                    rect.x + (rect.w - tw) / 2.0,
+                    rect.y + (rect.h - th) / 2.0,
+                    name,
+                    ui.theme.text,
+                    ui.theme.font_scale,
+                );
+                ui.current_layout.next_x += button_w + gap;
+            }
+            ui.current_layout.next_x = ui.current_layout.x;
+            ui.current_layout.next_y += button_h + ui.theme.spacing;
 
-            // Engine toolbar
-            ui_renderer.draw_rects(
-                &self.queue,
-                &mut encoder,
-                &view,
-                &[crate::ui::UiCommand {
-                    rect: [0.0, 0.0, 1280.0, 34.0],
-                    color: [0.06, 0.07, 0.10, 0.96],
-                }],
-            );
-            ui_renderer.draw_text(
-                &self.queue,
-                &mut encoder,
-                &view,
-                16.0,
-                9.0,
-                "RUST ENGINE",
-                [0.3, 0.75, 1.0, 1.0],
-                1.1,
-            );
-            ui_renderer.draw_text(
-                &self.queue,
-                &mut encoder,
-                &view,
-                180.0,
-                10.0,
-                "FILE   EDIT   VIEW   WINDOW   HELP",
-                [0.75, 0.78, 0.85, 1.0],
-                0.8,
-            );
+            ui.spacing(3.0);
+            ui.label("RENDER SCALE");
+            let mut render_scale = render_scale_percent as f32;
+            if ui.slider("", &mut render_scale, 50.0, 200.0).changed {
+                requested_render_scale = Some(render_scale.round() as u32);
+                render_scale_changed = true;
+            }
+            ui.spacing(2.0);
+            ui.separator();
+            ui.label("RENDER OPTIONS");
+            let mut msaa = msaa_enabled;
+            if ui.checkbox("MSAA 4X", &mut msaa).clicked {
+                requested_msaa = Some(msaa);
+            }
+            let mut post_processing = post_processing_enabled;
+            if ui.checkbox("POST FX", &mut post_processing).clicked {
+                requested_post_processing = Some(post_processing);
+            }
+            let mut wireframe = wireframe_mode;
+            if ui.checkbox("WIREFRAME", &mut wireframe).clicked {
+                requested_wireframe = Some(wireframe);
+            }
+            ui.end_panel();
 
-            // Right inspector panel
-            ui_renderer.draw_rects(
-                &self.queue,
-                &mut encoder,
-                &view,
-                &[
-                    crate::ui::UiCommand {
-                        rect: [980.0, 45.0, 290.0, 380.0],
-                        color: [0.07, 0.08, 0.12, 0.94],
-                    },
-                    crate::ui::UiCommand {
-                        rect: [980.0, 45.0, 290.0, 30.0],
-                        color: [0.12, 0.14, 0.20, 1.0],
-                    },
-                ],
-            );
-            ui_renderer.draw_text(
-                &self.queue,
-                &mut encoder,
-                &view,
-                995.0,
-                55.0,
-                "INSPECTOR",
-                [0.9, 0.9, 0.95, 1.0],
-                1.0,
-            );
-            ui_renderer.draw_text(
-                &self.queue,
-                &mut encoder,
-                &view,
-                995.0,
-                92.0,
-                "RENDER SETTINGS",
-                [0.35, 0.75, 1.0, 1.0],
-                0.9,
-            );
-            ui_renderer.draw_text(
-                &self.queue,
-                &mut encoder,
-                &view,
-                995.0,
-                116.0,
-                &format!("QUALITY: {}", self.preset_name.to_uppercase()),
-                [0.85, 0.85, 0.9, 1.0],
-                0.8,
-            );
-            ui_renderer.draw_text(
-                &self.queue,
-                &mut encoder,
-                &view,
-                995.0,
-                138.0,
-                "RENDER SCALE",
-                [0.7, 0.7, 0.75, 1.0],
-                0.8,
-            );
-            ui_renderer.draw_rects(
-                &self.queue,
-                &mut encoder,
-                &view,
-                &[
-                    crate::ui::UiCommand {
-                        rect: [995.0, 154.0, 230.0, 8.0],
-                        color: [0.18, 0.19, 0.25, 1.0],
-                    },
-                    crate::ui::UiCommand {
-                        rect: [1090.0, 150.0, 12.0, 16.0],
-                        color: [0.25, 0.65, 0.95, 1.0],
-                    },
-                ],
-            );
-            ui_renderer.draw_text(
-                &self.queue,
-                &mut encoder,
-                &view,
-                995.0,
-                190.0,
-                "MSAA",
-                [0.7, 0.7, 0.75, 1.0],
-                0.8,
-            );
-            ui_renderer.draw_rects(
-                &self.queue,
-                &mut encoder,
-                &view,
-                &[crate::ui::UiCommand {
-                    rect: [995.0, 205.0, 18.0, 18.0],
-                    color: [0.2, 0.7, 0.3, 1.0],
-                }],
-            );
-            ui_renderer.draw_text(
-                &self.queue,
-                &mut encoder,
-                &view,
-                1022.0,
-                207.0,
-                "ENABLED",
-                [0.8, 0.85, 0.85, 1.0],
-                0.8,
-            );
+            // A compact HUD keeps the scene visible while making the key metrics
+            // readable and aligned instead of stacking them across the screen.
+            let stats_width = 370.0_f32.min(width - 32.0).max(0.0);
+            let stats_height = 54.0_f32.min(height - 32.0).max(0.0);
+            if self.show_stats && stats_width > 0.0 && stats_height > 0.0 {
+                let stats_x = width - stats_width - 16.0;
+                let stats_y = height - stats_height - 16.0;
+                ui.begin_panel(stats_x, stats_y, stats_width, stats_height);
+                let stat_y = stats_y + (stats_height - 14.0) * 0.5;
+                ui.draw_text(
+                    stats_x + 12.0,
+                    stat_y,
+                    &format!("FPS {:.0}", fps),
+                    ui.theme.text,
+                    2.0,
+                );
+                ui.draw_text(
+                    stats_x + 112.0,
+                    stat_y,
+                    &format!("{} ENTITIES", entity_count),
+                    ui.theme.text,
+                    2.0,
+                );
+                ui.draw_text(
+                    stats_x + 255.0,
+                    stat_y,
+                    &format!("{:.1} MS", frame_time_ms),
+                    ui.theme.text,
+                    2.0,
+                );
+                ui.end_panel();
+            }
 
-            // Scene hierarchy panel
-            ui_renderer.draw_rects(
-                &self.queue,
-                &mut encoder,
-                &view,
-                &[
-                    crate::ui::UiCommand {
-                        rect: [18.0, 440.0, 300.0, 245.0],
-                        color: [0.07, 0.08, 0.12, 0.94],
-                    },
-                    crate::ui::UiCommand {
-                        rect: [18.0, 440.0, 300.0, 30.0],
-                        color: [0.12, 0.14, 0.20, 1.0],
-                    },
-                ],
-            );
-            ui_renderer.draw_text(
-                &self.queue,
-                &mut encoder,
-                &view,
-                32.0,
-                450.0,
-                "SCENE HIERARCHY",
-                [0.9, 0.9, 0.95, 1.0],
-                0.9,
-            );
-            ui_renderer.draw_text(
-                &self.queue,
-                &mut encoder,
-                &view,
-                35.0,
-                490.0,
-                "[+] startup",
-                [0.35, 0.75, 1.0, 1.0],
-                0.85,
-            );
-            ui_renderer.draw_text(
-                &self.queue,
-                &mut encoder,
-                &view,
-                52.0,
-                515.0,
-                "cube_ground",
-                [0.75, 0.75, 0.8, 1.0],
-                0.8,
-            );
-            ui_renderer.draw_text(
-                &self.queue,
-                &mut encoder,
-                &view,
-                52.0,
-                540.0,
-                "cube_central",
-                [0.75, 0.75, 0.8, 1.0],
-                0.8,
-            );
-            ui_renderer.draw_text(
-                &self.queue,
-                &mut encoder,
-                &view,
-                52.0,
-                565.0,
-                "cube_left",
-                [0.75, 0.75, 0.8, 1.0],
-                0.8,
-            );
-            ui_renderer.draw_text(
-                &self.queue,
-                &mut encoder,
-                &view,
-                52.0,
-                590.0,
-                "cube_right",
-                [0.75, 0.75, 0.8, 1.0],
-                0.8,
-            );
-            ui_renderer.draw_text(
-                &self.queue,
-                &mut encoder,
-                &view,
-                32.0,
-                640.0,
-                "CAMERA",
-                [0.35, 0.75, 1.0, 1.0],
-                0.85,
-            );
-            ui_renderer.draw_text(
-                &self.queue,
-                &mut encoder,
-                &view,
-                52.0,
-                665.0,
-                "MainCamera3D",
-                [0.75, 0.75, 0.8, 1.0],
-                0.8,
-            );
+            // Get commands and draw
+            let commands = ui.end_frame();
+
+            // Draw using the UI renderer
+            if let Some(ui_renderer) = &mut self.ui_renderer {
+                ui_renderer.draw(&self.device, &self.queue, &mut encoder, view, &commands);
+            }
+        }
+
+        if let Some(index) = clicked_menu {
+            self.menu_open = if self.menu_open == Some(index) {
+                None
+            } else {
+                Some(index)
+            };
+        }
+        if clicked_outside_menu && clicked_menu.is_none() {
+            self.menu_open = None;
+        }
+        if let Some(menu_index) = clicked_menu_action {
+            match menu_index {
+                2 => self.show_stats = !self.show_stats,
+                3 => self.set_wireframe(!self.wireframe_mode),
+                _ => {}
+            }
+            self.menu_open = None;
+        }
+
+        if render_scale_changed {
+            self.preset_name = "Custom".to_string();
+        }
+        if let Some(scale) = requested_render_scale {
+            self.set_render_scale(scale);
+        }
+        if let Some(enabled) = requested_msaa {
+            self.set_msaa(enabled);
+        }
+        if let Some(enabled) = requested_post_processing {
+            self.set_post_processing(enabled);
+        }
+        if let Some(enabled) = requested_wireframe {
+            self.set_wireframe(enabled);
+        }
+        if let Some(index) = requested_preset {
+            let preset = match index {
+                0 => QualityPreset::Performance,
+                1 => QualityPreset::Balanced,
+                _ => QualityPreset::Quality,
+            };
+            let settings = preset.settings();
+            self.set_render_scale(settings.render_scale_percent);
+            self.set_msaa(settings.msaa_samples > 1);
+            self.set_post_processing(settings.post_processing);
+            self.preset_name = match preset {
+                QualityPreset::Performance => "Performance",
+                QualityPreset::Balanced => "Balanced",
+                QualityPreset::Quality => "Quality",
+            }
+            .to_string();
         }
 
         self.queue.submit([encoder.finish()]);
         frame.present();
-        Ok(())
     }
 
     fn configure_targets(&mut self) {
-        let width =
-            (self.window_size.width as f32 * self.render_scale_percent as f32 / 100.0) as u32;
-        let height =
-            (self.window_size.height as f32 * self.render_scale_percent as f32 / 100.0) as u32;
-        let width = width.max(1);
-        let height = height.max(1);
+        // The scene is rendered directly into the surface when post-processing
+        // is disabled, so its depth/MSAA attachments must match the surface size.
+        // The render scale only applies to the offscreen scene texture.
+        let render_scale = if self.post_processing {
+            self.render_scale_percent
+        } else {
+            100
+        };
+        let width = (self.window_size.width as u64 * render_scale as u64 / 100).max(1) as u32;
+        let height = (self.window_size.height as u64 * render_scale as u64 / 100).max(1) as u32;
         let depth = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("depth"),
             size: wgpu::Extent3d {
