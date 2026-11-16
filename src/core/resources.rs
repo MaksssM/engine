@@ -29,9 +29,35 @@ impl Default for EngineTime {
 }
 
 /// Wrapper for the input state as a Bevy ECS Resource.
-#[derive(bevy_ecs::resource::Resource, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InputContext {
+    Editor,
+    Game,
+    Both,
+}
+
+#[derive(bevy_ecs::resource::Resource)]
 pub struct EngineInput {
     pub state: InputState,
+    pub context: InputContext,
+}
+
+impl Default for EngineInput {
+    fn default() -> Self {
+        Self {
+            state: InputState::default(),
+            context: InputContext::Editor,
+        }
+    }
+}
+
+impl EngineInput {
+    pub fn accepts_editor(&self) -> bool {
+        matches!(self.context, InputContext::Editor | InputContext::Both)
+    }
+    pub fn accepts_game(&self) -> bool {
+        matches!(self.context, InputContext::Game | InputContext::Both)
+    }
 }
 
 /// Global engine configuration stored as a Bevy ECS Resource.
@@ -140,6 +166,44 @@ impl Default for EngineMode {
     }
 }
 
+impl EngineMode {
+    pub fn enter_play(&mut self) -> bool {
+        if *self == Self::Editor {
+            *self = Self::Playing;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn pause(&mut self) -> bool {
+        if *self == Self::Playing {
+            *self = Self::Paused;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn resume(&mut self) -> bool {
+        if *self == Self::Paused {
+            *self = Self::Playing;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn stop(&mut self) -> bool {
+        if matches!(*self, Self::Playing | Self::Paused) {
+            *self = Self::Editor;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// Insert all core resources into the world with their defaults.
 pub fn init_core_resources(world: &mut World) {
     if !world.contains_resource::<EngineTime>() {
@@ -205,5 +269,16 @@ mod tests {
     #[test]
     fn engine_mode_default_is_editor() {
         assert_eq!(EngineMode::default(), EngineMode::Editor);
+    }
+
+    #[test]
+    fn mode_transitions_are_explicit_and_legal() {
+        let mut mode = EngineMode::Editor;
+        assert!(mode.enter_play());
+        assert!(!mode.enter_play());
+        assert!(mode.pause());
+        assert!(mode.resume());
+        assert!(mode.stop());
+        assert!(!mode.stop());
     }
 }

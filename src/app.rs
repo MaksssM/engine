@@ -16,6 +16,7 @@ use crate::{
     ecs::Ecs,
     editor::Editor,
     events::Events,
+    input::MouseButton as EngineMouseButton,
     quality::QualityPreset,
     renderer::{Renderable, Renderer},
     time::{Clock, FixedTimestep, FpsMeter},
@@ -211,19 +212,43 @@ impl ApplicationHandler for EngineApp {
                     renderer.resize(size);
                 }
             }
-            WindowEvent::MouseInput {
-                state,
-                button: MouseButton::Left,
-                ..
-            } => {
+            WindowEvent::MouseInput { state, button, .. } => {
                 let was_down = self.mouse.left_down;
                 self.mouse.left_down = matches!(state, ElementState::Pressed);
                 self.mouse.left_clicked = !was_down && self.mouse.left_down;
                 self.mouse.left_released = was_down && !self.mouse.left_down;
+                if let Some(mut input) = self
+                    .ecs
+                    .world
+                    .get_resource_mut::<crate::core::resources::EngineInput>()
+                {
+                    let button = match button {
+                        MouseButton::Left => EngineMouseButton::Left,
+                        MouseButton::Right => EngineMouseButton::Right,
+                        MouseButton::Middle => EngineMouseButton::Middle,
+                        MouseButton::Back => EngineMouseButton::Other(3),
+                        MouseButton::Forward => EngineMouseButton::Other(4),
+                        MouseButton::Other(value) => EngineMouseButton::Other(value),
+                    };
+                    if matches!(state, ElementState::Pressed) {
+                        input.state.press_mouse(button);
+                    } else {
+                        input.state.release_mouse(button);
+                    }
+                }
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.mouse.x = position.x as f32;
                 self.mouse.y = position.y as f32;
+                if let Some(mut input) = self
+                    .ecs
+                    .world
+                    .get_resource_mut::<crate::core::resources::EngineInput>()
+                {
+                    input
+                        .state
+                        .set_mouse_position(position.x as f32, position.y as f32);
+                }
             }
             WindowEvent::RedrawRequested => self.update(),
             other => {
@@ -242,6 +267,34 @@ impl ApplicationHandler for EngineApp {
 }
 
 impl EngineApp {
+    fn sync_play_mode(&mut self) {
+        let requested = self
+            .ecs
+            .world
+            .get_resource::<crate::core::resources::EngineMode>()
+            .copied()
+            .is_some_and(|mode| {
+                matches!(
+                    mode,
+                    crate::core::resources::EngineMode::Playing
+                        | crate::core::resources::EngineMode::Paused
+                )
+            });
+        if requested && !self.scene_manager.is_playing() {
+            if !self.scene_manager.enter_play(&mut self.ecs.world) {
+                if let Some(mut mode) = self
+                    .ecs
+                    .world
+                    .get_resource_mut::<crate::core::resources::EngineMode>()
+                {
+                    *mode = crate::core::resources::EngineMode::Editor;
+                }
+            }
+        } else if !requested && self.scene_manager.is_playing() {
+            let _ = self.scene_manager.stop_play(&mut self.ecs.world);
+        }
+    }
+
     fn update(&mut self) {
         let frame_time = {
             let Some(clock) = self.clock.as_mut() else {
@@ -257,6 +310,7 @@ impl EngineApp {
             input.state.begin_frame();
         }
         self.process_events();
+        self.sync_play_mode();
 
         let step_seconds = self.game_loop.fixed_step as f32;
         self.game_loop

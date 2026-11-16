@@ -49,6 +49,9 @@ impl GameLoop {
             .unwrap_or_default();
         let simulation_enabled = matches!(mode, EngineMode::Playing);
         if simulation_enabled {
+            if let Some(mut time) = world.get_resource_mut::<EngineTime>() {
+                time.delta_seconds = delta_seconds.max(0.0) as f32;
+            }
             self.fixed_accumulator += delta_seconds.max(0.0);
             let mut steps = 0;
             while self.fixed_accumulator >= self.fixed_step && steps < self.max_fixed_steps {
@@ -71,6 +74,11 @@ impl GameLoop {
     /// Execute exactly one fixed simulation tick while paused.
     pub fn step(&mut self, world: &mut World) {
         if world.get_resource::<EngineMode>().copied() == Some(EngineMode::Paused) {
+            if let Some(mut time) = world.get_resource_mut::<EngineTime>() {
+                time.delta_seconds = 0.0;
+                time.fixed_delta_seconds = self.fixed_step as f32;
+                time.frame_number = time.frame_number.saturating_add(1);
+            }
             self.scheduler
                 .run_stage(super::systems::SystemStage::FixedUpdate, world);
             self.scheduler
@@ -85,11 +93,45 @@ impl GameLoop {
     }
 
     pub fn set_playing(world: &mut World, playing: bool) {
-        world.insert_resource(if playing {
-            EngineMode::Playing
+        if let Some(mut mode) = world.get_resource_mut::<EngineMode>() {
+            if playing {
+                let _ = mode.enter_play();
+            } else {
+                let _ = mode.stop();
+            }
         } else {
-            EngineMode::Editor
-        });
+            world.insert_resource(if playing {
+                EngineMode::Playing
+            } else {
+                EngineMode::Editor
+            });
+        }
+    }
+
+    pub fn enter_play(&mut self, world: &mut World) -> bool {
+        self.fixed_accumulator = 0.0;
+        world
+            .get_resource_mut::<EngineMode>()
+            .is_some_and(|mut mode| mode.enter_play())
+    }
+
+    pub fn pause(world: &mut World) -> bool {
+        world
+            .get_resource_mut::<EngineMode>()
+            .is_some_and(|mut mode| mode.pause())
+    }
+
+    pub fn resume(world: &mut World) -> bool {
+        world
+            .get_resource_mut::<EngineMode>()
+            .is_some_and(|mut mode| mode.resume())
+    }
+
+    pub fn stop(&mut self, world: &mut World) -> bool {
+        self.fixed_accumulator = 0.0;
+        world
+            .get_resource_mut::<EngineMode>()
+            .is_some_and(|mut mode| mode.stop())
     }
 }
 

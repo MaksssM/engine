@@ -214,6 +214,8 @@ pub struct SceneManager {
     scenes: HashMap<String, Scene>,
     active: Option<String>,
     active_entities: Vec<Entity>,
+    play_snapshot: Option<Scene>,
+    play_entities: Vec<Entity>,
 }
 
 impl SceneManager {
@@ -331,7 +333,11 @@ impl SceneManager {
     }
 
     pub fn unload_active(&mut self, world: &mut bevy_ecs::world::World) {
-        for entity in self.active_entities.drain(..) {
+        Self::despawn_entities(world, &mut self.active_entities);
+    }
+
+    fn despawn_entities(world: &mut bevy_ecs::world::World, entities: &mut Vec<Entity>) {
+        for entity in entities.drain(..) {
             if let Some(uid) = world.get::<Uid>(entity).copied() {
                 if let Some(mut registry) =
                     world.get_resource_mut::<crate::core::resources::PersistentIdRegistry>()
@@ -339,8 +345,42 @@ impl SceneManager {
                     registry.unregister(uid);
                 }
             }
-            world.despawn(entity);
+            let _ = world.despawn(entity);
         }
+    }
+
+    pub fn enter_play(&mut self, world: &mut bevy_ecs::world::World) -> bool {
+        if self.play_snapshot.is_some() || self.active.is_none() {
+            return false;
+        }
+        let name = self.active.clone().unwrap();
+        let snapshot = match self.scenes.get(&name) {
+            Some(scene) => scene.clone(),
+            None => return false,
+        };
+        Self::despawn_entities(world, &mut self.active_entities);
+        let Some(entities) = self.spawn_into(&name, world) else {
+            return false;
+        };
+        self.play_snapshot = Some(snapshot);
+        self.play_entities = entities;
+        true
+    }
+
+    pub fn stop_play(&mut self, world: &mut bevy_ecs::world::World) -> bool {
+        if self.play_snapshot.take().is_none() {
+            return false;
+        }
+        Self::despawn_entities(world, &mut self.play_entities);
+        let Some(name) = self.active.clone() else {
+            return false;
+        };
+        self.active_entities = self.spawn_into(&name, world).unwrap_or_default();
+        true
+    }
+
+    pub fn is_playing(&self) -> bool {
+        self.play_snapshot.is_some()
     }
 }
 
