@@ -1,4 +1,4 @@
-use std::{
+﻿use std::{
     collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
@@ -6,7 +6,7 @@ use std::{
 };
 
 use bevy_ecs::{component::Component, entity::Entity, world::World};
-use egui::{Color32, Context, Key, RichText, Vec2};
+use egui::{Color32, Context, Key, RichText, Sense, Stroke, Vec2};
 use glam::Vec3;
 use serde::{Deserialize, Serialize};
 use winit::{event::WindowEvent, window::Window};
@@ -14,6 +14,7 @@ use winit::{event::WindowEvent, window::Window};
 use egui_dock::{DockArea, DockState, NodeIndex, SurfaceIndex};
 
 use crate::{
+    assets_ui::{AssetKind, PreviewMode, ObjMesh, classify, count_assets, format_bytes, format_modified},
     camera::CameraController,
     dock::{DockAction, EditorTab, WorkspacePreset, editor_dock_style},
     ecs::Name,
@@ -229,21 +230,22 @@ pub struct Editor {
     pub active_tool: usize,
     pub status: String,
     dirty: bool,
-    filter: String,
-    content_root: PathBuf,
-    content_dir: PathBuf,
-    content_history: Vec<PathBuf>,
-    history_index: usize,
-    content_list_view: bool,
-    content_type_filter: String,
-    content_selected: Option<PathBuf>,
-    log_filter: String,
-    log: Vec<(String, String)>,
-    scene_path: PathBuf,
-    view_mode: ViewMode,
-    orbit_target: Vec3,
-    orbit_distance: f32,
-    last_view_mode: ViewMode,
+        pub filter: String,
+        pub content_root: PathBuf,
+        pub content_dir: PathBuf,
+        pub content_history: Vec<PathBuf>,
+        pub history_index: usize,
+        pub content_list_view: bool,
+        pub content_type_filter: String,
+        pub content_selected: Option<PathBuf>,
+        pub renaming: Option<(PathBuf, String)>,
+        pub log_filter: String,
+        pub log: Vec<(String, String)>,
+        pub scene_path: PathBuf,
+        pub view_mode: ViewMode,
+        pub orbit_target: Vec3,
+        pub orbit_distance: f32,
+        pub last_view_mode: ViewMode,
 
     // Docking & Workspaces
     pub dock_state: Option<DockState<EditorTab>>,
@@ -256,6 +258,15 @@ pub struct Editor {
     pub graphics_shadows: String,
     pub camera_fov: f32,
     pub mouse_sensitivity: f32,
+
+        // Asset Preview state
+        pub preview_mode: PreviewMode,
+        pub mesh_zoom: f32,
+        pub texture_zoom: f32,
+        pub preview_yaw: f32,
+        pub preview_pitch: f32,
+        pub preview_orbit_drag: Option<(f32, f32)>,
+                pub open_asset_pending: Option<PathBuf>,
 
     // Feedback & Notifications
     pub notifications: NotificationManager,
@@ -308,6 +319,7 @@ impl Editor {
             content_list_view: true,
             content_type_filter: "All types".into(),
             content_selected: None,
+            renaming: None,
             log_filter: String::new(),
             log: vec![("INFO".into(), "Editor session started".into())],
             scene_path: PathBuf::from("assets/scenes/editor.ron"),
@@ -325,6 +337,13 @@ impl Editor {
             graphics_shadows: "High".into(),
             camera_fov: 75.0,
             mouse_sensitivity: 1.0,
+                        preview_mode: PreviewMode::Mesh,
+                        mesh_zoom: 1.0,
+                        texture_zoom: 1.0,
+                        preview_yaw: 0.6,
+                        preview_pitch: 0.3,
+                        preview_orbit_drag: None,
+                        open_asset_pending: None,
             notifications: NotificationManager::default(),
             confirm_dialog: None,
         }
@@ -435,6 +454,13 @@ impl Editor {
         style.visuals.window_fill = Color32::from_rgb(35, 36, 40);
         style.spacing.item_spacing = Vec2::new(6.0, 5.0);
         ctx.set_style(style);
+
+                // Process pending asset-open requests (e.g. "Open in Scene Editor" button
+                // in the Asset Preview panel, which runs outside the world-consuming code path).
+                if let Some(path) = self.open_asset_pending.take() {
+                    self.current_workspace = WorkspacePreset::LevelEditing;
+                    self.load_scene_from_path(world, &path);
+                }
 
         let mut dock_state = self
             .dock_state
@@ -948,7 +974,7 @@ impl Editor {
                         if err_count > 0 {
                             let btn = ui.add(
                                 egui::Button::new(
-                                    RichText::new(format!("✕ {err_count} errors"))
+                                    RichText::new(format!("вњ• {err_count} errors"))
                                         .size(11.0)
                                         .color(Color32::WHITE),
                                 )
@@ -967,7 +993,7 @@ impl Editor {
                         if warn_count > 0 {
                             let btn = ui.add(
                                 egui::Button::new(
-                                    RichText::new(format!("⚠ {warn_count} warnings"))
+                                    RichText::new(format!("вљ  {warn_count} warnings"))
                                         .size(11.0)
                                         .color(Color32::BLACK),
                                 )
@@ -1562,7 +1588,7 @@ impl Editor {
                     .hint_text("Search log...")
                     .desired_width(180.0),
             );
-            if !self.log_filter.is_empty() && ui.small_button("×").engine_tooltip("Clear Search", "Clear the log search filter", None).clicked() {
+            if !self.log_filter.is_empty() && ui.small_button("Г—").engine_tooltip("Clear Search", "Clear the log search filter", None).clicked() {
                 self.log_filter.clear();
             }
 
@@ -1625,6 +1651,595 @@ impl Editor {
                 }
             });
     }
+
+    /// Open an asset: scenes load into the Scene Editor; others select for preview.
+        pub fn open_asset(&mut self, world: &mut World, path: &std::path::Path) {
+        let kind = classify(path);
+        match kind {
+            AssetKind::Scene => {
+                    self.load_scene_from_path(world, path);
+                self.log_info("Loaded scene from Content Browser");
+            }
+            AssetKind::Folder => {
+                self.navigate_content(path.to_path_buf());
+            }
+            _ => {
+                self.content_selected = Some(path.to_path_buf());
+            }
+        }
+    }
+
+    /// Convenience helper to append an INFO-level message to the Output Log.
+    pub fn log_info(&mut self, message: &str) {
+        self.log.push(("INFO".into(), message.into()));
+    }
+
+    /// Load a scene file from a specific path into the world.
+    pub fn load_scene_from_path(&mut self, world: &mut World, path: &Path) {
+                match std::fs::read_to_string(path)
+                    .ok()
+                    .and_then(|s| Scene::from_ron(&s).ok())
+                {
+                    Some(scene) => {
+                        let entities: Vec<Entity> = world
+                            .query_filtered::<Entity, (
+                                bevy_ecs::query::With<Transform>,
+                                bevy_ecs::query::With<Name>,
+                            )>()
+                            .iter(world)
+                            .collect();
+                        for e in entities {
+                            let _ = world.despawn(e);
+                        }
+                        let count = scene.entities.len();
+                        for item in scene.entities {
+                            let mut t = Transform::from_translation(Vec3::from_array(item.translation));
+                            t.rotation = glam::Quat::from_array(item.rotation);
+                            t.scale = Vec3::from_array(item.scale);
+                            world.spawn((Name(item.name), t));
+                        }
+                        self.dirty = false;
+                        self.status = "Loaded".into();
+                        self.log
+                            .push(("INFO".into(), format!("Loaded scene with {count} actor(s)")));
+                        self.notifications.info(
+                            "Scene Reloaded",
+                            format!(
+                                "Restored {count} actor(s) from {}",
+                                path.file_name()
+                                    .unwrap_or_default()
+                                    .to_string_lossy()
+                            ),
+                        );
+                    }
+                    None => {
+                        self.status = "Scene load failed".into();
+                        self.log.push(("ERROR".into(), self.status.clone()));
+                    }
+                }
+    }
+
+            /// Draw the Asset Preview panel (central panel in Asset Editing workspace).
+            fn draw_asset_preview(&mut self, ui: &mut egui::Ui) {
+                let path = match &self.content_selected {
+                    Some(p) => p.clone(),
+                    None => {
+                                    Self::preview_empty_state(ui);
+                        return;
+                    }
+                };
+                let kind = classify(&path);
+                match kind {
+                                AssetKind::Folder => Self::preview_folder_state(self, ui, &path),
+                                AssetKind::Scene => Self::preview_scene_state(self, ui, &path),
+                                AssetKind::Texture => Self::preview_texture_state(self, ui, &path),
+                                AssetKind::Model => Self::preview_model_state(self, ui, &path),
+                                AssetKind::Material => Self::preview_material_state(self, ui, &path),
+                                AssetKind::Script => Self::preview_script_state(self, ui, &path),
+                                AssetKind::Shader => Self::preview_shader_state(self, ui, &path),
+                                AssetKind::Audio => Self::preview_audio_state(self, ui, &path),
+                                AssetKind::Unsupported => Self::preview_unsupported_state(self, ui, &path),
+                }
+            }
+
+            /// Draw the Asset Details panel (right panel in Asset Editing workspace).
+            fn draw_asset_details(&mut self, ui: &mut egui::Ui) {
+                let path = match &self.content_selected {
+                    Some(p) => p.clone(),
+                    None => {
+                                    Self::details_empty_state(ui);
+                        return;
+                    }
+                };
+                let kind = classify(&path);
+                let metadata = std::fs::metadata(&path).ok();
+                let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                            Self::draw_asset_details_header(ui, &name, &kind, &path, metadata.as_ref());
+                ui.separator();
+                            Self::draw_asset_details_properties(ui, &path, &kind, metadata.as_ref());
+                ui.separator();
+                            Self::draw_asset_details_type_specific(ui, &path, &kind);
+            }
+
+            fn preview_mesh_viewport(&mut self, ui: &mut egui::Ui, mesh: &ObjMesh) {
+                let (rect, response) = ui.allocate_exact_size(
+                    ui.available_size(),
+                    Sense::click_and_drag(),
+                );
+                let painter = ui.painter_at(rect);
+                let center = rect.center();
+                let zoom = self.mesh_zoom.max(0.1);
+                // Handle orbit drag
+                if response.dragged() {
+                    let delta = response.drag_delta();
+                    self.preview_yaw += delta.x * 0.005;
+                    self.preview_pitch = (self.preview_pitch - delta.y * 0.005).clamp(-1.5, 1.5);
+                }
+                // Scroll zoom
+                if response.hovered() {
+                    let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+                    if scroll != 0.0 {
+                        self.mesh_zoom = (self.mesh_zoom * (1.0 + scroll * 0.001)).clamp(0.1, 50.0);
+                    }
+                }
+                // Project 3D vertices to 2D
+                let cos_yaw = self.preview_yaw.cos();
+                let sin_yaw = self.preview_yaw.sin();
+                let cos_pitch = self.preview_pitch.cos();
+                let sin_pitch = self.preview_pitch.sin();
+                // Compute 2D points
+                                let points_2d: Vec<egui::Pos2> = mesh
+                    .vertices
+                    .iter()
+                    .map(|v| {
+                        let x = v[0] * cos_yaw * zoom + v[2] * sin_yaw * zoom;
+                        let y = v[1] * cos_pitch * zoom - (v[0] * sin_yaw - v[2] * cos_yaw) * sin_pitch * zoom;
+                        egui::pos2(center.x + x, center.y + y)
+                    })
+                    .collect();
+                                // Draw wireframe triangles (indices are a flat list of vertex indices, 3 per triangle)
+                let tri_color = Color32::from_rgb(80, 180, 230);
+                                for tri in mesh.indices.chunks(3) {
+                                    if tri.len() == 3 {
+                                        if let (Some(a), Some(b), Some(c)) = (
+                                            points_2d.get(tri[0] as usize),
+                                            points_2d.get(tri[1] as usize),
+                                            points_2d.get(tri[2] as usize),
+                                        ) {
+                                            painter.line_segment([*a, *b], Stroke::new(1.0, tri_color));
+                                            painter.line_segment([*b, *c], Stroke::new(1.0, tri_color));
+                                            painter.line_segment([*c, *a], Stroke::new(1.0, tri_color));
+                                        }
+                    }
+                }
+                // Draw bounds box
+                                let (min_p, max_p) = mesh.bounds();
+                                let corners = [
+                                    [min_p[0], min_p[1], min_p[2]],
+                                    [max_p[0], min_p[1], min_p[2]],
+                                    [max_p[0], max_p[1], min_p[2]],
+                                    [min_p[0], max_p[1], min_p[2]],
+                                    [min_p[0], min_p[1], max_p[2]],
+                                    [max_p[0], min_p[1], max_p[2]],
+                                    [max_p[0], max_p[1], max_p[2]],
+                                    [min_p[0], max_p[1], max_p[2]],
+                                ];
+                                let corners_2d: Vec<egui::Pos2> = corners
+                                    .iter()
+                                    .map(|v| {
+                                        let x = v[0] * cos_yaw * zoom + v[2] * sin_yaw * zoom;
+                                        let y = v[1] * cos_pitch * zoom - (v[0] * sin_yaw - v[2] * cos_yaw) * sin_pitch * zoom;
+                                        egui::pos2(center.x + x, center.y + y)
+                                    })
+                                    .collect();
+                                let box_edges = [
+                                    (0,1),(1,2),(2,3),(3,0),
+                                    (4,5),(5,6),(6,7),(7,4),
+                                    (0,4),(1,5),(2,6),(3,7),
+                                ];
+                                let box_color = Color32::from_rgb(120, 140, 160);
+                                for (a,b) in box_edges {
+                                    painter.line_segment([corners_2d[a], corners_2d[b]], Stroke::new(1.0, box_color));
+                }
+            }
+
+            fn preview_texture_viewport(&mut self, ui: &mut egui::Ui, data: &[u8]) {
+                            if let Ok(decoded) = image::load_from_memory(data) {
+                                let rgba = decoded.to_rgba8();
+                                let size = [rgba.width() as usize, rgba.height() as usize];
+                                let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &rgba);
+                    let texture = ui.ctx().load_texture(
+                        "asset_preview_texture",
+                        color_image,
+                        egui::TextureOptions::LINEAR,
+                    );
+                    let available = ui.available_size();
+                    let aspect = size[0] as f32 / size[1] as f32;
+                    let (w, h) = if available.x / available.y > aspect {
+                        (available.y * aspect * self.texture_zoom, available.y * self.texture_zoom)
+                    } else {
+                        (available.x * self.texture_zoom, available.x / aspect * self.texture_zoom)
+                    };
+                    let rect = ui.allocate_exact_size(egui::vec2(w, h), Sense::click_and_drag()).0;
+                    // Checkerboard background
+                    let painter = ui.painter_at(rect);
+                                let square = 16.0_f32;
+                    for x in (0..rect.width() as usize).step_by(square as usize * 2) {
+                        for y in (0..rect.height() as usize).step_by(square as usize * 2) {
+                            let r = egui::Rect::from_min_size(
+                                rect.min + egui::vec2(x as f32, y as f32),
+                                egui::vec2(square, square),
+                            );
+                            painter.rect_filled(r, 0.0, Color32::from_rgb(50, 53, 58));
+                            let r2 = egui::Rect::from_min_size(
+                                rect.min + egui::vec2(x as f32 + square, y as f32 + square),
+                                egui::vec2(square, square),
+                            );
+                            painter.rect_filled(r2, 0.0, Color32::from_rgb(50, 53, 58));
+                        }
+                    }
+                    ui.put(rect, egui::Image::new(&texture).fit_to_exact_size(rect.size()));
+                    if let Some(hover_pos) = ui.input(|i| i.pointer.hover_pos()) {
+                        if rect.contains(hover_pos) {
+                            let local = hover_pos - rect.min;
+                            let tex_x = (local.x / rect.width() * size[0] as f32) as usize;
+                            let tex_y = (local.y / rect.height() * size[1] as f32) as usize;
+                            if tex_x < size[0] && tex_y < size[1] {
+                                let idx = (tex_y * size[0] + tex_x) * 4;
+                                                            let raw = rgba.as_raw();
+                                                            if idx + 3 < raw.len() {
+                                                                let r = raw[idx];
+                                                                let g = raw[idx + 1];
+                                                                let b = raw[idx + 2];
+                                                                let a = raw[idx + 3];
+                                    ui.ctx().debug_painter().text(
+                                        hover_pos + egui::vec2(12.0, -20.0),
+                                        egui::Align2::LEFT_BOTTOM,
+                                        format!("RGBA: {r}, {g}, {b}, {a}"),
+                                        egui::FontId::proportional(11.0),
+                                        Color32::WHITE,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    ui.centered_and_justified(|ui| {
+                        ui.label(RichText::new("Failed to decode image").color(Color32::from_rgb(220, 100, 100)));
+                    });
+                }
+            }
+
+            // Preview state functions
+            fn preview_empty_state(ui: &mut egui::Ui) {
+                ui.centered_and_justified(|ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(40.0);
+                        Icons::show(ui, Icons::FILE, IconSize::XLarge, Some(Color32::from_rgb(100, 120, 140)));
+                        ui.add_space(12.0);
+                        ui.label(RichText::new("Asset Preview").size(20.0).color(Color32::from_rgb(180, 190, 200)));
+                        ui.add_space(4.0);
+                        ui.label(RichText::new("Select an asset in the Content Browser to preview it here.").color(Color32::from_rgb(120, 135, 155)));
+                    });
+                });
+            }
+
+            fn preview_folder_state(_editor: &mut Editor, ui: &mut egui::Ui, path: &Path) {
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                let count = count_assets(path);
+                            let entries = fs::read_dir(path).map(|rd| rd.count()).unwrap_or(0);
+                ui.centered_and_justified(|ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(40.0);
+                        Icons::show(ui, Icons::FOLDER, IconSize::XLarge, Some(Color32::from_rgb(80, 180, 230)));
+                        ui.add_space(12.0);
+                        ui.label(RichText::new(name).size(20.0).color(Color32::WHITE));
+                        ui.add_space(8.0);
+                                    ui.label(RichText::new(format!("{count} asset(s) В· {entries} entries")).color(Color32::from_rgb(140, 155, 170)));
+                        ui.add_space(20.0);
+                                    ui.label(RichText::new("Double-click in the Content Browser to navigate here.").color(Color32::from_rgb(120, 135, 155)));
+                    });
+                });
+            }
+
+            fn preview_scene_state(editor: &mut Editor, ui: &mut egui::Ui, path: &Path) {
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                ui.centered_and_justified(|ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(40.0);
+                        Icons::show(ui, Icons::SCENE, IconSize::XLarge, Some(Color32::from_rgb(80, 220, 120)));
+                        ui.add_space(12.0);
+                        ui.label(RichText::new(name).size(20.0).color(Color32::WHITE));
+                        ui.add_space(8.0);
+                        ui.label(RichText::new("Double-click to open in Scene Editor").color(Color32::from_rgb(140, 155, 170)));
+                        ui.add_space(20.0);
+                                    if ui.button("Open in Scene Editor").clicked() {
+                                        editor.open_asset_pending = Some(path.to_path_buf());
+                        }
+                    });
+                });
+            }
+
+            fn preview_texture_state(editor: &mut Editor, ui: &mut egui::Ui, path: &Path) {
+                if let Ok(data) = std::fs::read(path) {
+                    // Show zoom controls
+                    ui.horizontal(|ui| {
+                        ui.label("Zoom:");
+                        ui.add(egui::DragValue::new(&mut editor.texture_zoom).speed(0.01).clamp_range(0.1..=10.0).suffix("x"));
+                        if ui.button("Reset").clicked() {
+                            editor.texture_zoom = 1.0;
+                        }
+                    });
+                    ui.add_space(4.0);
+                    editor.preview_texture_viewport(ui, &data);
+                } else {
+                    ui.centered_and_justified(|ui| {
+                        ui.label(RichText::new("Failed to read texture file").color(Color32::from_rgb(220, 100, 100)));
+                    });
+                }
+            }
+
+            fn preview_model_state(editor: &mut Editor, ui: &mut egui::Ui, path: &Path) {
+                if let Ok(content) = std::fs::read_to_string(path) {
+                    if let Some(mesh) = ObjMesh::parse(&content) {
+                        // Show zoom control
+                        ui.horizontal(|ui| {
+                            ui.label("Zoom:");
+                            ui.add(egui::DragValue::new(&mut editor.mesh_zoom).speed(0.1).clamp_range(0.1..=50.0).suffix("x"));
+                            if ui.button("Reset").clicked() {
+                                editor.mesh_zoom = 1.0;
+                                editor.preview_yaw = 0.0;
+                                editor.preview_pitch = 0.0;
+                            }
+                            ui.separator();
+                            ui.label(format!("Vertices: {}  Triangles: {}", mesh.vertices.len(), mesh.indices.len() / 3));
+                        });
+                        ui.add_space(4.0);
+                        editor.preview_mesh_viewport(ui, &mesh);
+                    } else {
+                        ui.centered_and_justified(|ui| {
+                            ui.label(RichText::new("Failed to parse model (OBJ only)").color(Color32::from_rgb(220, 100, 100)));
+                        });
+                    }
+                } else {
+                    ui.centered_and_justified(|ui| {
+                        ui.label(RichText::new("Failed to read model file").color(Color32::from_rgb(220, 100, 100)));
+                    });
+                }
+            }
+
+            fn preview_material_state(_editor: &mut Editor, ui: &mut egui::Ui, path: &Path) {
+                if let Ok(content) = std::fs::read_to_string(path) {
+                                let mut buffer = content.clone();
+                    ui.vertical(|ui| {
+                        ui.add_space(10.0);
+                        ui.label(RichText::new("Material Preview").strong());
+                        ui.add_space(8.0);
+                        // Simple sphere placeholder
+                        let (rect, _) = ui.allocate_exact_size(egui::vec2(200.0, 200.0), Sense::hover());
+                        let painter = ui.painter_at(rect);
+                        let center = rect.center();
+                        let radius = 80.0;
+                        painter.circle_filled(center, radius, Color32::from_rgb(180, 140, 100));
+                        painter.circle_stroke(center, radius, Stroke::new(2.0, Color32::from_rgb(100, 80, 60)));
+                        ui.add_space(12.0);
+                        ui.separator();
+                        ui.add_space(8.0);
+                        ui.label(RichText::new("Raw Content:").strong());
+                        egui::ScrollArea::vertical()
+                            .max_height(200.0)
+                            .show(ui, |ui| {
+                                ui.add(
+                                                egui::TextEdit::multiline(&mut buffer)
+                                        .font(egui::TextStyle::Monospace)
+                                        .desired_width(f32::INFINITY)
+                                        .interactive(false),
+                                );
+                            });
+                    });
+                } else {
+                    ui.centered_and_justified(|ui| {
+                        ui.label(RichText::new("Failed to read material file").color(Color32::from_rgb(220, 100, 100)));
+                    });
+                }
+            }
+
+            fn preview_script_state(_editor: &mut Editor, ui: &mut egui::Ui, path: &Path) {
+                if let Ok(content) = std::fs::read_to_string(path) {
+                                let mut buffer = content.clone();
+                    ui.vertical(|ui| {
+                        ui.add_space(10.0);
+                        ui.label(RichText::new("Script Preview").strong());
+                        ui.add_space(8.0);
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            ui.add(
+                                            egui::TextEdit::multiline(&mut buffer)
+                                    .font(egui::TextStyle::Monospace)
+                                    .desired_width(f32::INFINITY)
+                                    .desired_rows(30)
+                                    .interactive(false),
+                            );
+                        });
+                    });
+                } else {
+                    ui.centered_and_justified(|ui| {
+                        ui.label(RichText::new("Failed to read script file").color(Color32::from_rgb(220, 100, 100)));
+                    });
+                }
+            }
+
+            fn preview_shader_state(_editor: &mut Editor, ui: &mut egui::Ui, path: &Path) {
+                            Self::preview_script_state(_editor, ui, path); // Same as script for now
+            }
+
+            fn preview_audio_state(_editor: &mut Editor, ui: &mut egui::Ui, path: &Path) {
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                let metadata = std::fs::metadata(path).ok();
+                let size = metadata.map(|m| m.len()).unwrap_or(0);
+                ui.centered_and_justified(|ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(40.0);
+                        Icons::show(ui, Icons::AUDIO, IconSize::XLarge, Some(Color32::from_rgb(220, 180, 80)));
+                        ui.add_space(12.0);
+                        ui.label(RichText::new(name).size(20.0).color(Color32::WHITE));
+                        ui.add_space(8.0);
+                        ui.label(RichText::new(format!("{} bytes", format_bytes(size))).color(Color32::from_rgb(140, 155, 170)));
+                        ui.add_space(20.0);
+                        ui.label(RichText::new("Audio preview not yet implemented").color(Color32::from_rgb(120, 135, 155)));
+                    });
+                });
+            }
+
+            fn preview_unsupported_state(_editor: &mut Editor, ui: &mut egui::Ui, path: &Path) {
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+                ui.centered_and_justified(|ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(40.0);
+                        Icons::show(ui, Icons::FILE, IconSize::XLarge, Some(Color32::from_rgb(160, 100, 100)));
+                        ui.add_space(12.0);
+                        ui.label(RichText::new(name).size(20.0).color(Color32::WHITE));
+                        ui.add_space(8.0);
+                        ui.label(RichText::new(format!("Unsupported asset type: .{}", ext)).color(Color32::from_rgb(220, 140, 140)));
+                        ui.add_space(20.0);
+                        ui.label(RichText::new("No preview available. Extend the preview system to support this type.").color(Color32::from_rgb(120, 135, 155)));
+                    });
+                });
+            }
+
+            // Asset Details helpers
+            fn draw_asset_details_header(ui: &mut egui::Ui, name: &str, kind: &AssetKind, path: &Path, metadata: Option<&std::fs::Metadata>) {
+                ui.horizontal(|ui| {
+                    Icons::show(ui, Icons::INFO, IconSize::Medium, Some(Color32::from_rgb(80, 180, 230)));
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new(name).size(16.0).strong().color(Color32::WHITE));
+                        ui.label(RichText::new(kind.label()).size(11.0).color(Color32::from_rgb(140, 155, 170)));
+                    });
+                });
+                ui.add_space(8.0);
+                if let Some(meta) = metadata {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Path:").color(Color32::from_rgb(120, 135, 155)));
+                        ui.add(egui::TextEdit::singleline(&mut path.to_string_lossy().to_string()).desired_width(f32::INFINITY).interactive(false));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Size:").color(Color32::from_rgb(120, 135, 155)));
+                        ui.label(RichText::new(format_bytes(meta.len())).color(Color32::WHITE));
+                    });
+                    if let Ok(modified) = meta.modified() {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Modified:").color(Color32::from_rgb(120, 135, 155)));
+                                                ui.label(RichText::new(format_modified(modified)).color(Color32::WHITE));
+                        });
+                    }
+                }
+            }
+
+            fn draw_asset_details_properties(ui: &mut egui::Ui, path: &Path, kind: &AssetKind, metadata: Option<&std::fs::Metadata>) {
+                ui.label(RichText::new("Properties").strong());
+                ui.add_space(4.0);
+                egui::Grid::new("asset_details_props").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
+                    Self::property_row(ui, "Name", path.file_name().unwrap_or_default().to_string_lossy().to_string());
+                    Self::property_row(ui, "Type", kind.label().to_string());
+                    Self::property_row(ui, "Format", path.extension().and_then(|s| s.to_str()).unwrap_or("").to_uppercase());
+                    if let Some(meta) = metadata {
+                        Self::property_row(ui, "Size", format_bytes(meta.len()));
+                    }
+                    ui.end_row();
+                });
+            }
+
+            fn draw_asset_details_type_specific(ui: &mut egui::Ui, path: &Path, kind: &AssetKind) {
+                match kind {
+                    AssetKind::Model => {
+                        ui.add_space(8.0);
+                        ui.label(RichText::new("Geometry").strong());
+                        if let Ok(content) = std::fs::read_to_string(path) {
+                                                if let Some(mesh) = ObjMesh::parse(&content) {
+                                                    let triangle_count = mesh.indices.len() / 3;
+                                                    let (min_p, max_p) = mesh.bounds();
+                                                    let size = [
+                                                        max_p[0] - min_p[0],
+                                                        max_p[1] - min_p[1],
+                                                        max_p[2] - min_p[2],
+                                                    ];
+                                egui::Grid::new("model_geometry").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
+                                    Self::property_row(ui, "Vertices", mesh.vertices.len().to_string());
+                                                        Self::property_row(ui, "Triangles", triangle_count.to_string());
+                                                        Self::property_row(ui, "Bounds", format!("{:.2} x {:.2} x {:.2}", size[0], size[1], size[2]));
+                                    ui.end_row();
+                                });
+                            }
+                        }
+                    }
+                    AssetKind::Texture => {
+                        ui.add_space(8.0);
+                        ui.label(RichText::new("Image").strong());
+                        if let Ok(data) = std::fs::read(path) {
+                            if let Ok(image) = image::load_from_memory(&data) {
+                                                    let (w, h) = (image.width(), image.height());
+                                egui::Grid::new("texture_props").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
+                                    Self::property_row(ui, "Resolution", format!("{} x {}", w, h));
+                                    Self::property_row(ui, "Color Type", format!("{:?}", image.color()));
+                                    ui.end_row();
+                                });
+                            }
+                        }
+                    }
+                    AssetKind::Material => {
+                        ui.add_space(8.0);
+                        ui.label(RichText::new("Material Parameters").strong());
+                        if let Ok(content) = std::fs::read_to_string(path) {
+                            for line in content.lines() {
+                                let line = line.trim();
+                                if line.starts_with("//") || line.is_empty() { continue; }
+                                ui.horizontal(|ui| {
+                                    ui.add_space(16.0);
+                                    ui.label(RichText::new(line).monospace().size(11.0).color(Color32::from_rgb(160, 170, 180)));
+                                });
+                            }
+                        }
+                    }
+                    AssetKind::Scene => {
+                        ui.add_space(8.0);
+                        ui.label(RichText::new("Scene Info").strong());
+                        if let Ok(content) = std::fs::read_to_string(path) {
+                            if let Ok(scene) = Scene::from_ron(&content) {
+                                egui::Grid::new("scene_props").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
+                                    Self::property_row(ui, "Entities", scene.entities.len().to_string());
+                                    ui.end_row();
+                                });
+                            }
+                        }
+                    }
+                    AssetKind::Script | AssetKind::Shader => {
+                        ui.add_space(8.0);
+                        ui.label(RichText::new("Source").strong());
+                    }
+                    _ => {}
+                }
+            }
+
+            fn property_row(ui: &mut egui::Ui, label: &str, value: String) {
+                ui.label(RichText::new(label).color(Color32::from_rgb(120, 135, 155)));
+                ui.label(RichText::new(value).color(Color32::WHITE));
+                ui.end_row();
+            }
+
+            fn details_empty_state(ui: &mut egui::Ui) {
+                ui.centered_and_justified(|ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(40.0);
+                        Icons::show(ui, Icons::INFO, IconSize::XLarge, Some(Color32::from_rgb(100, 120, 140)));
+                        ui.add_space(12.0);
+                        ui.label(RichText::new("Asset Details").size(20.0).color(Color32::from_rgb(180, 190, 200)));
+                        ui.add_space(4.0);
+                        ui.label(RichText::new("Select an asset in the Content Browser to view its properties.").color(Color32::from_rgb(120, 135, 155)));
+                    });
+                });
+            }
+
+            fn zoom_constant() -> f32 { 100.0 }
 
     fn draw_script_editor(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
@@ -1770,278 +2385,11 @@ impl Editor {
             self.orbit_distance = 8.0;
         }
     }
-    fn draw_content_browser(&mut self, ui: &mut egui::Ui, _world: &mut World) {
-        let _ = fs::create_dir_all(&self.content_root);
-        ui.horizontal(|ui| {
-            ui.heading("CONTENT BROWSER");
-            if ui
-                .button(
-                    RichText::new(Icons::LIST_VIEW)
-                        .size(14.0)
-                        .color(if self.content_list_view {
-                            Color32::WHITE
-                        } else {
-                            Color32::from_rgb(140, 145, 155)
-                        }),
-                )
-                .engine_tooltip("List View", "Show assets in a compact list", None)
-                .clicked()
-            {
-                self.content_list_view = true;
-            }
-            if ui
-                .button(
-                    RichText::new(Icons::GRID_VIEW)
-                        .size(14.0)
-                        .color(if !self.content_list_view {
-                            Color32::WHITE
-                        } else {
-                            Color32::from_rgb(140, 145, 155)
-                        }),
-                )
-                .engine_tooltip("Grid View", "Show assets as thumbnails in a grid", None)
-                .clicked()
-            {
-                self.content_list_view = false;
-            }
-        });
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(self.history_index > 0, egui::Button::new(RichText::new(Icons::BACK).size(13.0)))
-                .engine_tooltip("Back", "Return to the previous folder", Some("Alt+Left"))
-                .clicked()
-            {
-                self.history_index -= 1;
-                self.content_dir = self.content_history[self.history_index].clone();
-            }
-            if ui
-                .add_enabled(
-                    self.history_index + 1 < self.content_history.len(),
-                    egui::Button::new(RichText::new(Icons::FORWARD).size(13.0)),
-                )
-                .engine_tooltip("Forward", "Return to the next folder", Some("Alt+Right"))
-                .clicked()
-            {
-                self.history_index += 1;
-                self.content_dir = self.content_history[self.history_index].clone();
-            }
-            if ui
-                .button(RichText::new(Icons::HOME).size(13.0))
-                .engine_tooltip("Content Root", "Navigate to the root content folder", None)
-                .clicked()
-            {
-                self.navigate_content(self.content_root.clone());
-            }
-        });
-        let relative_parts: Vec<String> = self
-            .content_dir
-            .strip_prefix(&self.content_root)
-            .unwrap_or(Path::new(""))
-            .components()
-            .map(|part| part.as_os_str().to_string_lossy().to_string())
-            .collect();
-        ui.horizontal_wrapped(|ui| {
-            let mut target = self.content_root.clone();
-            if ui
-                .selectable_label(relative_parts.is_empty(), "Content")
-                .clicked()
-            {
-                self.navigate_content(target.clone());
-            }
-            for part in &relative_parts {
-                target.push(part);
-                ui.label("›");
-                if ui.selectable_label(false, part).clicked() {
-                    self.navigate_content(target.clone());
-                }
-            }
-        });
-        ui.horizontal(|ui| {
-            Icons::show(ui, Icons::SEARCH, IconSize::Small, Some(Color32::from_rgb(120, 135, 155)));
-            ui.add(
-                egui::TextEdit::singleline(&mut self.filter)
-                    .hint_text("Search assets…")
-                    .desired_width(f32::INFINITY),
-            );
-            if !self.filter.is_empty() && ui.small_button("×").clicked() {
-                self.filter.clear();
-            }
-        });
-        ui.horizontal(|ui| {
-            egui::ComboBox::from_id_salt("content_type_filter")
-                .selected_text(&self.content_type_filter)
-                .show_ui(ui, |ui| {
-                    for kind in [
-                        "All types",
-                        "Folders",
-                        "Scenes",
-                        "Materials",
-                        "Textures",
-                        "Models",
-                        "Scripts",
-                    ] {
-                        ui.selectable_value(&mut self.content_type_filter, kind.into(), kind);
-                    }
-                });
-            ui.menu_button(format!("{} Create", Icons::ADD), |ui| {
-                if ui.button(format!("{} Folder", Icons::FOLDER)).clicked() {
-                    self.create_content_folder();
-                    ui.close();
-                }
-                for (label, ext) in [("Scene", "ron"), ("Material", "mat"), ("Script", "rs")] {
-                    if ui.button(format!("{} {}", Icons::FILE, label)).clicked() {
-                        self.create_content_file(ext);
-                        ui.close();
-                    }
-                }
-                ui.separator();
-                if ui.button(format!("{} Import Sample Texture…", Icons::IMPORT)).clicked() {
-                    let dir = self.content_dir.clone();
-                    self.import_dummy_resource(&dir);
-                    ui.close();
-                }
-            });
-        });
-        ui.separator();
-        let mut entries: Vec<_> = fs::read_dir(&self.content_dir)
-            .ok()
-            .into_iter()
-            .flatten()
-            .filter_map(Result::ok)
-            .collect();
-        entries.sort_by_key(|entry| {
-            (
-                !entry.path().is_dir(),
-                entry.file_name().to_string_lossy().to_lowercase(),
-            )
-        });
-        let query = self.filter.to_lowercase();
-        let matches = |path: &Path| {
-            let name = path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_lowercase();
-            if !name.contains(&query) {
-                return false;
-            }
-            let is_dir = path.is_dir();
-            let ext = path
-                .extension()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_lowercase();
-            match self.content_type_filter.as_str() {
-                "Folders" => is_dir,
-                "Scenes" => ext == "ron" || ext == "scene",
-                "Materials" => ext == "mat" || ext == "material",
-                "Textures" => ["png", "jpg", "jpeg", "bmp", "tga", "dds"].contains(&ext.as_str()),
-                "Models" => ["obj", "fbx", "gltf", "glb"].contains(&ext.as_str()),
-                "Scripts" => ["rs", "lua", "py"].contains(&ext.as_str()),
-                _ => true,
-            }
-        };
-        let filtered: Vec<PathBuf> = entries
-            .into_iter()
-            .map(|entry| entry.path())
-            .filter(|path| matches(path))
-            .collect();
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            if self.content_list_view {
-                for path in filtered {
-                    let name = path
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .to_string();
-                    let kind = content_kind(&path);
-                    let is_dir = path.is_dir();
-                    let icon = content_icon(&path);
-                    let response = ui.selectable_label(
-                        self.content_selected.as_ref() == Some(&path),
-                        format!("{}  {}   · {}", icon, name, kind),
-                    );
-                    if response.clicked() {
-                        self.content_selected = Some(path.clone());
-                        if is_dir {
-                            self.navigate_content(path.clone());
-                        }
-                    }
-                    response.context_menu(|ui| self.content_context_menu(ui, &path));
-                }
-            } else {
-                let columns = ((ui.available_width() / 92.0).floor() as usize).max(1);
-                egui::Grid::new("content_grid")
-                    .num_columns(columns)
-                    .spacing([6.0, 8.0])
-                    .show(ui, |ui| {
-                        for (index, path) in filtered.iter().enumerate() {
-                            let name = path
-                                .file_name()
-                                .unwrap_or_default()
-                                .to_string_lossy()
-                                .to_string();
-                            let response = ui
-                                .allocate_ui_with_layout(
-                                    Vec2::new(82.0, 86.0),
-                                    egui::Layout::top_down(egui::Align::Center),
-                                    |ui| {
-                                        let selected = self.content_selected.as_ref() == Some(path);
-                                        let fill = if selected {
-                                            Color32::from_rgb(52, 76, 102)
-                                        } else {
-                                            Color32::from_rgb(39, 41, 46)
-                                        };
-                                        let border = if selected {
-                                            Color32::from_rgb(82, 166, 235)
-                                        } else {
-                                            Color32::from_rgb(50, 53, 58)
-                                        };
-                                        egui::Frame::new()
-                                            .fill(fill)
-                                            .corner_radius(4)
-                                            .inner_margin(6.0)
-                                            .stroke(egui::Stroke::new(1.0, border))
-                                            .show(ui, |ui| {
-                                                ui.set_min_width(68.0);
-                                                ui.set_min_height(70.0);
-                                                ui.vertical_centered(|ui| {
-                                                    ui.label(
-                                                        RichText::new(content_icon(path))
-                                                            .size(29.0),
-                                                    );
-                                                    ui.label(egui::RichText::new(name).size(11.0));
-                                                    ui.label(
-                                                        RichText::new(content_kind(path))
-                                                            .size(9.0)
-                                                            .color(Color32::GRAY),
-                                                    );
-                                                });
-                                            });
-                                    },
-                                )
-                                .response
-                                .interact(egui::Sense::click());
-                            if response.clicked() {
-                                self.content_selected = Some(path.clone());
-                                if path.is_dir() {
-                                    self.navigate_content(path.clone());
-                                }
-                            }
-                            response.context_menu(|ui| self.content_context_menu(ui, path));
-                            if (index + 1) % columns == 0 {
-                                ui.end_row();
-                            }
-                        }
-                    });
-            }
-        });
-        if self.content_selected.as_ref().is_some_and(|p| !p.exists()) {
-            self.content_selected = None;
-        }
+    fn draw_content_browser(&mut self, ui: &mut egui::Ui, world: &mut World) {
+        crate::content_browser::draw_content_browser(self, ui, world);
     }
 
-    fn navigate_content(&mut self, path: PathBuf) {
+    pub fn navigate_content(&mut self, path: PathBuf) {
         let Ok(root) = self.content_root.canonicalize() else {
             return;
         };
@@ -2060,7 +2408,7 @@ impl Editor {
         self.content_selected = None;
     }
 
-    fn content_context_menu(&mut self, ui: &mut egui::Ui, path: &Path) {
+    pub fn content_context_menu(&mut self, ui: &mut egui::Ui, path: &Path) {
         if path.is_dir() && ui.button(format!("{} Open", Icons::FOLDER_OPEN)).clicked() {
             self.navigate_content(path.to_path_buf());
             ui.close();
@@ -2081,7 +2429,7 @@ impl Editor {
             self.prompt_delete_resource(path.to_path_buf());
             ui.close();
         }
-        if ui.button(format!("{} Import Sample Texture…", Icons::IMPORT)).clicked() {
+        if ui.button(format!("{} Import Sample TextureвЂ¦", Icons::IMPORT)).clicked() {
             let target = if path.is_dir() {
                 path.to_path_buf()
             } else {
@@ -2096,7 +2444,7 @@ impl Editor {
         }
     }
 
-    fn create_content_folder(&mut self) {
+    pub fn create_content_folder(&mut self) {
         let mut n = 1;
         let path = loop {
             let candidate = self.content_dir.join(format!("NewFolder{n}"));
@@ -2110,7 +2458,7 @@ impl Editor {
                 .push(("ERROR".into(), format!("Create folder failed: {e}")));
         }
     }
-    fn create_content_file(&mut self, ext: &str) {
+    pub fn create_content_file(&mut self, ext: &str) {
         let mut n = 1;
         let path = loop {
             let candidate = self.content_dir.join(format!("New{n}.{ext}"));
@@ -2124,23 +2472,56 @@ impl Editor {
                 .push(("ERROR".into(), format!("Create file failed: {e}")));
         }
     }
-    fn rename_content(&mut self, path: &Path) {
+    pub fn rename_content(&mut self, path: &Path) {
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             return;
         };
-        let stem = path.file_stem().and_then(|n| n.to_str()).unwrap_or(name);
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| format!(".{e}"))
-            .unwrap_or_default();
-        let next = path.with_file_name(format!("{stem}_renamed{ext}"));
-        if let Err(e) = fs::rename(path, next) {
+        self.renaming = Some((path.to_path_buf(), name.to_string()));
+    }
+
+    /// Commit the in-progress rename (or cancel when `None` name is empty).
+    pub fn commit_rename(&mut self, apply: bool) {
+        let Some((path, new_name)) = self.renaming.take() else {
+            return;
+        };
+        if !apply || new_name.trim().is_empty() || *new_name == path.file_name().unwrap_or_default().to_string_lossy() {
+            return;
+        }
+        // Preserve extension for files: if user typed a name without extension, re-append it.
+        let target = if path.is_dir() {
+            path.with_file_name(new_name.trim())
+        } else {
+            let ext = path.extension().and_then(|e| e.to_str());
+            let stem_input = new_name.trim();
+            let final_name = match ext {
+                Some(e) if !stem_input.to_lowercase().ends_with(&format!(".{e}")) => {
+                    format!("{stem_input}.{e}")
+                }
+                _ => stem_input.to_string(),
+            };
+            path.with_file_name(final_name)
+        };
+        if target.exists() {
+            self.log.push((
+                "ERROR".into(),
+                format!("Rename failed: '{}' already exists", target.display()),
+            ));
+            return;
+        }
+        if let Err(e) = fs::rename(&path, &target) {
             self.log
                 .push(("ERROR".into(), format!("Rename failed: {e}")));
+        } else {
+            if self.content_selected.as_ref() == Some(&path) {
+                self.content_selected = Some(target.clone());
+            }
+            self.log.push((
+                "INFO".into(),
+                format!("Renamed '{}'", target.file_name().unwrap_or_default().to_string_lossy()),
+            ));
         }
     }
-    fn duplicate_content(&mut self, path: &Path) {
+    pub fn duplicate_content(&mut self, path: &Path) {
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             return;
         };
@@ -2158,7 +2539,7 @@ impl Editor {
                 .push(("ERROR".into(), format!("Duplicate failed: {e}")));
         }
     }
-    fn delete_content(&mut self, path: &Path) {
+    pub fn delete_content(&mut self, path: &Path) {
         let result = if path.is_dir() {
             fs::remove_dir_all(path)
         } else {
@@ -2172,7 +2553,7 @@ impl Editor {
             self.content_selected = None;
         }
     }
-    fn show_in_explorer(&mut self, path: &Path) {
+    pub fn show_in_explorer(&mut self, path: &Path) {
         #[cfg(target_os = "windows")]
         let result = Command::new("explorer").arg("/select,").arg(path).spawn();
         #[cfg(not(target_os = "windows"))]
@@ -2247,10 +2628,10 @@ impl Editor {
             Icons::show(ui, Icons::SEARCH, IconSize::Small, Some(Color32::from_rgb(120, 135, 155)));
             ui.add(
                 egui::TextEdit::singleline(&mut self.filter)
-                    .hint_text("Search actors…")
+                    .hint_text("Search actorsвЂ¦")
                     .desired_width(f32::INFINITY),
             );
-            if !self.filter.is_empty() && ui.small_button("×").clicked() {
+            if !self.filter.is_empty() && ui.small_button("Г—").clicked() {
                 self.filter.clear();
             }
         });
@@ -2782,20 +3163,33 @@ impl Editor {
         self.log.push(("INFO".into(), "Created empty scene".into()));
         self.notifications.success("New Scene", "Initialized new empty scene");
     }
-    fn import_dummy_resource(&mut self, target_dir: &Path) {
-        let dest = target_dir.join("sample_asset.obj");
-        let content = "# Wavefront OBJ mesh\nv 0.0 0.0 0.0\nv 1.0 0.0 0.0\nv 0.0 1.0 0.0\nf 1 2 3\n";
-        if let Err(e) = std::fs::write(&dest, content) {
-            self.notifications.error("Import Failed", format!("{e}"));
-            self.log.push(("ERROR".into(), format!("Import failed: {e}")));
-        } else {
-            self.notifications.success(
-                "Resource Imported",
-                "Successfully imported 'sample_asset.obj'",
-            );
-            self.log
-                .push(("INFO".into(), "Imported resource: sample_asset.obj".into()));
-            self.content_selected = Some(dest);
+    pub fn import_dummy_resource(&mut self, target_dir: &Path) {
+            // Pick a real file from disk and copy it into the content folder.
+            if let Some(file) = rfd::FileDialog::new().pick_file() {
+                let file_name = file
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "imported_asset".into());
+                let dest = target_dir.join(&file_name);
+                match std::fs::copy(&file, &dest) {
+                    Ok(_) => {
+                        self.content_selected = Some(dest);
+                        self.status = format!("Imported '{file_name}'");
+                        self.log.push((
+                            "INFO".into(),
+                            format!("Imported resource: {file_name} -> {}", target_dir.display()),
+                        ));
+                        self.notifications.success(
+                            "Resource Imported",
+                            format!("Copied '{file_name}' into the content folder"),
+                        );
+                    }
+                    Err(e) => {
+                        self.status = format!("Import failed: {e}");
+                        self.log.push(("ERROR".into(), self.status.clone()));
+                        self.notifications.error("Import Failed", format!("{e}"));
+                    }
+                }
         }
     }
     fn delete_selected(&mut self, world: &mut World) {
@@ -2859,48 +3253,7 @@ impl Editor {
         }
     }
     fn load_scene(&mut self, world: &mut World) {
-        match std::fs::read_to_string(&self.scene_path)
-            .ok()
-            .and_then(|s| Scene::from_ron(&s).ok())
-        {
-            Some(scene) => {
-                let entities: Vec<Entity> = world
-                    .query_filtered::<Entity, (
-                        bevy_ecs::query::With<Transform>,
-                        bevy_ecs::query::With<Name>,
-                    )>()
-                    .iter(world)
-                    .collect();
-                for e in entities {
-                    let _ = world.despawn(e);
-                }
-                let count = scene.entities.len();
-                for item in scene.entities {
-                    let mut t = Transform::from_translation(Vec3::from_array(item.translation));
-                    t.rotation = glam::Quat::from_array(item.rotation);
-                    t.scale = Vec3::from_array(item.scale);
-                    world.spawn((Name(item.name), t));
-                }
-                self.dirty = false;
-                self.status = "Loaded".into();
-                self.log
-                    .push(("INFO".into(), format!("Loaded scene with {count} actor(s)")));
-                self.notifications.info(
-                    "Scene Reloaded",
-                    format!(
-                        "Restored {count} actor(s) from {}",
-                        self.scene_path
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                    ),
-                );
-            }
-            None => {
-                self.status = "Scene load failed".into();
-                self.log.push(("ERROR".into(), self.status.clone()));
-            }
-        }
+        self.load_scene_from_path(world, &self.scene_path.clone());
     }
     fn save_layout(&self) {
         let state = LayoutSettings {
@@ -2951,6 +3304,8 @@ impl<'a> egui_dock::TabViewer for EditorTabViewer<'a> {
             EditorTab::WorldOutliner => self.editor.draw_world_outliner(ui, self.world),
             EditorTab::Details => self.editor.draw_details(ui, self.world),
             EditorTab::ContentBrowser => self.editor.draw_content_browser(ui, self.world),
+                EditorTab::AssetPreview => self.editor.draw_asset_preview(ui),
+                EditorTab::AssetDetails => self.editor.draw_asset_details(ui),
             EditorTab::OutputLog => self.editor.draw_output_log(ui),
             EditorTab::ScriptEditor => self.editor.draw_script_editor(ui),
             EditorTab::GraphicsSettings => self.editor.draw_graphics_settings(ui),

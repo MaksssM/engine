@@ -8,17 +8,21 @@ pub enum EditorTab {
     WorldOutliner,
     Details,
     ContentBrowser,
+    AssetPreview,
+    AssetDetails,
     OutputLog,
     ScriptEditor,
     GraphicsSettings,
 }
 
 impl EditorTab {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 9] = [
         Self::Viewport,
         Self::WorldOutliner,
         Self::Details,
         Self::ContentBrowser,
+        Self::AssetPreview,
+        Self::AssetDetails,
         Self::OutputLog,
         Self::ScriptEditor,
         Self::GraphicsSettings,
@@ -30,6 +34,8 @@ impl EditorTab {
             Self::WorldOutliner => "World Outliner",
             Self::Details => "Details",
             Self::ContentBrowser => "Content Browser",
+            Self::AssetPreview => "Asset Preview",
+            Self::AssetDetails => "Asset Details",
             Self::OutputLog => "Output Log",
             Self::ScriptEditor => "Script Editor",
             Self::GraphicsSettings => "Graphics Settings",
@@ -42,6 +48,8 @@ impl EditorTab {
             Self::WorldOutliner => "outliner",
             Self::Details => "details",
             Self::ContentBrowser => "content",
+            Self::AssetPreview => "asset-preview",
+            Self::AssetDetails => "asset-details",
             Self::OutputLog => "log",
             Self::ScriptEditor => "script",
             Self::GraphicsSettings => "graphics",
@@ -130,19 +138,20 @@ impl WorkspacePreset {
             }
             Self::AssetEditing => {
                 let mut state = DockState::new(vec![EditorTab::ContentBrowser]);
-                let [content_node, center_node] = state.main_surface_mut().split_right(
+                let [content_node, preview_node] = state.main_surface_mut().split_right(
                     NodeIndex::root(),
-                    0.35,
-                    vec![EditorTab::Viewport],
+                    0.30,
+                    vec![EditorTab::AssetPreview],
                 );
-                let [_center_node, _details_node] = state.main_surface_mut().split_right(
-                    center_node,
-                    0.60,
-                    vec![EditorTab::Details],
+                let [_preview_node, _details_node] = state.main_surface_mut().split_right(
+                    preview_node,
+                    0.62,
+                    vec![EditorTab::AssetDetails],
                 );
+                // Output Log starts collapsed (thin strip) and expands when the user drags it.
                 let [_content_node, _log_node] = state.main_surface_mut().split_below(
                     content_node,
-                    0.65,
+                    0.95,
                     vec![EditorTab::OutputLog],
                 );
                 state
@@ -316,7 +325,9 @@ pub fn smart_open_tab(dock_state: &mut DockState<EditorTab>, tab: EditorTab) {
         EditorTab::Viewport => None,
         EditorTab::WorldOutliner => Some((EditorTab::Details, egui_dock::Split::Above, 0.5)),
         EditorTab::Details => Some((EditorTab::WorldOutliner, egui_dock::Split::Below, 0.5)),
-        EditorTab::ContentBrowser => Some((EditorTab::OutputLog, egui_dock::Split::Left, 0.5)),
+        EditorTab::ContentBrowser => Some((EditorTab::AssetPreview, egui_dock::Split::Right, 0.5)),
+        EditorTab::AssetPreview => Some((EditorTab::ContentBrowser, egui_dock::Split::Left, 0.5)),
+        EditorTab::AssetDetails => Some((EditorTab::AssetPreview, egui_dock::Split::Right, 0.5)),
         EditorTab::OutputLog => Some((EditorTab::ContentBrowser, egui_dock::Split::Right, 0.5)),
         EditorTab::ScriptEditor => Some((EditorTab::Viewport, egui_dock::Split::Below, 0.35)),
         EditorTab::GraphicsSettings => Some((EditorTab::Details, egui_dock::Split::Below, 0.5)),
@@ -354,12 +365,15 @@ mod tests {
             let tabs: Vec<EditorTab> = state.iter_all_tabs().map(|(_, t)| *t).collect();
             assert!(!tabs.is_empty(), "Preset {:?} must contain tabs", preset);
 
-            // Viewport should exist in all presets
-            assert!(
-                tabs.contains(&EditorTab::Viewport),
-                "Preset {:?} must contain Viewport",
-                preset
-            );
+            // Viewport should exist in all presets except AssetEditing,
+            // which is an asset-management workspace without a 3D viewport.
+            if preset != WorkspacePreset::AssetEditing {
+                assert!(
+                    tabs.contains(&EditorTab::Viewport),
+                    "Preset {:?} must contain Viewport",
+                    preset
+                );
+            }
         }
     }
 

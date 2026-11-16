@@ -18,6 +18,8 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 wgpu = "27"
 winit = "0.30"
 egui_dock = { version = "0.18.0", features = ["serde"] }
+image = "0.25"
+rfd = "0.13"
 
 [profile.release]
 lto = "thin"

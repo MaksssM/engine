@@ -2,7 +2,9 @@
 
 mod app;
 mod assets;
+mod assets_ui;
 mod camera;
+mod content_browser;
 mod dock;
 mod ecs;
 mod editor;
