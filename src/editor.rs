@@ -4270,6 +4270,7 @@ impl Editor {
         ui.add_space(4.0);
 
         egui::ScrollArea::vertical()
+            .id_source("ecs_components_scroll")
             .max_height(200.0)
             .show(ui, |ui| {
                 egui::Grid::new("ecs_components_grid")
@@ -4296,6 +4297,7 @@ impl Editor {
         ui.add_space(4.0);
 
         egui::ScrollArea::vertical()
+            .id_source("ecs_resources_scroll")
             .max_height(150.0)
             .show(ui, |ui| {
                 for resource in &stats.resources {
@@ -4311,6 +4313,7 @@ impl Editor {
         ui.add_space(4.0);
 
         egui::ScrollArea::vertical()
+            .id_source("ecs_systems_scroll")
             .max_height(150.0)
             .show(ui, |ui| {
                 for (stage, system) in &stats.systems {

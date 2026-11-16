@@ -233,10 +233,12 @@ fn draw_folder_tree(editor: &mut Editor, ui: &mut egui::Ui) {
             .color(Color32::from_rgb(120, 135, 155)),
     );
     ui.separator();
-    egui::ScrollArea::vertical().show(ui, |ui| {
-        let root = crate::assets_ui::build_folder_tree(&editor.content_root, 8);
-        draw_tree_node(editor, ui, &root, 0);
-    });
+    egui::ScrollArea::vertical()
+        .id_source("folder_tree_scroll")
+        .show(ui, |ui| {
+            let root = crate::assets_ui::build_folder_tree(&editor.content_root, 8);
+            draw_tree_node(editor, ui, &root, 0);
+        });
 }
 
 fn draw_tree_node(
@@ -334,138 +336,141 @@ fn draw_asset_list(editor: &mut Editor, ui: &mut egui::Ui, world: &mut World) {
         .filter(|path| matches(path))
         .collect();
 
-    egui::ScrollArea::vertical().show(ui, |ui| {
-        if editor.content_list_view {
-            for path in filtered {
-                let name = path
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string();
-                let kind = classify(&path);
-                let is_dir = path.is_dir();
-                let icon = content_icon(&path);
+    egui::ScrollArea::vertical()
+        .id_source("asset_list_scroll")
+        .show(ui, |ui| {
+            if editor.content_list_view {
+                for path in filtered {
+                    let name = path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string();
+                    let kind = classify(&path);
+                    let is_dir = path.is_dir();
+                    let icon = content_icon(&path);
 
-                // Inline rename editor
-                let renaming_this = editor.renaming.as_ref().is_some_and(|(p, _)| p == &path);
-                if renaming_this {
-                    let (_, text) = editor.renaming.as_mut().unwrap();
-                    let response = ui.text_edit_singleline(text);
-                    if response.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                        editor.commit_rename(false);
+                    // Inline rename editor
+                    let renaming_this = editor.renaming.as_ref().is_some_and(|(p, _)| p == &path);
+                    if renaming_this {
+                        let (_, text) = editor.renaming.as_mut().unwrap();
+                        let response = ui.text_edit_singleline(text);
+                        if response.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                            editor.commit_rename(false);
+                        }
+                        if response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            editor.commit_rename(true);
+                        }
+                        ui.label(format!("{}  · {}", icon, kind.label()));
+                        continue;
                     }
-                    if response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        editor.commit_rename(true);
-                    }
-                    ui.label(format!("{}  · {}", icon, kind.label()));
-                    continue;
+
+                    // Use dnd_drag_source for drag & drop support
+                    let item_id = egui::Id::new(format!("content_item_{}", path.display()));
+                    let drag_result = ui.dnd_drag_source(item_id, path.clone(), |ui| {
+                        let selected = editor.content_selected.as_ref() == Some(&path);
+                        let response = ui.selectable_label(
+                            selected,
+                            format!("{}  {}   · {}", icon, name, kind.label()),
+                        );
+                        if response.clicked() {
+                            editor.content_selected = Some(path.clone());
+                            if is_dir {
+                                editor.navigate_content(path.clone());
+                            }
+                        }
+                        if response.double_clicked() {
+                            editor.open_asset(world, &path);
+                        }
+                        response
+                    });
+                    drag_result
+                        .inner
+                        .context_menu(|ui| editor.content_context_menu(ui, &path));
                 }
-
-                // Use dnd_drag_source for drag & drop support
-                let item_id = egui::Id::new(format!("content_item_{}", path.display()));
-                let drag_result = ui.dnd_drag_source(item_id, path.clone(), |ui| {
-                    let selected = editor.content_selected.as_ref() == Some(&path);
-                    let response = ui.selectable_label(
-                        selected,
-                        format!("{}  {}   · {}", icon, name, kind.label()),
-                    );
-                    if response.clicked() {
-                        editor.content_selected = Some(path.clone());
-                        if is_dir {
-                            editor.navigate_content(path.clone());
-                        }
-                    }
-                    if response.double_clicked() {
-                        editor.open_asset(world, &path);
-                    }
-                    response
-                });
-                drag_result
-                    .inner
-                    .context_menu(|ui| editor.content_context_menu(ui, &path));
-            }
-        } else {
-            let columns = ((ui.available_width() / 92.0).floor() as usize).max(1);
-            egui::Grid::new("content_grid")
-                .num_columns(columns)
-                .spacing([6.0, 8.0])
-                .show(ui, |ui| {
-                    for (index, path) in filtered.iter().enumerate() {
-                        let name = path
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .to_string();
-                        let renaming_this =
-                            editor.renaming.as_ref().is_some_and(|(p, _)| p == path);
-                        if renaming_this {
-                            let (_, text) = editor.renaming.as_mut().unwrap();
-                            let response = ui.text_edit_singleline(text);
-                            if response.lost_focus()
-                                || ui.input(|i| i.key_pressed(egui::Key::Escape))
-                            {
-                                editor.commit_rename(false);
-                            }
-                            if response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                            {
-                                editor.commit_rename(true);
-                            }
-                            continue;
-                        }
-                        let item_id =
-                            egui::Id::new(format!("content_grid_item_{}", path.display()));
-                        let path_clone = path.clone();
-                        let drag_result = ui.dnd_drag_source(item_id, path_clone, |ui| {
-                            let selected = editor.content_selected.as_ref() == Some(path);
-                            let fill = if selected {
-                                Color32::from_rgb(52, 76, 102)
-                            } else {
-                                Color32::from_rgb(39, 41, 46)
-                            };
-                            let border = if selected {
-                                Color32::from_rgb(82, 166, 235)
-                            } else {
-                                Color32::from_rgb(50, 53, 58)
-                            };
-                            let frame_response = egui::Frame::new()
-                                .fill(fill)
-                                .corner_radius(4)
-                                .inner_margin(6.0)
-                                .stroke(Stroke::new(1.0, border))
-                                .show(ui, |ui| {
-                                    ui.set_min_width(68.0);
-                                    ui.set_min_height(70.0);
-                                    ui.vertical_centered(|ui| {
-                                        ui.label(RichText::new(content_icon(path)).size(29.0));
-                                        ui.label(egui::RichText::new(name).size(11.0));
-                                        ui.label(
-                                            RichText::new(classify(path).label())
-                                                .size(9.0)
-                                                .color(Color32::GRAY),
-                                        );
-                                    });
-                                });
-                            if frame_response.response.clicked() {
-                                editor.content_selected = Some(path.clone());
-                                if path.is_dir() {
-                                    editor.navigate_content(path.clone());
+            } else {
+                let columns = ((ui.available_width() / 92.0).floor() as usize).max(1);
+                egui::Grid::new("content_grid")
+                    .num_columns(columns)
+                    .spacing([6.0, 8.0])
+                    .show(ui, |ui| {
+                        for (index, path) in filtered.iter().enumerate() {
+                            let name = path
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .to_string();
+                            let renaming_this =
+                                editor.renaming.as_ref().is_some_and(|(p, _)| p == path);
+                            if renaming_this {
+                                let (_, text) = editor.renaming.as_mut().unwrap();
+                                let response = ui.text_edit_singleline(text);
+                                if response.lost_focus()
+                                    || ui.input(|i| i.key_pressed(egui::Key::Escape))
+                                {
+                                    editor.commit_rename(false);
                                 }
+                                if response.has_focus()
+                                    && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                                {
+                                    editor.commit_rename(true);
+                                }
+                                continue;
                             }
-                            if frame_response.response.double_clicked() {
-                                editor.open_asset(world, path);
+                            let item_id =
+                                egui::Id::new(format!("content_grid_item_{}", path.display()));
+                            let path_clone = path.clone();
+                            let drag_result = ui.dnd_drag_source(item_id, path_clone, |ui| {
+                                let selected = editor.content_selected.as_ref() == Some(path);
+                                let fill = if selected {
+                                    Color32::from_rgb(52, 76, 102)
+                                } else {
+                                    Color32::from_rgb(39, 41, 46)
+                                };
+                                let border = if selected {
+                                    Color32::from_rgb(82, 166, 235)
+                                } else {
+                                    Color32::from_rgb(50, 53, 58)
+                                };
+                                let frame_response = egui::Frame::new()
+                                    .fill(fill)
+                                    .corner_radius(4)
+                                    .inner_margin(6.0)
+                                    .stroke(Stroke::new(1.0, border))
+                                    .show(ui, |ui| {
+                                        ui.set_min_width(68.0);
+                                        ui.set_min_height(70.0);
+                                        ui.vertical_centered(|ui| {
+                                            ui.label(RichText::new(content_icon(path)).size(29.0));
+                                            ui.label(egui::RichText::new(name).size(11.0));
+                                            ui.label(
+                                                RichText::new(classify(path).label())
+                                                    .size(9.0)
+                                                    .color(Color32::GRAY),
+                                            );
+                                        });
+                                    });
+                                if frame_response.response.clicked() {
+                                    editor.content_selected = Some(path.clone());
+                                    if path.is_dir() {
+                                        editor.navigate_content(path.clone());
+                                    }
+                                }
+                                if frame_response.response.double_clicked() {
+                                    editor.open_asset(world, path);
+                                }
+                                frame_response.response
+                            });
+                            drag_result
+                                .inner
+                                .context_menu(|ui| editor.content_context_menu(ui, path));
+                            if (index + 1) % columns == 0 {
+                                ui.end_row();
                             }
-                            frame_response.response
-                        });
-                        drag_result
-                            .inner
-                            .context_menu(|ui| editor.content_context_menu(ui, path));
-                        if (index + 1) % columns == 0 {
-                            ui.end_row();
                         }
-                    }
-                });
-        }
-    });
+                    });
+            }
+        });
 
     // Drag & drop target: allow dropping assets onto the current folder to move them
     let _ = world;
