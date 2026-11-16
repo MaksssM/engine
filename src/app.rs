@@ -12,16 +12,19 @@ use winit::{
 
 use crate::{
     camera::{Camera3D, CameraController},
-    core::{lifecycle::GameLoop, resources::init_core_resources, systems::SystemStage},
+    core::{
+        lifecycle::GameLoop,
+        resources::init_core_resources,
+        systems::SystemStage,
+    },
     ecs::Ecs,
     editor::Editor,
-    events::Events,
-    input::MouseButton as EngineMouseButton,
+    events::{EventCursor, Events},
+    input::{MouseButton as EngineMouseButton, UiInput},
     quality::QualityPreset,
-    renderer::{Renderable, Renderer},
+    renderer::{collect_render_snapshot, Renderable, Renderer},
     time::{Clock, FixedTimestep, FpsMeter},
-    transform::{GlobalTransform, Transform},
-    ui_new::MouseInput,
+    transform::Transform,
 };
 
 pub fn run() -> Result<(), winit::error::EventLoopError> {
@@ -54,7 +57,7 @@ struct EngineApp {
     scene_manager: crate::scene::SceneManager,
     debug_overlay: bool,
     wireframe_mode: bool,
-    mouse: MouseInput,
+    mouse: UiInput,
     show_debug_panel: bool,
     show_quality_panel: bool,
     show_camera_panel: bool,
@@ -63,6 +66,7 @@ struct EngineApp {
     editor: Option<Editor>,
     /// Runtime system lifecycle shared by editor and future game mode.
     game_loop: GameLoop,
+    window_event_cursor: EventCursor,
 }
 
 impl ApplicationHandler for EngineApp {
@@ -213,10 +217,6 @@ impl ApplicationHandler for EngineApp {
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                let was_down = self.mouse.left_down;
-                self.mouse.left_down = matches!(state, ElementState::Pressed);
-                self.mouse.left_clicked = !was_down && self.mouse.left_down;
-                self.mouse.left_released = was_down && !self.mouse.left_down;
                 if let Some(mut input) = self
                     .ecs
                     .world
@@ -236,10 +236,9 @@ impl ApplicationHandler for EngineApp {
                         input.state.release_mouse(button);
                     }
                 }
+                self.sync_ui_input();
             }
             WindowEvent::CursorMoved { position, .. } => {
-                self.mouse.x = position.x as f32;
-                self.mouse.y = position.y as f32;
                 if let Some(mut input) = self
                     .ecs
                     .world
@@ -249,6 +248,23 @@ impl ApplicationHandler for EngineApp {
                         .state
                         .set_mouse_position(position.x as f32, position.y as f32);
                 }
+                self.sync_ui_input();
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let (x, y) = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(x, y) => (x, y),
+                    winit::event::MouseScrollDelta::PixelDelta(position) => {
+                        (position.x as f32, position.y as f32)
+                    }
+                };
+                if let Some(mut input) = self
+                    .ecs
+                    .world
+                    .get_resource_mut::<crate::core::resources::EngineInput>()
+                {
+                    input.state.add_mouse_wheel(x, y);
+                }
+                self.sync_ui_input();
             }
             WindowEvent::RedrawRequested => self.update(),
             other => {
@@ -319,8 +335,9 @@ impl EngineApp {
         // Rendering resource preparation is once per frame; simulation timing is
         // owned by GameLoop so FixedUpdate cannot be executed twice.
         self.update_camera_controller(step_seconds);
+        let render_snapshot = collect_render_snapshot(&mut self.ecs.world);
         if let Some(renderer) = self.renderer.as_mut() {
-            renderer.update(&mut self.ecs.world, step_seconds);
+            renderer.update(&render_snapshot, step_seconds);
         }
         let entity_count = self
             .ecs
@@ -344,17 +361,10 @@ impl EngineApp {
         }
 
         if let Some(renderer) = self.renderer.as_mut() {
-            let camera_data = self
-                .ecs
-                .world
-                .query::<(&Camera3D, &GlobalTransform)>()
-                .iter(&self.ecs.world)
-                .next()
-                .map(|(camera, transform)| (*camera, *transform));
-            if let Some((camera, transform)) = camera_data {
+            if let Some((camera, transform)) = render_snapshot.camera {
                 renderer.set_camera(&camera, &transform);
             }
-            match renderer.render_scene(&mut self.ecs.world) {
+            match renderer.render_scene(&render_snapshot) {
                 Ok((frame, view)) => {
                     if let (Some(window), Some(editor)) =
                         (self.window.as_ref(), self.editor.as_mut())
@@ -511,12 +521,13 @@ impl EngineApp {
 
     fn process_events(&mut self) {
         let mut reload_requested = false;
-        let mut events = self
+        let pending_events = self
             .ecs
             .world
-            .remove_resource::<Events<WindowEvent>>()
+            .get_resource::<Events<WindowEvent>>()
+            .map(|events| events.read(&mut self.window_event_cursor).cloned().collect::<Vec<_>>())
             .unwrap_or_default();
-        for event in events.drain() {
+        for event in pending_events {
             if let WindowEvent::KeyboardInput { event, .. } = event
                 && let PhysicalKey::Code(key) = event.physical_key
             {
@@ -565,25 +576,32 @@ impl EngineApp {
                 }
             }
         }
-        self.ecs
-            .world
-            .insert_resource::<Events<WindowEvent>>(events);
         if reload_requested {
             self.reload_active_scene();
         }
     }
 
     fn process_ui(&mut self) {
+        self.sync_ui_input();
+    }
+
+    fn sync_ui_input(&mut self) {
+        let Some(input) = self
+            .ecs
+            .world
+            .get_resource::<crate::core::resources::EngineInput>()
+        else {
+            return;
+        };
+        self.mouse = UiInput::from_input(&input.state);
         if let Some(renderer) = &mut self.renderer {
             if let Some(ui) = &mut renderer.ui {
-                ui.mouse_x = self.mouse.x;
-                ui.mouse_y = self.mouse.y;
+                ui.mouse_x = self.mouse.position.0;
+                ui.mouse_y = self.mouse.position.1;
                 ui.mouse_down = self.mouse.left_down;
-                ui.mouse_clicked = self.mouse.left_clicked;
+                ui.mouse_clicked = self.mouse.left_pressed;
                 ui.mouse_released = self.mouse.left_released;
             }
         }
-        self.mouse.left_clicked = false;
-        self.mouse.left_released = false;
     }
 }

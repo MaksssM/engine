@@ -22,6 +22,10 @@ impl Clock {
         delta
     }
 
+    pub fn advance(&mut self, delta: Duration) {
+        self.elapsed += delta;
+    }
+
     pub fn elapsed(&self) -> Duration {
         self.elapsed
     }

@@ -2,6 +2,8 @@ use std::{collections::HashMap, marker::PhantomData, sync::Arc};
 
 use crate::{
     assets::{AssetManager, Handle},
+    camera::Camera3D,
+    core::components::{CameraMarker, Light, LightKind, Visible},
     quality::{QualityPreset, ShaderVariant, ShadowQuality},
     transform::GlobalTransform,
     ui_new::{Rect, Ui, UiRenderer},
@@ -140,6 +142,92 @@ pub struct MaterialAsset {
 pub struct Renderable {
     pub mesh: Handle<MeshAsset>,
     pub material: Handle<MaterialAsset>,
+}
+
+/// The renderer-facing view of world data. It contains only references and
+/// transforms needed by the GPU passes, keeping ECS components independent of
+/// wgpu resources.
+#[derive(Clone, Copy)]
+pub struct RenderableInstance {
+    pub entity: Entity,
+    pub renderable: Renderable,
+    pub global_transform: glam::Mat4,
+}
+
+#[derive(Default)]
+pub struct RenderSnapshot {
+    pub renderables: Vec<RenderableInstance>,
+    pub camera: Option<(Camera3D, GlobalTransform)>,
+    pub directional_light: Option<([f32; 3], Vec3)>,
+}
+
+pub fn collect_render_snapshot(world: &mut World) -> RenderSnapshot {
+    let renderables = collect_visible_renderables(world);
+    let camera = world
+        .query::<(&Camera3D, &GlobalTransform, Option<&CameraMarker>, Option<&Visible>)>()
+        .iter(world)
+        .filter(|(_, _, marker, visible)| {
+            marker.is_none_or(|marker| marker.is_main)
+                && visible.is_none_or(|visible| visible.0)
+        })
+        .next()
+        .map(|(camera, transform, _, _)| (*camera, *transform));
+    let directional_light = world
+        .query::<(&Light, &GlobalTransform, Option<&Visible>)>()
+        .iter(world)
+        .filter(|(_, _, visible)| visible.is_none_or(|visible| visible.0))
+        .find_map(|(light, transform, _)| match light.kind {
+            LightKind::Directional => Some((
+                light.color,
+                transform.0.transform_vector3(Vec3::NEG_Z).normalize_or_zero(),
+            )),
+            _ => None,
+        });
+    RenderSnapshot {
+        renderables,
+        camera,
+        directional_light,
+    }
+}
+
+pub fn collect_visible_renderables(world: &mut World) -> Vec<RenderableInstance> {
+    let mut query = world.query::<(Entity, &Renderable, &GlobalTransform, Option<&Visible>)>();
+    query
+        .iter(world)
+        .filter(|(_, _, _, visible)| visible.is_none_or(|visible| visible.0))
+        .map(|(entity, renderable, transform, _)| RenderableInstance {
+            entity,
+            renderable: *renderable,
+            global_transform: transform.0,
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transform::Transform;
+
+    #[test]
+    fn renderer_snapshot_filters_hidden_entities() {
+        let mut world = World::new();
+        let visible_mesh = Handle::<MeshAsset>::from_id(1);
+        let visible_material = Handle::<MaterialAsset>::from_id(2);
+        let hidden_mesh = Handle::<MeshAsset>::from_id(3);
+        let hidden_material = Handle::<MaterialAsset>::from_id(4);
+        world.spawn((Renderable {
+            mesh: visible_mesh,
+            material: visible_material,
+        }, Transform::default(), GlobalTransform::default(), Visible(true)));
+        world.spawn((Renderable {
+            mesh: hidden_mesh,
+            material: hidden_material,
+        }, Transform::default(), GlobalTransform::default(), Visible(false)));
+
+        let visible = collect_visible_renderables(&mut world);
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].renderable.mesh.id(), visible_mesh.id());
+    }
 }
 
 #[derive(Resource)]
@@ -907,7 +995,7 @@ impl Renderer {
         self.frame_time_ms = frame_time_ms;
     }
 
-    pub fn update(&mut self, world: &mut World, delta_seconds: f32) {
+    pub fn update(&mut self, snapshot: &RenderSnapshot, delta_seconds: f32) {
         let aspect = self.window_size.width as f32 / self.window_size.height.max(1) as f32;
         let projection =
             Mat4::perspective_rh(self.camera_fov, aspect, self.camera_near, self.camera_far);
@@ -918,22 +1006,24 @@ impl Renderer {
         self.queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&camera));
         let _ = delta_seconds;
-        let light_view = Mat4::look_at_rh(Vec3::new(4.0, 8.0, 4.0), Vec3::ZERO, Vec3::Y);
+        let (light_color, light_direction) = snapshot.directional_light.unwrap_or((
+            [1.0, 1.0, 1.0],
+            Vec3::new(-4.0, -8.0, -4.0).normalize(),
+        ));
+        let light_view = Mat4::look_at_rh(-light_direction * 10.0, Vec3::ZERO, Vec3::Y);
         let light_projection = Mat4::orthographic_rh(-8.0, 8.0, -8.0, 8.0, 0.1, 40.0);
         let light = LightUniform {
             view_proj: (light_projection * light_view).to_cols_array_2d(),
-            params: [0.25, 0.75, 0.0, 0.0],
-            direction: Vec3::new(-4.0, -8.0, -4.0).normalize().extend(0.0).into(),
+            params: [light_color[0], light_color[1], light_color[2], 0.0],
+            direction: light_direction.extend(0.0).into(),
         };
         self.queue
             .write_buffer(&self.light_buffer, 0, bytemuck::bytes_of(&light));
 
-        let mut query = world.query::<(Entity, &Renderable, &GlobalTransform)>();
-        let renderables: Vec<_> = query
-            .iter(world)
-            .map(|(entity, renderable, transform)| (entity, *renderable, transform.0))
-            .collect();
-        for (entity, renderable, transform) in renderables {
+        for instance in snapshot.renderables.iter().copied() {
+            let entity = instance.entity;
+            let renderable = instance.renderable;
+            let transform = instance.global_transform;
             let key = (renderable.mesh.id(), entity.to_bits());
             let needs_model_buffer = self
                 .mesh_assets
@@ -986,7 +1076,7 @@ impl Renderer {
 
     pub fn render_scene(
         &mut self,
-        world: &mut World,
+        snapshot: &RenderSnapshot,
     ) -> Result<(wgpu::SurfaceTexture, wgpu::TextureView), wgpu::SurfaceError> {
         let frame = self.surface.get_current_texture()?;
         let view = frame
@@ -998,11 +1088,7 @@ impl Renderer {
                 label: Some("frame"),
             });
 
-        let mut query = world.query::<(Entity, &Renderable, &GlobalTransform)>();
-        let renderables: Vec<_> = query
-            .iter(world)
-            .map(|(entity, renderable, transform)| (entity, *renderable, transform.0))
-            .collect();
+        let renderables = &snapshot.renderables;
 
         // Shadow pass temporarily disabled - WGPU requires separate depth texture for sampling vs attachment
         // which is not supported on this driver architecture
@@ -1052,7 +1138,9 @@ impl Renderer {
             timestamp_writes: None,
             occlusion_query_set: None,
         });
-        for (entity, renderable, _) in &renderables {
+        for instance in renderables {
+            let entity = instance.entity;
+            let renderable = instance.renderable;
             let Some(material) = self.material_assets.get(renderable.material) else {
                 continue;
             };

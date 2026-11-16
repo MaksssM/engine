@@ -368,13 +368,14 @@ impl SceneManager {
     }
 
     pub fn stop_play(&mut self, world: &mut bevy_ecs::world::World) -> bool {
-        if self.play_snapshot.take().is_none() {
+        let Some(snapshot) = self.play_snapshot.take() else {
             return false;
-        }
+        };
         Self::despawn_entities(world, &mut self.play_entities);
         let Some(name) = self.active.clone() else {
             return false;
         };
+        self.scenes.insert(name.clone(), snapshot);
         self.active_entities = self.spawn_into(&name, world).unwrap_or_default();
         true
     }

@@ -26,6 +26,13 @@ impl<T> std::hash::Hash for Handle<T> {
 }
 
 impl<T> Handle<T> {
+    pub(crate) fn from_id(id: u64) -> Self {
+        Self {
+            id,
+            _marker: PhantomData,
+        }
+    }
+
     pub fn id(self) -> u64 {
         self.id
     }

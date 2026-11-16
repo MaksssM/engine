@@ -33,10 +33,12 @@ impl GameLoop {
 
     /// Run one frame with editor work always active and simulation gated by mode.
     pub fn tick(&mut self, world: &mut World, delta_seconds: f64) {
+        let frame_delta = delta_seconds.max(0.0);
         if let Some(mut time) = world.get_resource_mut::<EngineTime>() {
-            time.delta_seconds = delta_seconds as f32;
+            time.delta_seconds = 0.0;
             time.fixed_delta_seconds = self.fixed_step as f32;
             time.frame_number = time.frame_number.saturating_add(1);
+            time.clock.advance(std::time::Duration::from_secs_f64(frame_delta));
         }
         self.scheduler
             .run_stage(super::systems::SystemStage::PreUpdate, world);
@@ -50,15 +52,18 @@ impl GameLoop {
         let simulation_enabled = matches!(mode, EngineMode::Playing);
         if simulation_enabled {
             if let Some(mut time) = world.get_resource_mut::<EngineTime>() {
-                time.delta_seconds = delta_seconds.max(0.0) as f32;
+                time.delta_seconds = frame_delta as f32;
             }
-            self.fixed_accumulator += delta_seconds.max(0.0);
+            self.fixed_accumulator += frame_delta;
             let mut steps = 0;
             while self.fixed_accumulator >= self.fixed_step && steps < self.max_fixed_steps {
                 self.scheduler
                     .run_stage(super::systems::SystemStage::FixedUpdate, world);
                 self.fixed_accumulator -= self.fixed_step;
                 steps += 1;
+            }
+            if steps == self.max_fixed_steps && self.fixed_accumulator >= self.fixed_step {
+                self.fixed_accumulator = self.fixed_step * 0.999;
             }
             self.scheduler
                 .run_stage(super::systems::SystemStage::Update, world);

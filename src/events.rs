@@ -27,6 +27,12 @@ impl<T> Default for Events<T> {
     }
 }
 
+impl EventCursor {
+    pub fn sequence(&self) -> u64 {
+        self.sequence
+    }
+}
+
 impl<T> Events<T> {
     pub fn send(&mut self, event: T) {
         let sequence = self.next_sequence;
@@ -45,6 +51,35 @@ impl<T> Events<T> {
             .filter(move |(sequence, _)| *sequence >= current)
             .map(|(_, event)| event)
     }
+    /// Discard events that every registered reader has already passed.
+    /// Callers retain cursors for as long as they need delivery guarantees.
+    pub fn retain_from(&mut self, oldest_sequence: u64) {
+        while self
+            .queue
+            .front()
+            .is_some_and(|(sequence, _)| *sequence < oldest_sequence)
+        {
+            self.queue.pop_front();
+        }
+    }
+
+    /// Advance a cursor and return its events while allowing the queue to be
+    /// compacted once all readers have acknowledged the same boundary.
+    pub fn read_and_retain<'a>(
+        &'a mut self,
+        cursor: &'a mut EventCursor,
+        oldest_sequence: u64,
+    ) -> impl Iterator<Item = &'a T> + 'a {
+        let current = cursor.sequence;
+        let newest = self.next_sequence;
+        cursor.sequence = newest;
+        self.retain_from(oldest_sequence);
+        self.queue
+            .iter()
+            .filter(move |(sequence, _)| *sequence >= current)
+            .map(|(_, event)| event)
+    }
+
     pub fn len(&self) -> usize {
         self.queue.len()
     }
@@ -90,5 +125,7 @@ mod tests {
             events.read(&mut second).copied().collect::<Vec<_>>(),
             vec![3]
         );
+        events.retain_from(first.sequence());
+        assert_eq!(events.len(), 0);
     }
 }
