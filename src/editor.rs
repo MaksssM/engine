@@ -3184,13 +3184,23 @@ impl Editor {
     }
     fn save_scene(&mut self, world: &mut World) {
         let mut scene = Scene::new();
-        for (_, name, t) in world.query::<(Entity, &Name, &Transform)>().iter(world) {
+        for (entity, name, t) in world.query::<(Entity, &Name, &Transform)>().iter(world) {
             scene.entities.push(SceneEntity {
                 name: name.0.clone(),
+                uid: world.get::<crate::core::uid::Uid>(entity).copied(),
                 translation: t.translation.to_array(),
                 rotation: t.rotation.to_array(),
                 scale: t.scale.to_array(),
                 parent: None,
+                visible: world
+                    .get::<crate::core::components::Visible>(entity)
+                    .is_none_or(|value| value.0),
+                locked: world
+                    .get::<crate::core::components::Locked>(entity)
+                    .is_some_and(|value| value.0),
+                folder: world
+                    .get::<crate::core::components::FolderGroup>(entity)
+                    .map(|value| value.0.clone()),
             });
         }
         if let Some(parent) = self.scene_path.parent() {

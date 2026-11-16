@@ -36,6 +36,9 @@ impl GameLoop {
     pub fn tick(&mut self, world: &mut World, delta_seconds: f64) {
         if let Some(mut time) = world.get_resource_mut::<EngineTime>() {
             let _ = time.clock.tick();
+            time.delta_seconds = delta_seconds as f32;
+            time.fixed_delta_seconds = self.fixed_step as f32;
+            time.frame_number = time.frame_number.saturating_add(1);
         }
 
         self.scheduler

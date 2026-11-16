@@ -16,7 +16,6 @@ use crate::{
     ecs::Ecs,
     editor::Editor,
     events::Events,
-    input::InputState,
     quality::QualityPreset,
     renderer::{Renderable, Renderer},
     time::{Clock, FixedTimestep, FpsMeter},
@@ -51,7 +50,6 @@ struct EngineApp {
     timestep: Option<FixedTimestep>,
     fps: FpsMeter,
     ecs: Ecs,
-    input: InputState,
     events: Events<WindowEvent>,
     scene_manager: crate::scene::SceneManager,
     debug_overlay: bool,
@@ -245,7 +243,13 @@ impl EngineApp {
             };
             clock.tick()
         };
-        self.input.begin_frame();
+        if let Some(mut input) = self
+            .ecs
+            .world
+            .get_resource_mut::<crate::core::resources::EngineInput>()
+        {
+            input.state.begin_frame();
+        }
         self.process_events();
 
         let updates = self
@@ -360,6 +364,26 @@ impl EngineApp {
     }
 
     fn update_camera_controller(&mut self, delta_seconds: f32) {
+        let Some(input) = self
+            .ecs
+            .world
+            .get_resource::<crate::core::resources::EngineInput>()
+        else {
+            return;
+        };
+        let keys = [
+            input.state.pressed(winit::keyboard::KeyCode::KeyW),
+            input.state.pressed(winit::keyboard::KeyCode::KeyS),
+            input.state.pressed(winit::keyboard::KeyCode::KeyD),
+            input.state.pressed(winit::keyboard::KeyCode::KeyA),
+            input.state.pressed(winit::keyboard::KeyCode::KeyQ),
+            input.state.pressed(winit::keyboard::KeyCode::KeyE),
+            input.state.pressed(winit::keyboard::KeyCode::ArrowLeft),
+            input.state.pressed(winit::keyboard::KeyCode::ArrowRight),
+            input.state.pressed(winit::keyboard::KeyCode::ArrowUp),
+            input.state.pressed(winit::keyboard::KeyCode::ArrowDown),
+        ];
+        let _ = input;
         let mut query = self
             .ecs
             .world
@@ -368,38 +392,38 @@ impl EngineApp {
             return;
         };
         let mut movement = Vec3::ZERO;
-        if self.input.pressed(winit::keyboard::KeyCode::KeyW) {
+        if keys[0] {
             movement += controller.forward();
         }
-        if self.input.pressed(winit::keyboard::KeyCode::KeyS) {
+        if keys[1] {
             movement -= controller.forward();
         }
-        if self.input.pressed(winit::keyboard::KeyCode::KeyD) {
+        if keys[2] {
             movement += controller.right();
         }
-        if self.input.pressed(winit::keyboard::KeyCode::KeyA) {
+        if keys[3] {
             movement -= controller.right();
         }
-        if self.input.pressed(winit::keyboard::KeyCode::KeyQ) {
+        if keys[4] {
             movement.y -= 1.0;
         }
-        if self.input.pressed(winit::keyboard::KeyCode::KeyE) {
+        if keys[5] {
             movement.y += 1.0;
         }
         if movement.length_squared() > 0.0 {
             transform.translation +=
                 movement.normalize() * controller.movement_speed * delta_seconds;
         }
-        if self.input.pressed(winit::keyboard::KeyCode::ArrowLeft) {
+        if keys[6] {
             controller.yaw -= 1.5 * delta_seconds;
         }
-        if self.input.pressed(winit::keyboard::KeyCode::ArrowRight) {
+        if keys[7] {
             controller.yaw += 1.5 * delta_seconds;
         }
-        if self.input.pressed(winit::keyboard::KeyCode::ArrowUp) {
+        if keys[8] {
             controller.pitch = (controller.pitch + delta_seconds).clamp(-1.4, 1.4);
         }
-        if self.input.pressed(winit::keyboard::KeyCode::ArrowDown) {
+        if keys[9] {
             controller.pitch = (controller.pitch - delta_seconds).clamp(-1.4, 1.4);
         }
         let rotation = glam::Quat::from_rotation_y(controller.yaw)
@@ -449,10 +473,21 @@ impl EngineApp {
             {
                 match event.state {
                     ElementState::Pressed => {
-                        if self.input.pressed(key) {
+                        let already_pressed = self
+                            .ecs
+                            .world
+                            .get_resource::<crate::core::resources::EngineInput>()
+                            .is_some_and(|input| input.state.pressed(key));
+                        if already_pressed {
                             continue;
                         }
-                        self.input.press(key);
+                        if let Some(mut input) = self
+                            .ecs
+                            .world
+                            .get_resource_mut::<crate::core::resources::EngineInput>()
+                        {
+                            input.state.press(key);
+                        }
                         match key {
                             winit::keyboard::KeyCode::F1 => {
                                 self.debug_overlay = !self.debug_overlay;
@@ -469,7 +504,15 @@ impl EngineApp {
                             _ => {}
                         }
                     }
-                    ElementState::Released => self.input.release(key),
+                    ElementState::Released => {
+                        if let Some(mut input) = self
+                            .ecs
+                            .world
+                            .get_resource_mut::<crate::core::resources::EngineInput>()
+                        {
+                            input.state.release(key);
+                        }
+                    }
                 }
             }
         }

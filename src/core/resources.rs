@@ -12,12 +12,18 @@ use crate::time::Clock;
 #[derive(bevy_ecs::resource::Resource)]
 pub struct EngineTime {
     pub clock: Clock,
+    pub delta_seconds: f32,
+    pub fixed_delta_seconds: f32,
+    pub frame_number: u64,
 }
 
 impl Default for EngineTime {
     fn default() -> Self {
         Self {
             clock: Clock::new(),
+            delta_seconds: 0.0,
+            fixed_delta_seconds: 1.0 / 60.0,
+            frame_number: 0,
         }
     }
 }

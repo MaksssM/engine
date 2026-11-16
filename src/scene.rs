@@ -1,4 +1,11 @@
-use crate::transform::Transform;
+use crate::{
+    core::{
+        components::{FolderGroup, Locked, Visible},
+        uid::Uid,
+    },
+    ecs::Name,
+    transform::Transform,
+};
 use bevy_ecs::entity::Entity;
 use glam::Vec3;
 use serde::{Deserialize, Serialize};
@@ -10,16 +17,27 @@ fn default_rotation() -> [f32; 4] {
 fn default_scale() -> [f32; 3] {
     [1.0, 1.0, 1.0]
 }
+fn default_visible() -> bool {
+    true
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SceneEntity {
     pub name: String,
+    #[serde(default)]
+    pub uid: Option<Uid>,
     pub translation: [f32; 3],
     #[serde(default = "default_rotation")]
     pub rotation: [f32; 4],
     #[serde(default = "default_scale")]
     pub scale: [f32; 3],
     pub parent: Option<usize>,
+    #[serde(default = "default_visible")]
+    pub visible: bool,
+    #[serde(default)]
+    pub locked: bool,
+    #[serde(default)]
+    pub folder: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -64,10 +82,14 @@ impl Scene {
         let index = self.entities.len();
         self.entities.push(SceneEntity {
             name: name.into(),
+            uid: Some(Uid::new()),
             translation: translation.to_array(),
             rotation: default_rotation(),
             scale: default_scale(),
             parent,
+            visible: true,
+            locked: false,
+            folder: None,
         });
         index
     }
@@ -123,11 +145,29 @@ impl SceneManager {
         for item in &scene.entities {
             entities.push(
                 world
-                    .spawn(Transform::from_translation(Vec3::from_array(
-                        item.translation,
-                    )))
+                    .spawn((
+                        Name(item.name.clone()),
+                        item.uid.unwrap_or_default(),
+                        Transform {
+                            translation: Vec3::from_array(item.translation),
+                            rotation: glam::Quat::from_xyzw(
+                                item.rotation[0],
+                                item.rotation[1],
+                                item.rotation[2],
+                                item.rotation[3],
+                            ),
+                            scale: Vec3::from_array(item.scale),
+                        },
+                        Visible(item.visible),
+                        Locked(item.locked),
+                    ))
                     .id(),
             );
+            if let Some(folder) = &item.folder {
+                world
+                    .entity_mut(*entities.last().unwrap())
+                    .insert(FolderGroup(folder.clone()));
+            }
         }
         for (index, item) in scene.entities.iter().enumerate() {
             if let Some(parent) = item.parent {
