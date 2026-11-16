@@ -9,7 +9,7 @@ bytemuck = { version = "1.25", features = ["derive"] }
 egui = "0.33"
 egui-wgpu = "0.33"
 egui-winit = "0.33"
-glam = "0.30"
+glam = { version = "0.30", features = ["serde"] }
 ron = "0.8"
 serde = { version = "1", features = ["derive"] }
 pollster = "0.4"

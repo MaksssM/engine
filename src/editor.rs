@@ -1,11 +1,11 @@
-﻿use std::{
+use std::{
     collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
     process::Command,
 };
 
-use bevy_ecs::{component::Component, entity::Entity, world::World};
+use bevy_ecs::{entity::Entity, world::World};
 use egui::{Color32, Context, Key, RichText, Sense, Stroke, Vec2};
 use glam::Vec3;
 use serde::{Deserialize, Serialize};
@@ -16,6 +16,7 @@ use egui_dock::{DockArea, DockState, NodeIndex, SurfaceIndex};
 use crate::{
     assets_ui::{AssetKind, PreviewMode, ObjMesh, classify, count_assets, format_bytes, format_modified},
     camera::CameraController,
+    core::components::{FolderGroup, Locked, Visible},
     dock::{DockAction, EditorTab, WorkspacePreset, editor_dock_style},
     ecs::Name,
     feedback::{
@@ -129,33 +130,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     return vec4<f32>(albedo * diff, 1.0);
 }
 "#;
-
-#[derive(Component, Clone, Copy, Debug, PartialEq)]
-pub struct Visible(pub bool);
-
-impl Default for Visible {
-    fn default() -> Self {
-        Self(true)
-    }
-}
-
-#[derive(Component, Clone, Copy, Debug, PartialEq)]
-pub struct Locked(pub bool);
-
-impl Default for Locked {
-    fn default() -> Self {
-        Self(false)
-    }
-}
-
-#[derive(Component, Clone, Debug, PartialEq)]
-pub struct FolderGroup(pub String);
-
-impl Default for FolderGroup {
-    fn default() -> Self {
-        Self("Default".into())
-    }
-}
 
 #[derive(Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 enum ViewMode {

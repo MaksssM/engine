@@ -12,6 +12,7 @@ use winit::{
 
 use crate::{
     camera::{Camera3D, CameraController},
+    core::{lifecycle::GameLoop, resources::init_core_resources, systems::SystemStage},
     ecs::Ecs,
     editor::Editor,
     events::Events,
@@ -19,7 +20,7 @@ use crate::{
     quality::QualityPreset,
     renderer::{Renderable, Renderer},
     time::{Clock, FixedTimestep, FpsMeter},
-    transform::{GlobalTransform, Transform, propagate_transforms},
+    transform::{GlobalTransform, Transform},
     ui_new::MouseInput,
 };
 
@@ -62,6 +63,8 @@ struct EngineApp {
     // UI state - now handled by renderer's UI system
     quality_preset_index: usize,
     editor: Option<Editor>,
+    /// Runtime system lifecycle shared by editor and future game mode.
+    game_loop: GameLoop,
 }
 
 impl ApplicationHandler for EngineApp {
@@ -79,6 +82,12 @@ impl ApplicationHandler for EngineApp {
         let attributes = Window::default_attributes().with_title("Rust Engine");
         match event_loop.create_window(attributes) {
             Ok(window) => {
+                init_core_resources(&mut self.ecs.world);
+                self.game_loop.scheduler.add_fn(
+                    "Transform propagation",
+                    SystemStage::PostUpdate,
+                    |world| crate::transform::propagate_transforms(world),
+                );
                 self.window_id = Some(window.id());
                 let window = Arc::new(window);
                 let preset = QualityPreset::from_environment();
@@ -263,7 +272,8 @@ impl EngineApp {
             }
         }
 
-        propagate_transforms(&mut self.ecs.world);
+        self.game_loop
+            .tick(&mut self.ecs.world, frame_time.as_secs_f64());
         let entity_count = self
             .ecs
             .world
