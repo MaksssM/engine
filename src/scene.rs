@@ -141,32 +141,52 @@ impl SceneManager {
         if scene.validate().is_err() {
             return None;
         }
+        let mut seen_uids = std::collections::HashSet::with_capacity(scene.entities.len());
+        for item in &scene.entities {
+            let uid = item.uid.unwrap_or_default();
+            if !uid.is_valid() || !seen_uids.insert(uid) {
+                return None;
+            }
+            if world
+                .get_resource::<crate::core::resources::PersistentIdRegistry>()
+                .and_then(|registry| registry.resolve(uid))
+                .is_some()
+            {
+                return None;
+            }
+        }
         let mut entities = Vec::with_capacity(scene.entities.len());
         for item in &scene.entities {
-            entities.push(
-                world
-                    .spawn((
-                        Name(item.name.clone()),
-                        item.uid.unwrap_or_default(),
-                        Transform {
-                            translation: Vec3::from_array(item.translation),
-                            rotation: glam::Quat::from_xyzw(
-                                item.rotation[0],
-                                item.rotation[1],
-                                item.rotation[2],
-                                item.rotation[3],
-                            ),
-                            scale: Vec3::from_array(item.scale),
-                        },
-                        Visible(item.visible),
-                        Locked(item.locked),
-                    ))
-                    .id(),
-            );
+            let uid = item.uid.unwrap_or_default();
+            let entity = world
+                .spawn((
+                    Name(item.name.clone()),
+                    uid,
+                    Transform {
+                        translation: Vec3::from_array(item.translation),
+                        rotation: glam::Quat::from_xyzw(
+                            item.rotation[0],
+                            item.rotation[1],
+                            item.rotation[2],
+                            item.rotation[3],
+                        ),
+                        scale: Vec3::from_array(item.scale),
+                    },
+                    Visible(item.visible),
+                    Locked(item.locked),
+                ))
+                .id();
+            if let Some(mut registry) =
+                world.get_resource_mut::<crate::core::resources::PersistentIdRegistry>()
+            {
+                if registry.register(uid, entity).is_err() {
+                    world.despawn(entity);
+                    return None;
+                }
+            }
+            entities.push(entity);
             if let Some(folder) = &item.folder {
-                world
-                    .entity_mut(*entities.last().unwrap())
-                    .insert(FolderGroup(folder.clone()));
+                world.entity_mut(entity).insert(FolderGroup(folder.clone()));
             }
         }
         for (index, item) in scene.entities.iter().enumerate() {
@@ -192,6 +212,13 @@ impl SceneManager {
 
     pub fn unload_active(&mut self, world: &mut bevy_ecs::world::World) {
         for entity in self.active_entities.drain(..) {
+            if let Some(uid) = world.get::<Uid>(entity).copied() {
+                if let Some(mut registry) =
+                    world.get_resource_mut::<crate::core::resources::PersistentIdRegistry>()
+                {
+                    registry.unregister(uid);
+                }
+            }
             world.despawn(entity);
         }
     }

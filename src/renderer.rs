@@ -6,7 +6,7 @@ use crate::{
     transform::GlobalTransform,
     ui_new::{Rect, Ui, UiRenderer},
 };
-use bevy_ecs::{component::Component, entity::Entity, world::World};
+use bevy_ecs::{component::Component, entity::Entity, resource::Resource, world::World};
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
 use wgpu::util::DeviceExt;
@@ -142,6 +142,7 @@ pub struct Renderable {
     pub material: Handle<MaterialAsset>,
 }
 
+#[derive(Resource)]
 pub struct Renderer {
     pub surface: wgpu::Surface<'static>,
     pub device: wgpu::Device,

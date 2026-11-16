@@ -1,6 +1,7 @@
+use bevy_ecs::resource::Resource;
 use std::collections::VecDeque;
 
-#[derive(Debug)]
+#[derive(Debug, Resource)]
 pub struct Events<T> {
     queue: VecDeque<T>,
 }

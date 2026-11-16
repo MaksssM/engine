@@ -44,6 +44,74 @@ pub struct EngineConfig {
     pub max_fps: Option<u32>,
 }
 
+/// Renderer settings shared by runtime, editor and render systems.
+#[derive(bevy_ecs::resource::Resource, Clone, Debug)]
+pub struct RendererConfiguration {
+    pub render_scale_percent: u32,
+    pub post_processing: bool,
+    pub msaa_samples: u32,
+    pub shadow_quality: crate::quality::ShadowQuality,
+}
+
+impl Default for RendererConfiguration {
+    fn default() -> Self {
+        let settings = crate::quality::QualityPreset::Balanced.settings();
+        Self {
+            render_scale_percent: settings.render_scale_percent,
+            post_processing: settings.post_processing,
+            msaa_samples: settings.msaa_samples,
+            shadow_quality: settings.shadow_quality,
+        }
+    }
+}
+
+/// Project-wide mapping between persistent object IDs and transient ECS entities.
+#[derive(bevy_ecs::resource::Resource, Default)]
+pub struct PersistentIdRegistry {
+    entities: std::collections::HashMap<crate::core::uid::Uid, bevy_ecs::entity::Entity>,
+}
+
+impl PersistentIdRegistry {
+    pub fn register(
+        &mut self,
+        uid: crate::core::uid::Uid,
+        entity: bevy_ecs::entity::Entity,
+    ) -> Result<(), RegistryError> {
+        if !uid.is_valid() {
+            return Err(RegistryError::InvalidId);
+        }
+        if let Some(existing) = self.entities.get(&uid).copied() {
+            if existing != entity {
+                return Err(RegistryError::DuplicateId(uid));
+            }
+        }
+        self.entities.insert(uid, entity);
+        Ok(())
+    }
+
+    pub fn unregister(&mut self, uid: crate::core::uid::Uid) -> Option<bevy_ecs::entity::Entity> {
+        self.entities.remove(&uid)
+    }
+
+    pub fn unregister_entity(&mut self, entity: bevy_ecs::entity::Entity) {
+        self.entities.retain(|_, mapped| *mapped != entity);
+    }
+
+    pub fn resolve(&self, uid: crate::core::uid::Uid) -> Option<bevy_ecs::entity::Entity> {
+        self.entities.get(&uid).copied()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entities.len()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegistryError {
+    InvalidId,
+    DuplicateId(crate::core::uid::Uid),
+}
+
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
@@ -86,6 +154,12 @@ pub fn init_core_resources(world: &mut World) {
     if !world.contains_resource::<EngineMode>() {
         world.insert_resource(EngineMode::default());
     }
+    if !world.contains_resource::<RendererConfiguration>() {
+        world.insert_resource(RendererConfiguration::default());
+    }
+    if !world.contains_resource::<PersistentIdRegistry>() {
+        world.insert_resource(PersistentIdRegistry::default());
+    }
 }
 
 #[cfg(test)]
@@ -97,11 +171,28 @@ mod tests {
         let mut world = World::new();
         init_core_resources(&mut world);
         init_core_resources(&mut world); // must not panic on second call
-
         assert!(world.contains_resource::<EngineTime>());
         assert!(world.contains_resource::<EngineInput>());
         assert!(world.contains_resource::<EngineConfig>());
         assert!(world.contains_resource::<EngineMode>());
+        assert!(world.contains_resource::<RendererConfiguration>());
+        assert!(world.contains_resource::<PersistentIdRegistry>());
+    }
+
+    #[test]
+    fn persistent_registry_rejects_collisions_and_removes_entities() {
+        let mut registry = PersistentIdRegistry::default();
+        let uid = crate::core::uid::Uid::from_parts(1, 2);
+        let first = bevy_ecs::entity::Entity::from_raw(1);
+        let second = bevy_ecs::entity::Entity::from_raw(2);
+        assert_eq!(registry.register(uid, first), Ok(()));
+        assert_eq!(registry.resolve(uid), Some(first));
+        assert_eq!(
+            registry.register(uid, second),
+            Err(RegistryError::DuplicateId(uid))
+        );
+        registry.unregister_entity(first);
+        assert_eq!(registry.resolve(uid), None);
     }
 
     #[test]

@@ -16,7 +16,10 @@ pub mod prelude {
     pub use super::components::*;
     pub use super::game_object::{GameObject, ObjectRole};
     pub use super::lifecycle::GameLoop;
-    pub use super::resources::{EngineConfig, EngineInput, EngineMode, EngineTime};
+    pub use super::resources::{
+        EngineConfig, EngineInput, EngineMode, EngineTime, PersistentIdRegistry, RegistryError,
+        RendererConfiguration,
+    };
     pub use super::systems::{FnSystem, System, SystemScheduler, SystemStage};
     pub use super::uid::Uid;
 }

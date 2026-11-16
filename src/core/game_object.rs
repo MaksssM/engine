@@ -19,14 +19,25 @@ impl GameObject {
         use crate::ecs::Name;
         use crate::transform::Transform;
 
-        world
+        let entity = world
             .spawn((
                 Uid::new(),
                 Name(name.into()),
                 Transform::default(),
                 Visible::default(),
             ))
-            .id()
+            .id();
+        let uid = *world
+            .get::<Uid>(entity)
+            .expect("spawned GameObject has Uid");
+        if let Some(mut registry) =
+            world.get_resource_mut::<crate::core::resources::PersistentIdRegistry>()
+        {
+            registry
+                .register(uid, entity)
+                .expect("generated GameObject UID must be unique");
+        }
+        entity
     }
 
     /// Spawn with explicit transform.
@@ -37,9 +48,20 @@ impl GameObject {
     ) -> bevy_ecs::entity::Entity {
         use crate::ecs::Name;
 
-        world
+        let entity = world
             .spawn((Uid::new(), Name(name.into()), transform, Visible::default()))
-            .id()
+            .id();
+        let uid = *world
+            .get::<Uid>(entity)
+            .expect("spawned GameObject has Uid");
+        if let Some(mut registry) =
+            world.get_resource_mut::<crate::core::resources::PersistentIdRegistry>()
+        {
+            registry
+                .register(uid, entity)
+                .expect("generated GameObject UID must be unique");
+        }
+        entity
     }
 }
 

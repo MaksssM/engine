@@ -50,7 +50,6 @@ struct EngineApp {
     timestep: Option<FixedTimestep>,
     fps: FpsMeter,
     ecs: Ecs,
-    events: Events<WindowEvent>,
     scene_manager: crate::scene::SceneManager,
     debug_overlay: bool,
     wireframe_mode: bool,
@@ -81,6 +80,9 @@ impl ApplicationHandler for EngineApp {
         match event_loop.create_window(attributes) {
             Ok(window) => {
                 init_core_resources(&mut self.ecs.world);
+                self.ecs
+                    .world
+                    .insert_resource(Events::<WindowEvent>::default());
                 self.game_loop.scheduler.add_fn(
                     "Transform propagation",
                     SystemStage::PostUpdate,
@@ -224,7 +226,11 @@ impl ApplicationHandler for EngineApp {
                 self.mouse.y = position.y as f32;
             }
             WindowEvent::RedrawRequested => self.update(),
-            other => self.events.send(other),
+            other => {
+                if let Some(mut events) = self.ecs.world.get_resource_mut::<Events<WindowEvent>>() {
+                    events.send(other);
+                }
+            }
         }
     }
 
@@ -467,7 +473,12 @@ impl EngineApp {
 
     fn process_events(&mut self) {
         let mut reload_requested = false;
-        for event in self.events.drain() {
+        let mut events = self
+            .ecs
+            .world
+            .remove_resource::<Events<WindowEvent>>()
+            .unwrap_or_default();
+        for event in events.drain() {
             if let WindowEvent::KeyboardInput { event, .. } = event
                 && let PhysicalKey::Code(key) = event.physical_key
             {
@@ -516,6 +527,9 @@ impl EngineApp {
                 }
             }
         }
+        self.ecs
+            .world
+            .insert_resource::<Events<WindowEvent>>(events);
         if reload_requested {
             self.reload_active_scene();
         }

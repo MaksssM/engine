@@ -1,3 +1,4 @@
+use bevy_ecs::resource::Resource;
 use std::{collections::HashMap, hash::Hash, marker::PhantomData, sync::Arc};
 
 #[derive(Debug)]
@@ -30,7 +31,7 @@ impl<T> Handle<T> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Resource)]
 pub struct AssetManager<T, K = String> {
     assets: HashMap<Handle<T>, Arc<T>>,
     paths: HashMap<K, Handle<T>>,
