@@ -47,7 +47,8 @@ impl GameLoop {
             time.delta_seconds = 0.0;
             time.fixed_delta_seconds = self.fixed_step as f32;
             time.frame_number = time.frame_number.saturating_add(1);
-            time.clock.advance(std::time::Duration::from_secs_f64(frame_delta));
+            time.clock
+                .advance(std::time::Duration::from_secs_f64(frame_delta));
         }
         self.scheduler
             .run_stage(super::systems::SystemStage::PreUpdate, world);

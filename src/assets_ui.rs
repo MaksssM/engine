@@ -114,7 +114,9 @@ pub fn classify(path: &Path) -> AssetKind {
         .as_str()
     {
         "ron" | "scene" | "lvl" | "umap" => AssetKind::Scene,
-        "png" | "jpg" | "jpeg" | "bmp" | "tga" | "dds" | "hdr" | "exr" | "ktx" => AssetKind::Texture,
+        "png" | "jpg" | "jpeg" | "bmp" | "tga" | "dds" | "hdr" | "exr" | "ktx" => {
+            AssetKind::Texture
+        }
         "obj" | "fbx" | "gltf" | "glb" | "dae" | "blend" | "3ds" | "msh" => AssetKind::Model,
         "mat" | "material" | "matx" => AssetKind::Material,
         "rs" | "lua" | "py" | "js" | "ts" => AssetKind::Script,
@@ -357,13 +359,13 @@ mod tests {
         assert_eq!(classify(Path::new("a.rs")), AssetKind::Script);
         assert_eq!(classify(Path::new("a.wgsl")), AssetKind::Shader);
         assert_eq!(classify(Path::new("a.unknown")), AssetKind::Unsupported);
-            // Non-existent paths are never Folder (is_dir() returns false)
-            assert_ne!(classify(Path::new("dir")), AssetKind::Folder);
-            // Real directory is classified as Folder
-            let temp = std::env::temp_dir().join("assets_ui_classify_test_dir");
-            std::fs::create_dir_all(&temp).ok();
-            assert_eq!(classify(&temp), AssetKind::Folder);
-            let _ = std::fs::remove_dir(&temp);
+        // Non-existent paths are never Folder (is_dir() returns false)
+        assert_ne!(classify(Path::new("dir")), AssetKind::Folder);
+        // Real directory is classified as Folder
+        let temp = std::env::temp_dir().join("assets_ui_classify_test_dir");
+        std::fs::create_dir_all(&temp).ok();
+        assert_eq!(classify(&temp), AssetKind::Folder);
+        let _ = std::fs::remove_dir(&temp);
     }
 
     #[test]

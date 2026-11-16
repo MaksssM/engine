@@ -116,7 +116,11 @@ impl SystemScheduler {
                 sys.run(world);
                 if let Some(started) = started {
                     let elapsed = started.elapsed().as_secs_f64() * 1000.0;
-                    if let Some(timing) = self.timings.iter_mut().find(|timing| timing.name == sys.name()) {
+                    if let Some(timing) = self
+                        .timings
+                        .iter_mut()
+                        .find(|timing| timing.name == sys.name())
+                    {
                         timing.last_ms = elapsed;
                         timing.calls = timing.calls.saturating_add(1);
                     } else {

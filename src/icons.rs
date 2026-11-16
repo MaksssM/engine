@@ -174,7 +174,12 @@ impl Icons {
     }
 
     /// Render an icon with consistent styling
-    pub fn show(ui: &mut Ui, icon: &str, size: IconSize, color: Option<egui::Color32>) -> egui::Response {
+    pub fn show(
+        ui: &mut Ui,
+        icon: &str,
+        size: IconSize,
+        color: Option<egui::Color32>,
+    ) -> egui::Response {
         let text = RichText::new(icon)
             .font(FontId::new(size.pt(), egui::FontFamily::Proportional))
             .color(color.unwrap_or(egui::Color32::WHITE));
@@ -186,11 +191,21 @@ impl Icons {
         let text = RichText::new(icon)
             .font(FontId::new(size.pt(), egui::FontFamily::Proportional))
             .color(egui::Color32::WHITE);
-        ui.add(egui::Button::new(text).frame(false).min_size(egui::vec2(size.pt() * 2.0, size.pt() * 2.0)))
+        ui.add(
+            egui::Button::new(text)
+                .frame(false)
+                .min_size(egui::vec2(size.pt() * 2.0, size.pt() * 2.0)),
+        )
     }
 
     /// Render a toolbar icon button with tooltip
-    pub fn toolbar_button(ui: &mut Ui, icon: &str, tooltip: &str, shortcut: Option<&str>, selected: bool) -> egui::Response {
+    pub fn toolbar_button(
+        ui: &mut Ui,
+        icon: &str,
+        tooltip: &str,
+        shortcut: Option<&str>,
+        selected: bool,
+    ) -> egui::Response {
         let bg_color = if selected {
             egui::Color32::from_rgb(60, 80, 120)
         } else {
@@ -198,7 +213,10 @@ impl Icons {
         };
 
         let text = RichText::new(icon)
-            .font(FontId::new(IconSize::Large.pt(), egui::FontFamily::Proportional))
+            .font(FontId::new(
+                IconSize::Large.pt(),
+                egui::FontFamily::Proportional,
+            ))
             .color(egui::Color32::WHITE);
 
         let mut btn = egui::Button::new(text)
@@ -211,39 +229,63 @@ impl Icons {
             btn = btn.shortcut_text(sc);
         }
 
-            let mut response = ui.add(btn);
+        let mut response = ui.add(btn);
         if !tooltip.is_empty() {
-                response = response.on_hover_text(tooltip);
+            response = response.on_hover_text(tooltip);
         }
         response
     }
 
     /// Render a tree expand/collapse icon
     pub fn tree_toggle(ui: &mut Ui, expanded: bool, size: IconSize) -> egui::Response {
-        let icon = if expanded { Self::EXPANDED } else { Self::COLLAPSED };
+        let icon = if expanded {
+            Self::EXPANDED
+        } else {
+            Self::COLLAPSED
+        };
         let text = RichText::new(icon)
             .font(FontId::new(size.pt(), egui::FontFamily::Proportional))
             .color(egui::Color32::from_rgb(140, 145, 155));
-        ui.add(egui::Button::new(text).frame(false).min_size(egui::vec2(size.pt() * 1.5, size.pt() * 1.5)))
+        ui.add(
+            egui::Button::new(text)
+                .frame(false)
+                .min_size(egui::vec2(size.pt() * 1.5, size.pt() * 1.5)),
+        )
     }
 
     /// Render a visibility toggle icon
     pub fn visibility_toggle(ui: &mut Ui, visible: bool, size: IconSize) -> egui::Response {
         let icon = if visible { Self::VISIBLE } else { Self::HIDDEN };
-        let color = if visible { egui::Color32::from_rgb(100, 200, 100) } else { egui::Color32::from_rgb(120, 120, 120) };
+        let color = if visible {
+            egui::Color32::from_rgb(100, 200, 100)
+        } else {
+            egui::Color32::from_rgb(120, 120, 120)
+        };
         let text = RichText::new(icon)
             .font(FontId::new(size.pt(), egui::FontFamily::Proportional))
             .color(color);
-        ui.add(egui::Button::new(text).frame(false).min_size(egui::vec2(size.pt() * 1.5, size.pt() * 1.5)))
+        ui.add(
+            egui::Button::new(text)
+                .frame(false)
+                .min_size(egui::vec2(size.pt() * 1.5, size.pt() * 1.5)),
+        )
     }
 
     /// Render a lock toggle icon
     pub fn lock_toggle(ui: &mut Ui, locked: bool, size: IconSize) -> egui::Response {
         let icon = if locked { Self::LOCKED } else { Self::UNLOCKED };
-        let color = if locked { egui::Color32::from_rgb(220, 180, 60) } else { egui::Color32::from_rgb(120, 120, 120) };
+        let color = if locked {
+            egui::Color32::from_rgb(220, 180, 60)
+        } else {
+            egui::Color32::from_rgb(120, 120, 120)
+        };
         let text = RichText::new(icon)
             .font(FontId::new(size.pt(), egui::FontFamily::Proportional))
             .color(color);
-        ui.add(egui::Button::new(text).frame(false).min_size(egui::vec2(size.pt() * 1.5, size.pt() * 1.5)))
+        ui.add(
+            egui::Button::new(text)
+                .frame(false)
+                .min_size(egui::vec2(size.pt() * 1.5, size.pt() * 1.5)),
+        )
     }
 }

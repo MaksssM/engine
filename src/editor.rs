@@ -14,17 +14,19 @@ use winit::{event::WindowEvent, window::Window};
 use egui_dock::{DockArea, DockState, NodeIndex, SurfaceIndex};
 
 use crate::{
-    assets_ui::{AssetKind, PreviewMode, ObjMesh, classify, count_assets, format_bytes, format_modified},
+    assets_ui::{
+        AssetKind, ObjMesh, PreviewMode, classify, count_assets, format_bytes, format_modified,
+    },
     camera::CameraController,
     core::components::{FolderGroup, Locked, Visible},
     dock::{DockAction, EditorTab, WorkspacePreset, editor_dock_style},
     ecs::Name,
     feedback::{
-        apply_feedback_styles, ConfirmDialog, DialogResult, NotificationManager, PendingAction,
-        TooltipExt,
+        ConfirmDialog, DialogResult, NotificationManager, PendingAction, TooltipExt,
+        apply_feedback_styles,
     },
     icons::{IconSize, Icons},
-        performance::{PerformanceMonitor, PerformanceHistory},
+    performance::{PerformanceHistory, PerformanceMonitor},
     scene::{Scene, SceneEntity},
     transform::{Parent, Transform},
 };
@@ -205,22 +207,22 @@ pub struct Editor {
     pub active_tool: usize,
     pub status: String,
     dirty: bool,
-        pub filter: String,
-        pub content_root: PathBuf,
-        pub content_dir: PathBuf,
-        pub content_history: Vec<PathBuf>,
-        pub history_index: usize,
-        pub content_list_view: bool,
-        pub content_type_filter: String,
-        pub content_selected: Option<PathBuf>,
-        pub renaming: Option<(PathBuf, String)>,
-        pub log_filter: String,
-        pub log: Vec<(String, String)>,
-        pub scene_path: PathBuf,
-        pub view_mode: ViewMode,
-        pub orbit_target: Vec3,
-        pub orbit_distance: f32,
-        pub last_view_mode: ViewMode,
+    pub filter: String,
+    pub content_root: PathBuf,
+    pub content_dir: PathBuf,
+    pub content_history: Vec<PathBuf>,
+    pub history_index: usize,
+    pub content_list_view: bool,
+    pub content_type_filter: String,
+    pub content_selected: Option<PathBuf>,
+    pub renaming: Option<(PathBuf, String)>,
+    pub log_filter: String,
+    pub log: Vec<(String, String)>,
+    pub scene_path: PathBuf,
+    pub view_mode: ViewMode,
+    pub orbit_target: Vec3,
+    pub orbit_distance: f32,
+    pub last_view_mode: ViewMode,
 
     // Docking & Workspaces
     pub dock_state: Option<DockState<EditorTab>>,
@@ -233,15 +235,16 @@ pub struct Editor {
     pub graphics_shadows: String,
     pub camera_fov: f32,
     pub mouse_sensitivity: f32,
+    pub perf_selected_tab: usize,
 
-        // Asset Preview state
-        pub preview_mode: PreviewMode,
-        pub mesh_zoom: f32,
-        pub texture_zoom: f32,
-        pub preview_yaw: f32,
-        pub preview_pitch: f32,
-        pub preview_orbit_drag: Option<(f32, f32)>,
-                pub open_asset_pending: Option<PathBuf>,
+    // Asset Preview state
+    pub preview_mode: PreviewMode,
+    pub mesh_zoom: f32,
+    pub texture_zoom: f32,
+    pub preview_yaw: f32,
+    pub preview_pitch: f32,
+    pub preview_orbit_drag: Option<(f32, f32)>,
+    pub open_asset_pending: Option<PathBuf>,
 
     // Feedback & Notifications
     pub notifications: NotificationManager,
@@ -312,13 +315,14 @@ impl Editor {
             graphics_shadows: "High".into(),
             camera_fov: 75.0,
             mouse_sensitivity: 1.0,
-                        preview_mode: PreviewMode::Mesh,
-                        mesh_zoom: 1.0,
-                        texture_zoom: 1.0,
-                        preview_yaw: 0.6,
-                        preview_pitch: 0.3,
-                        preview_orbit_drag: None,
-                        open_asset_pending: None,
+            perf_selected_tab: 0,
+            preview_mode: PreviewMode::Mesh,
+            mesh_zoom: 1.0,
+            texture_zoom: 1.0,
+            preview_yaw: 0.6,
+            preview_pitch: 0.3,
+            preview_orbit_drag: None,
+            open_asset_pending: None,
             notifications: NotificationManager::default(),
             confirm_dialog: None,
         }
@@ -430,12 +434,12 @@ impl Editor {
         style.spacing.item_spacing = Vec2::new(6.0, 5.0);
         ctx.set_style(style);
 
-                // Process pending asset-open requests (e.g. "Open in Scene Editor" button
-                // in the Asset Preview panel, which runs outside the world-consuming code path).
-                if let Some(path) = self.open_asset_pending.take() {
-                    self.current_workspace = WorkspacePreset::LevelEditing;
-                    self.load_scene_from_path(world, &path);
-                }
+        // Process pending asset-open requests (e.g. "Open in Scene Editor" button
+        // in the Asset Preview panel, which runs outside the world-consuming code path).
+        if let Some(path) = self.open_asset_pending.take() {
+            self.current_workspace = WorkspacePreset::LevelEditing;
+            self.load_scene_from_path(world, &path);
+        }
 
         let mut dock_state = self
             .dock_state
@@ -450,7 +454,12 @@ impl Editor {
                 ui.horizontal(|ui| {
                     // App title with icon
                     ui.horizontal(|ui| {
-                        Icons::show(ui, Icons::PROJECT, IconSize::Large, Some(Color32::from_rgb(82, 166, 235)));
+                        Icons::show(
+                            ui,
+                            Icons::PROJECT,
+                            IconSize::Large,
+                            Some(Color32::from_rgb(82, 166, 235)),
+                        );
                         ui.label(
                             RichText::new("R  ENGINE")
                                 .strong()
@@ -463,7 +472,7 @@ impl Editor {
                         .button(
                             RichText::new(format!("{} Save", Icons::SAVE))
                                 .size(11.0)
-                                .color(Color32::WHITE)
+                                .color(Color32::WHITE),
                         )
                         .engine_tooltip("Save Scene", "Save current scene to disk", Some("Ctrl+S"))
                         .clicked()
@@ -475,7 +484,7 @@ impl Editor {
                         .button(
                             RichText::new(Icons::PLAY)
                                 .size(12.0)
-                                .color(Color32::from_rgb(80, 200, 100))
+                                .color(Color32::from_rgb(80, 200, 100)),
                         )
                         .engine_tooltip("Play", "Start simulation mode", Some("F5"))
                         .clicked()
@@ -486,7 +495,7 @@ impl Editor {
                         .button(
                             RichText::new(Icons::STOP)
                                 .size(12.0)
-                                .color(Color32::from_rgb(200, 80, 80))
+                                .color(Color32::from_rgb(200, 80, 80)),
                         )
                         .engine_tooltip("Stop", "Stop simulation", Some("Shift+F5"))
                         .clicked()
@@ -504,27 +513,47 @@ impl Editor {
                         (Icons::INFO, "Help"),
                     ] {
                         ui.horizontal(|ui| {
-                            Icons::show(ui, icon, IconSize::Small, Some(Color32::from_rgb(160, 165, 175)));
+                            Icons::show(
+                                ui,
+                                icon,
+                                IconSize::Small,
+                                Some(Color32::from_rgb(160, 165, 175)),
+                            );
                             ui.menu_button(menu, |ui| match menu {
                                 "File" => {
-                                    if ui.button(format!("{} New Scene", Icons::FILE_BLANK)).clicked() {
+                                    if ui
+                                        .button(format!("{} New Scene", Icons::FILE_BLANK))
+                                        .clicked()
+                                    {
                                         if self.dirty {
-                                            self.confirm_dialog = Some(ConfirmDialog::unsaved_changes(PendingAction::NewScene));
+                                            self.confirm_dialog =
+                                                Some(ConfirmDialog::unsaved_changes(
+                                                    PendingAction::NewScene,
+                                                ));
                                         } else {
                                             self.new_scene(world);
                                         }
                                         ui.close();
                                     }
-                                    if ui.button(format!("{} Save Scene  (Ctrl+S)", Icons::SAVE)).clicked() {
+                                    if ui
+                                        .button(format!("{} Save Scene  (Ctrl+S)", Icons::SAVE))
+                                        .clicked()
+                                    {
                                         self.save_scene(world);
                                         ui.close();
                                     }
-                                    if ui.button(format!("{} Reload Scene", Icons::REFRESH)).clicked() {
+                                    if ui
+                                        .button(format!("{} Reload Scene", Icons::REFRESH))
+                                        .clicked()
+                                    {
                                         self.prompt_reload_scene(world);
                                         ui.close();
                                     }
                                     ui.separator();
-                                    if ui.button(format!("{} Save Layout", Icons::SETTINGS_FILE)).clicked() {
+                                    if ui
+                                        .button(format!("{} Save Layout", Icons::SETTINGS_FILE))
+                                        .clicked()
+                                    {
                                         self.dock_state = Some(dock_state.clone());
                                         self.save_layout();
                                         self.dock_state = None;
@@ -535,7 +564,10 @@ impl Editor {
                                         );
                                         ui.close();
                                     }
-                                    if ui.button(format!("{} Reset Layout to Default", Icons::HOME)).clicked() {
+                                    if ui
+                                        .button(format!("{} Reset Layout to Default", Icons::HOME))
+                                        .clicked()
+                                    {
                                         actions.push(DockAction::ResetDefault);
                                         self.current_workspace = WorkspacePreset::Default;
                                         self.notifications.info(
@@ -546,25 +578,46 @@ impl Editor {
                                     }
                                 }
                                 "Edit" => {
-                                    if ui.button(format!("{} Select All (Ctrl+A)", Icons::ENTITY)).clicked() {
+                                    if ui
+                                        .button(format!("{} Select All (Ctrl+A)", Icons::ENTITY))
+                                        .clicked()
+                                    {
                                         self.select_all(world);
                                         ui.close();
                                     }
-                                    if ui.button(format!("{} Deselect All (Esc)", Icons::EMPTY_ENTITY)).clicked() {
+                                    if ui
+                                        .button(format!(
+                                            "{} Deselect All (Esc)",
+                                            Icons::EMPTY_ENTITY
+                                        ))
+                                        .clicked()
+                                    {
                                         self.selected = None;
                                         self.selected_entities.clear();
                                         ui.close();
                                     }
-                                    if ui.button(format!("{} Delete Selected (Del)", Icons::DELETE)).clicked() {
+                                    if ui
+                                        .button(format!("{} Delete Selected (Del)", Icons::DELETE))
+                                        .clicked()
+                                    {
                                         self.prompt_delete_selected(world);
                                         ui.close();
                                     }
-                                    if ui.button(format!("{} Duplicate Selected (Ctrl+D)", Icons::DUPLICATE)).clicked() {
+                                    if ui
+                                        .button(format!(
+                                            "{} Duplicate Selected (Ctrl+D)",
+                                            Icons::DUPLICATE
+                                        ))
+                                        .clicked()
+                                    {
                                         self.duplicate_selected(world);
                                         ui.close();
                                     }
                                     ui.separator();
-                                    if ui.button(format!("{} Focus Selected (F)", Icons::CAMERA)).clicked() {
+                                    if ui
+                                        .button(format!("{} Focus Selected (F)", Icons::CAMERA))
+                                        .clicked()
+                                    {
                                         if let Some(e) = self.selected {
                                             if let Some(t) = world.get::<Transform>(e) {
                                                 self.orbit_target = t.translation;
@@ -578,11 +631,14 @@ impl Editor {
                                     ui.menu_button("Workspaces", |ui| {
                                         for preset in WorkspacePreset::ALL {
                                             let active = self.current_workspace == preset;
-                                            if ui.selectable_label(active, preset.name()).clicked() {
+                                            if ui.selectable_label(active, preset.name()).clicked()
+                                            {
                                                 self.current_workspace = preset;
                                                 actions.push(DockAction::ApplyPreset(preset));
-                                                self.status =
-                                                    format!("Switched to {} workspace", preset.name());
+                                                self.status = format!(
+                                                    "Switched to {} workspace",
+                                                    preset.name()
+                                                );
                                                 self.notifications.info(
                                                     "Workspace Switched",
                                                     format!("Activated {} layout", preset.name()),
@@ -615,7 +671,10 @@ impl Editor {
                                         }
                                     });
                                     ui.separator();
-                                    if ui.button(format!("{} Reset Layout to Default", Icons::HOME)).clicked() {
+                                    if ui
+                                        .button(format!("{} Reset Layout to Default", Icons::HOME))
+                                        .clicked()
+                                    {
                                         self.current_workspace = WorkspacePreset::Default;
                                         actions.push(DockAction::ResetDefault);
                                         self.notifications.info(
@@ -626,12 +685,27 @@ impl Editor {
                                     }
                                 }
                                 "Tools" => {
-                                    ui.checkbox(&mut self.grid, format!("{} Show Grid", Icons::GRID_VIEW));
-                                    ui.checkbox(&mut self.show_gizmos, format!("{} Show Gizmos", Icons::TRANSFORM));
-                                    ui.checkbox(&mut self.show_collision, format!("{} Show Collision", Icons::HIDDEN));
-                                    ui.checkbox(&mut self.wireframe, format!("{} Wireframe", Icons::LIST_VIEW));
+                                    ui.checkbox(
+                                        &mut self.grid,
+                                        format!("{} Show Grid", Icons::GRID_VIEW),
+                                    );
+                                    ui.checkbox(
+                                        &mut self.show_gizmos,
+                                        format!("{} Show Gizmos", Icons::TRANSFORM),
+                                    );
+                                    ui.checkbox(
+                                        &mut self.show_collision,
+                                        format!("{} Show Collision", Icons::HIDDEN),
+                                    );
+                                    ui.checkbox(
+                                        &mut self.wireframe,
+                                        format!("{} Wireframe", Icons::LIST_VIEW),
+                                    );
                                     ui.separator();
-                                    if ui.button(format!("{} Reset Camera Orbit", Icons::CAMERA)).clicked() {
+                                    if ui
+                                        .button(format!("{} Reset Camera Orbit", Icons::CAMERA))
+                                        .clicked()
+                                    {
                                         self.orbit_target = Vec3::ZERO;
                                         self.orbit_distance = 8.0;
                                         self.update_camera(world);
@@ -639,10 +713,14 @@ impl Editor {
                                     }
                                 }
                                 "Build" => {
-                                    if ui.button(format!("{} Build Lighting", Icons::LIGHT)).clicked() {
+                                    if ui
+                                        .button(format!("{} Build Lighting", Icons::LIGHT))
+                                        .clicked()
+                                    {
                                         self.log.push((
                                             "INFO".into(),
-                                            "Build Lighting completed (0 static lights baked)".into(),
+                                            "Build Lighting completed (0 static lights baked)"
+                                                .into(),
                                         ));
                                         self.notifications.success(
                                             "Lighting Built",
@@ -650,7 +728,10 @@ impl Editor {
                                         );
                                         ui.close();
                                     }
-                                    if ui.button(format!("{} Build Navigation Mesh", Icons::BUILD)).clicked() {
+                                    if ui
+                                        .button(format!("{} Build Navigation Mesh", Icons::BUILD))
+                                        .clicked()
+                                    {
                                         self.log.push((
                                             "INFO".into(),
                                             "NavMesh generated (1 polygon island, 24 nodes)".into(),
@@ -661,7 +742,8 @@ impl Editor {
                                         );
                                         ui.close();
                                     }
-                                    if ui.button(format!("{} Build All", Icons::COMPILE)).clicked() {
+                                    if ui.button(format!("{} Build All", Icons::COMPILE)).clicked()
+                                    {
                                         self.log.push((
                                             "INFO".into(),
                                             "Full scene build completed successfully".into(),
@@ -674,20 +756,20 @@ impl Editor {
                                     }
                                 }
                                 "Help" => {
-                                ui.label("Rust Engine Editor");
-                                ui.separator();
-                                ui.label("Shortcuts:");
-                                ui.label("Ctrl+1..7: Focus Tabs");
-                                ui.label("W/E/R: Move/Rotate/Scale");
-                                ui.label("RMB Drag: Orbit Camera");
-                                ui.label("MMB Drag: Pan Camera");
-                                ui.label("Wheel: Zoom Camera");
-                                ui.label("F: Focus Selected");
-                                ui.label("Del: Delete Entity");
-                                ui.label("Ctrl+S: Save Scene");
-                            }
-                            _ => {}
-                        });
+                                    ui.label("Rust Engine Editor");
+                                    ui.separator();
+                                    ui.label("Shortcuts:");
+                                    ui.label("Ctrl+1..7: Focus Tabs");
+                                    ui.label("W/E/R: Move/Rotate/Scale");
+                                    ui.label("RMB Drag: Orbit Camera");
+                                    ui.label("MMB Drag: Pan Camera");
+                                    ui.label("Wheel: Zoom Camera");
+                                    ui.label("F: Focus Selected");
+                                    ui.label("Del: Delete Entity");
+                                    ui.label("Ctrl+S: Save Scene");
+                                }
+                                _ => {}
+                            });
                         });
                     }
                     if ui
@@ -717,10 +799,34 @@ impl Editor {
                 ui.horizontal_centered(|ui| {
                     // Transform tools with icons
                     let tool_info = [
-                        (Icons::SELECT, "Select", "Select Tool", "Pick entities in viewport", Some("Q")),
-                        (Icons::MOVE, "Move", "Move Tool", "Translate selected entity along axes", Some("W")),
-                        (Icons::ROTATE, "Rotate", "Rotate Tool", "Rotate selected entity in 3D space", Some("E")),
-                        (Icons::SCALE, "Scale", "Scale Tool", "Scale selected entity per axis", Some("R")),
+                        (
+                            Icons::SELECT,
+                            "Select",
+                            "Select Tool",
+                            "Pick entities in viewport",
+                            Some("Q"),
+                        ),
+                        (
+                            Icons::MOVE,
+                            "Move",
+                            "Move Tool",
+                            "Translate selected entity along axes",
+                            Some("W"),
+                        ),
+                        (
+                            Icons::ROTATE,
+                            "Rotate",
+                            "Rotate Tool",
+                            "Rotate selected entity in 3D space",
+                            Some("E"),
+                        ),
+                        (
+                            Icons::SCALE,
+                            "Scale",
+                            "Scale Tool",
+                            "Scale selected entity per axis",
+                            Some("R"),
+                        ),
                     ];
                     for (i, (icon, label, title, desc, shortcut)) in tool_info.iter().enumerate() {
                         let is_active = self.active_tool == i;
@@ -728,12 +834,20 @@ impl Editor {
                             egui::Button::new(
                                 RichText::new(format!("{} {}", icon, label))
                                     .size(11.0)
-                                    .color(if is_active { Color32::WHITE } else { Color32::from_rgb(180, 185, 195) })
+                                    .color(if is_active {
+                                        Color32::WHITE
+                                    } else {
+                                        Color32::from_rgb(180, 185, 195)
+                                    }),
                             )
                             .frame(false)
                             .min_size(egui::vec2(64.0, 28.0))
-                            .fill(if is_active { Color32::from_rgb(60, 80, 120) } else { Color32::TRANSPARENT })
-                            .corner_radius(egui::CornerRadius::same(4))
+                            .fill(if is_active {
+                                Color32::from_rgb(60, 80, 120)
+                            } else {
+                                Color32::TRANSPARENT
+                            })
+                            .corner_radius(egui::CornerRadius::same(4)),
                         );
                         let response = response.engine_tooltip(title, desc, *shortcut);
                         if response.clicked() {
@@ -746,9 +860,13 @@ impl Editor {
                         .button(
                             RichText::new(format!("{} Add Actor", Icons::ADD))
                                 .size(11.0)
-                                .color(Color32::WHITE)
+                                .color(Color32::WHITE),
                         )
-                        .engine_tooltip("Add Actor", "Spawn a new actor entity at scene origin", None)
+                        .engine_tooltip(
+                            "Add Actor",
+                            "Spawn a new actor entity at scene origin",
+                            None,
+                        )
                         .clicked()
                     {
                         self.create_entity(world);
@@ -758,7 +876,7 @@ impl Editor {
                         .button(
                             RichText::new(format!("{} Save", Icons::SAVE))
                                 .size(11.0)
-                                .color(Color32::WHITE)
+                                .color(Color32::WHITE),
                         )
                         .engine_tooltip(
                             "Save Scene",
@@ -773,11 +891,41 @@ impl Editor {
                     // View modes with icons
                     ui.label("View:");
                     let view_modes = [
-                        (Icons::PERSPECTIVE, "Persp", ViewMode::Perspective, "Perspective", "Perspective 3D camera projection"),
-                        (Icons::UP, "Top", ViewMode::Top, "Top View", "Orthographic top-down projection looking down Y"),
-                        (Icons::FRONT, "Front", ViewMode::Front, "Front View", "Orthographic front projection looking along Z"),
-                        (Icons::SIDE, "Side", ViewMode::Side, "Side View", "Orthographic side projection looking along X"),
-                        (Icons::ORTHOGRAPHIC, "Ortho", ViewMode::Orthographic, "Orthographic", "Orthographic 3D camera projection"),
+                        (
+                            Icons::PERSPECTIVE,
+                            "Persp",
+                            ViewMode::Perspective,
+                            "Perspective",
+                            "Perspective 3D camera projection",
+                        ),
+                        (
+                            Icons::UP,
+                            "Top",
+                            ViewMode::Top,
+                            "Top View",
+                            "Orthographic top-down projection looking down Y",
+                        ),
+                        (
+                            Icons::FRONT,
+                            "Front",
+                            ViewMode::Front,
+                            "Front View",
+                            "Orthographic front projection looking along Z",
+                        ),
+                        (
+                            Icons::SIDE,
+                            "Side",
+                            ViewMode::Side,
+                            "Side View",
+                            "Orthographic side projection looking along X",
+                        ),
+                        (
+                            Icons::ORTHOGRAPHIC,
+                            "Ortho",
+                            ViewMode::Orthographic,
+                            "Orthographic",
+                            "Orthographic 3D camera projection",
+                        ),
                     ];
                     for (icon, label, mode, title, desc) in view_modes.iter() {
                         let is_active = self.view_mode == *mode;
@@ -785,12 +933,20 @@ impl Editor {
                             egui::Button::new(
                                 RichText::new(format!("{} {}", icon, label))
                                     .size(11.0)
-                                    .color(if is_active { Color32::WHITE } else { Color32::from_rgb(180, 185, 195) })
+                                    .color(if is_active {
+                                        Color32::WHITE
+                                    } else {
+                                        Color32::from_rgb(180, 185, 195)
+                                    }),
                             )
                             .frame(false)
                             .min_size(egui::vec2(56.0, 28.0))
-                            .fill(if is_active { Color32::from_rgb(60, 80, 120) } else { Color32::TRANSPARENT })
-                            .corner_radius(egui::CornerRadius::same(4))
+                            .fill(if is_active {
+                                Color32::from_rgb(60, 80, 120)
+                            } else {
+                                Color32::TRANSPARENT
+                            })
+                            .corner_radius(egui::CornerRadius::same(4)),
                         );
                         let response = response.engine_tooltip(title, desc, None);
                         if response.clicked() {
@@ -799,12 +955,33 @@ impl Editor {
                     }
                     ui.separator();
                     // View toggles with icons
-                    ui.add(egui::Checkbox::new(&mut self.grid, format!("{} Grid", Icons::GRID_VIEW)))
-                        .engine_tooltip("Toggle Grid", "Show or hide the coordinate ground grid", None);
-                    ui.add(egui::Checkbox::new(&mut self.show_gizmos, format!("{} Gizmos", Icons::TRANSFORM)))
-                        .engine_tooltip("Toggle Gizmos", "Show or hide 3D transformation manipulators", None);
-                    ui.add(egui::Checkbox::new(&mut self.wireframe, format!("{} Wireframe", Icons::LIST_VIEW)))
-                        .engine_tooltip("Toggle Wireframe", "Render models in polygon wireframe mode", None);
+                    ui.add(egui::Checkbox::new(
+                        &mut self.grid,
+                        format!("{} Grid", Icons::GRID_VIEW),
+                    ))
+                    .engine_tooltip(
+                        "Toggle Grid",
+                        "Show or hide the coordinate ground grid",
+                        None,
+                    );
+                    ui.add(egui::Checkbox::new(
+                        &mut self.show_gizmos,
+                        format!("{} Gizmos", Icons::TRANSFORM),
+                    ))
+                    .engine_tooltip(
+                        "Toggle Gizmos",
+                        "Show or hide 3D transformation manipulators",
+                        None,
+                    );
+                    ui.add(egui::Checkbox::new(
+                        &mut self.wireframe,
+                        format!("{} Wireframe", Icons::LIST_VIEW),
+                    ))
+                    .engine_tooltip(
+                        "Toggle Wireframe",
+                        "Render models in polygon wireframe mode",
+                        None,
+                    );
 
                     ui.separator();
                     // Workspace selector with icons
@@ -819,17 +996,24 @@ impl Editor {
                             WorkspacePreset::Minimal => "Minimal",
                         };
                         let response = ui.add(
-                            egui::Button::new(
-                                RichText::new(short_name)
-                                    .size(11.0)
-                                    .color(if active { Color32::WHITE } else { Color32::from_rgb(180, 185, 195) })
-                            )
+                            egui::Button::new(RichText::new(short_name).size(11.0).color(
+                                if active {
+                                    Color32::WHITE
+                                } else {
+                                    Color32::from_rgb(180, 185, 195)
+                                },
+                            ))
                             .frame(false)
                             .min_size(egui::vec2(52.0, 28.0))
-                            .fill(if active { Color32::from_rgb(60, 80, 120) } else { Color32::TRANSPARENT })
-                            .corner_radius(egui::CornerRadius::same(4))
+                            .fill(if active {
+                                Color32::from_rgb(60, 80, 120)
+                            } else {
+                                Color32::TRANSPARENT
+                            })
+                            .corner_radius(egui::CornerRadius::same(4)),
                         );
-                        let response = response.engine_tooltip(preset.name(), preset.description(), None);
+                        let response =
+                            response.engine_tooltip(preset.name(), preset.description(), None);
                         if response.clicked() {
                             self.current_workspace = preset;
                             actions.push(DockAction::ApplyPreset(preset));
@@ -947,38 +1131,40 @@ impl Editor {
                         let warn_count = self.log.iter().filter(|(l, _)| l == "WARN").count();
 
                         if err_count > 0 {
-                            let btn = ui.add(
-                                egui::Button::new(
-                                    RichText::new(format!("вњ• {err_count} errors"))
-                                        .size(11.0)
-                                        .color(Color32::WHITE),
+                            let btn = ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new(format!("вњ• {err_count} errors"))
+                                            .size(11.0)
+                                            .color(Color32::WHITE),
+                                    )
+                                    .fill(Color32::from_rgb(160, 40, 40)),
                                 )
-                                .fill(Color32::from_rgb(160, 40, 40)),
-                            )
-                            .engine_tooltip(
-                                "Errors Logged",
-                                "Click to view error log entries in Output Log",
-                                None,
-                            );
+                                .engine_tooltip(
+                                    "Errors Logged",
+                                    "Click to view error log entries in Output Log",
+                                    None,
+                                );
                             if btn.clicked() {
                                 actions.push(DockAction::Open(EditorTab::OutputLog));
                             }
                         }
 
                         if warn_count > 0 {
-                            let btn = ui.add(
-                                egui::Button::new(
-                                    RichText::new(format!("вљ  {warn_count} warnings"))
-                                        .size(11.0)
-                                        .color(Color32::BLACK),
+                            let btn = ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new(format!("вљ  {warn_count} warnings"))
+                                            .size(11.0)
+                                            .color(Color32::BLACK),
+                                    )
+                                    .fill(Color32::from_rgb(230, 180, 50)),
                                 )
-                                .fill(Color32::from_rgb(230, 180, 50)),
-                            )
-                            .engine_tooltip(
-                                "Warnings Logged",
-                                "Click to view warnings in Output Log",
-                                None,
-                            );
+                                .engine_tooltip(
+                                    "Warnings Logged",
+                                    "Click to view warnings in Output Log",
+                                    None,
+                                );
                             if btn.clicked() {
                                 actions.push(DockAction::Open(EditorTab::OutputLog));
                             }
@@ -1094,7 +1280,8 @@ impl Editor {
                                 self.selected_entities.clear();
                                 self.dirty = true;
                                 self.status = format!("Deleted {count} actor(s)");
-                                self.log.push(("INFO".into(), format!("Deleted {count} actor(s)")));
+                                self.log
+                                    .push(("INFO".into(), format!("Deleted {count} actor(s)")));
                                 self.notifications.warning(
                                     "Actor Deleted",
                                     format!("Permanently removed {count} actor(s) from scene"),
@@ -1116,7 +1303,10 @@ impl Editor {
                                             self.content_selected = None;
                                         }
                                         self.status = format!("Deleted {name}");
-                                        self.log.push(("INFO".into(), format!("Deleted resource: {name}")));
+                                        self.log.push((
+                                            "INFO".into(),
+                                            format!("Deleted resource: {name}"),
+                                        ));
                                         self.notifications.warning(
                                             "Resource Deleted",
                                             format!("Permanently deleted '{name}'"),
@@ -1140,7 +1330,8 @@ impl Editor {
                                 PendingAction::LoadScene => self.load_scene(world),
                                 PendingAction::NewScene => self.new_scene(world),
                                 PendingAction::ResetLayout => {
-                                    self.dock_state = Some(self.current_workspace.create_dock_state());
+                                    self.dock_state =
+                                        Some(self.current_workspace.create_dock_state());
                                 }
                             }
                         }
@@ -1152,7 +1343,8 @@ impl Editor {
                                 PendingAction::LoadScene => self.load_scene(world),
                                 PendingAction::NewScene => self.new_scene(world),
                                 PendingAction::ResetLayout => {
-                                    self.dock_state = Some(self.current_workspace.create_dock_state());
+                                    self.dock_state =
+                                        Some(self.current_workspace.create_dock_state());
                                 }
                             }
                         }
@@ -1287,7 +1479,11 @@ impl Editor {
                             .size(11.0)
                             .color(Color32::WHITE),
                     )
-                    .engine_tooltip("Reset Camera", "Reset camera to default position", Some("R"))
+                    .engine_tooltip(
+                        "Reset Camera",
+                        "Reset camera to default position",
+                        Some("R"),
+                    )
                     .clicked()
                 {
                     self.orbit_target = Vec3::ZERO;
@@ -1301,7 +1497,11 @@ impl Editor {
                                 .size(11.0)
                                 .color(Color32::WHITE),
                         )
-                        .engine_tooltip("Focus Actor", "Focus camera on the selected actor", Some("F"))
+                        .engine_tooltip(
+                            "Focus Actor",
+                            "Focus camera on the selected actor",
+                            Some("F"),
+                        )
                         .clicked()
                     {
                         if let Some(t) = world.get::<Transform>(e) {
@@ -1397,16 +1597,25 @@ impl Editor {
                 self.show_gizmos = !self.show_gizmos;
                 ui.close();
             }
-            if ui.button(format!("{} Show Collision", Icons::COLLISION)).clicked() {
+            if ui
+                .button(format!("{} Show Collision", Icons::COLLISION))
+                .clicked()
+            {
                 self.show_collision = !self.show_collision;
                 ui.close();
             }
-            if ui.button(format!("{} Wireframe", Icons::WIREFRAME)).clicked() {
+            if ui
+                .button(format!("{} Wireframe", Icons::WIREFRAME))
+                .clicked()
+            {
                 self.wireframe = !self.wireframe;
                 ui.close();
             }
             ui.separator();
-            if ui.button(format!("{} Focus Selected (F)", Icons::FOCUS)).clicked() {
+            if ui
+                .button(format!("{} Focus Selected (F)", Icons::FOCUS))
+                .clicked()
+            {
                 if let Some(e) = self.selected {
                     if let Some(t) = world.get::<Transform>(e) {
                         self.orbit_target = t.translation;
@@ -1415,7 +1624,10 @@ impl Editor {
                 }
                 ui.close();
             }
-            if ui.button(format!("{} Reset Camera Orbit", Icons::RESET)).clicked() {
+            if ui
+                .button(format!("{} Reset Camera Orbit", Icons::RESET))
+                .clicked()
+            {
                 self.orbit_target = Vec3::ZERO;
                 self.orbit_distance = 8.0;
                 self.update_camera(world);
@@ -1557,13 +1769,23 @@ impl Editor {
             );
 
             ui.separator();
-            Icons::show(ui, Icons::SEARCH, IconSize::Small, Some(Color32::from_rgb(120, 135, 155)));
+            Icons::show(
+                ui,
+                Icons::SEARCH,
+                IconSize::Small,
+                Some(Color32::from_rgb(120, 135, 155)),
+            );
             ui.add(
                 egui::TextEdit::singleline(&mut self.log_filter)
                     .hint_text("Search log...")
                     .desired_width(180.0),
             );
-            if !self.log_filter.is_empty() && ui.small_button("Г—").engine_tooltip("Clear Search", "Clear the log search filter", None).clicked() {
+            if !self.log_filter.is_empty()
+                && ui
+                    .small_button("Г—")
+                    .engine_tooltip("Clear Search", "Clear the log search filter", None)
+                    .clicked()
+            {
                 self.log_filter.clear();
             }
 
@@ -1628,11 +1850,11 @@ impl Editor {
     }
 
     /// Open an asset: scenes load into the Scene Editor; others select for preview.
-        pub fn open_asset(&mut self, world: &mut World, path: &std::path::Path) {
+    pub fn open_asset(&mut self, world: &mut World, path: &std::path::Path) {
         let kind = classify(path);
         match kind {
             AssetKind::Scene => {
-                    self.load_scene_from_path(world, path);
+                self.load_scene_from_path(world, path);
                 self.log_info("Loaded scene from Content Browser");
             }
             AssetKind::Folder => {
@@ -1651,570 +1873,769 @@ impl Editor {
 
     /// Load a scene file from a specific path into the world.
     pub fn load_scene_from_path(&mut self, world: &mut World, path: &Path) {
-                match std::fs::read_to_string(path)
-                    .ok()
-                    .and_then(|s| Scene::from_ron(&s).ok())
-                {
-                    Some(scene) => {
-                        let entities: Vec<Entity> = world
-                            .query_filtered::<Entity, (
-                                bevy_ecs::query::With<Transform>,
-                                bevy_ecs::query::With<Name>,
-                            )>()
-                            .iter(world)
-                            .collect();
-                        for e in entities {
-                            let _ = world.despawn(e);
-                        }
-                        let count = scene.entities.len();
-                        for item in scene.entities {
-                            let mut t = Transform::from_translation(Vec3::from_array(item.translation));
-                            t.rotation = glam::Quat::from_array(item.rotation);
-                            t.scale = Vec3::from_array(item.scale);
-                            world.spawn((Name(item.name), t));
-                        }
-                        self.dirty = false;
-                        self.status = "Loaded".into();
-                        self.log
-                            .push(("INFO".into(), format!("Loaded scene with {count} actor(s)")));
-                        self.notifications.info(
-                            "Scene Reloaded",
-                            format!(
-                                "Restored {count} actor(s) from {}",
-                                path.file_name()
-                                    .unwrap_or_default()
-                                    .to_string_lossy()
-                            ),
-                        );
-                    }
-                    None => {
-                        self.status = "Scene load failed".into();
-                        self.log.push(("ERROR".into(), self.status.clone()));
-                    }
+        match std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| Scene::from_ron(&s).ok())
+        {
+            Some(scene) => {
+                let entities: Vec<Entity> = world
+                    .query_filtered::<Entity, (
+                        bevy_ecs::query::With<Transform>,
+                        bevy_ecs::query::With<Name>,
+                    )>()
+                    .iter(world)
+                    .collect();
+                for e in entities {
+                    let _ = world.despawn(e);
                 }
+                let count = scene.entities.len();
+                for item in scene.entities {
+                    let mut t = Transform::from_translation(Vec3::from_array(item.translation));
+                    t.rotation = glam::Quat::from_array(item.rotation);
+                    t.scale = Vec3::from_array(item.scale);
+                    world.spawn((Name(item.name), t));
+                }
+                self.dirty = false;
+                self.status = "Loaded".into();
+                self.log
+                    .push(("INFO".into(), format!("Loaded scene with {count} actor(s)")));
+                self.notifications.info(
+                    "Scene Reloaded",
+                    format!(
+                        "Restored {count} actor(s) from {}",
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    ),
+                );
+            }
+            None => {
+                self.status = "Scene load failed".into();
+                self.log.push(("ERROR".into(), self.status.clone()));
+            }
+        }
     }
 
-            /// Draw the Asset Preview panel (central panel in Asset Editing workspace).
-            fn draw_asset_preview(&mut self, ui: &mut egui::Ui) {
-                let path = match &self.content_selected {
-                    Some(p) => p.clone(),
-                    None => {
-                                    Self::preview_empty_state(ui);
-                        return;
-                    }
-                };
-                let kind = classify(&path);
-                match kind {
-                                AssetKind::Folder => Self::preview_folder_state(self, ui, &path),
-                                AssetKind::Scene => Self::preview_scene_state(self, ui, &path),
-                                AssetKind::Texture => Self::preview_texture_state(self, ui, &path),
-                                AssetKind::Model => Self::preview_model_state(self, ui, &path),
-                                AssetKind::Material => Self::preview_material_state(self, ui, &path),
-                                AssetKind::Script => Self::preview_script_state(self, ui, &path),
-                                AssetKind::Shader => Self::preview_shader_state(self, ui, &path),
-                                AssetKind::Audio => Self::preview_audio_state(self, ui, &path),
-                                AssetKind::Unsupported => Self::preview_unsupported_state(self, ui, &path),
+    /// Draw the Asset Preview panel (central panel in Asset Editing workspace).
+    fn draw_asset_preview(&mut self, ui: &mut egui::Ui) {
+        let path = match &self.content_selected {
+            Some(p) => p.clone(),
+            None => {
+                Self::preview_empty_state(ui);
+                return;
+            }
+        };
+        let kind = classify(&path);
+        match kind {
+            AssetKind::Folder => Self::preview_folder_state(self, ui, &path),
+            AssetKind::Scene => Self::preview_scene_state(self, ui, &path),
+            AssetKind::Texture => Self::preview_texture_state(self, ui, &path),
+            AssetKind::Model => Self::preview_model_state(self, ui, &path),
+            AssetKind::Material => Self::preview_material_state(self, ui, &path),
+            AssetKind::Script => Self::preview_script_state(self, ui, &path),
+            AssetKind::Shader => Self::preview_shader_state(self, ui, &path),
+            AssetKind::Audio => Self::preview_audio_state(self, ui, &path),
+            AssetKind::Unsupported => Self::preview_unsupported_state(self, ui, &path),
+        }
+    }
+
+    /// Draw the Asset Details panel (right panel in Asset Editing workspace).
+    fn draw_asset_details(&mut self, ui: &mut egui::Ui) {
+        let path = match &self.content_selected {
+            Some(p) => p.clone(),
+            None => {
+                Self::details_empty_state(ui);
+                return;
+            }
+        };
+        let kind = classify(&path);
+        let metadata = std::fs::metadata(&path).ok();
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        Self::draw_asset_details_header(ui, &name, &kind, &path, metadata.as_ref());
+        ui.separator();
+        Self::draw_asset_details_properties(ui, &path, &kind, metadata.as_ref());
+        ui.separator();
+        Self::draw_asset_details_type_specific(ui, &path, &kind);
+    }
+
+    fn preview_mesh_viewport(&mut self, ui: &mut egui::Ui, mesh: &ObjMesh) {
+        let (rect, response) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
+        let painter = ui.painter_at(rect);
+        let center = rect.center();
+        let zoom = self.mesh_zoom.max(0.1);
+        // Handle orbit drag
+        if response.dragged() {
+            let delta = response.drag_delta();
+            self.preview_yaw += delta.x * 0.005;
+            self.preview_pitch = (self.preview_pitch - delta.y * 0.005).clamp(-1.5, 1.5);
+        }
+        // Scroll zoom
+        if response.hovered() {
+            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+            if scroll != 0.0 {
+                self.mesh_zoom = (self.mesh_zoom * (1.0 + scroll * 0.001)).clamp(0.1, 50.0);
+            }
+        }
+        // Project 3D vertices to 2D
+        let cos_yaw = self.preview_yaw.cos();
+        let sin_yaw = self.preview_yaw.sin();
+        let cos_pitch = self.preview_pitch.cos();
+        let sin_pitch = self.preview_pitch.sin();
+        // Compute 2D points
+        let points_2d: Vec<egui::Pos2> = mesh
+            .vertices
+            .iter()
+            .map(|v| {
+                let x = v[0] * cos_yaw * zoom + v[2] * sin_yaw * zoom;
+                let y =
+                    v[1] * cos_pitch * zoom - (v[0] * sin_yaw - v[2] * cos_yaw) * sin_pitch * zoom;
+                egui::pos2(center.x + x, center.y + y)
+            })
+            .collect();
+        // Draw wireframe triangles (indices are a flat list of vertex indices, 3 per triangle)
+        let tri_color = Color32::from_rgb(80, 180, 230);
+        for tri in mesh.indices.chunks(3) {
+            if tri.len() == 3 {
+                if let (Some(a), Some(b), Some(c)) = (
+                    points_2d.get(tri[0] as usize),
+                    points_2d.get(tri[1] as usize),
+                    points_2d.get(tri[2] as usize),
+                ) {
+                    painter.line_segment([*a, *b], Stroke::new(1.0, tri_color));
+                    painter.line_segment([*b, *c], Stroke::new(1.0, tri_color));
+                    painter.line_segment([*c, *a], Stroke::new(1.0, tri_color));
                 }
             }
+        }
+        // Draw bounds box
+        let (min_p, max_p) = mesh.bounds();
+        let corners = [
+            [min_p[0], min_p[1], min_p[2]],
+            [max_p[0], min_p[1], min_p[2]],
+            [max_p[0], max_p[1], min_p[2]],
+            [min_p[0], max_p[1], min_p[2]],
+            [min_p[0], min_p[1], max_p[2]],
+            [max_p[0], min_p[1], max_p[2]],
+            [max_p[0], max_p[1], max_p[2]],
+            [min_p[0], max_p[1], max_p[2]],
+        ];
+        let corners_2d: Vec<egui::Pos2> = corners
+            .iter()
+            .map(|v| {
+                let x = v[0] * cos_yaw * zoom + v[2] * sin_yaw * zoom;
+                let y =
+                    v[1] * cos_pitch * zoom - (v[0] * sin_yaw - v[2] * cos_yaw) * sin_pitch * zoom;
+                egui::pos2(center.x + x, center.y + y)
+            })
+            .collect();
+        let box_edges = [
+            (0, 1),
+            (1, 2),
+            (2, 3),
+            (3, 0),
+            (4, 5),
+            (5, 6),
+            (6, 7),
+            (7, 4),
+            (0, 4),
+            (1, 5),
+            (2, 6),
+            (3, 7),
+        ];
+        let box_color = Color32::from_rgb(120, 140, 160);
+        for (a, b) in box_edges {
+            painter.line_segment([corners_2d[a], corners_2d[b]], Stroke::new(1.0, box_color));
+        }
+    }
 
-            /// Draw the Asset Details panel (right panel in Asset Editing workspace).
-            fn draw_asset_details(&mut self, ui: &mut egui::Ui) {
-                let path = match &self.content_selected {
-                    Some(p) => p.clone(),
-                    None => {
-                                    Self::details_empty_state(ui);
-                        return;
-                    }
-                };
-                let kind = classify(&path);
-                let metadata = std::fs::metadata(&path).ok();
-                let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-                            Self::draw_asset_details_header(ui, &name, &kind, &path, metadata.as_ref());
-                ui.separator();
-                            Self::draw_asset_details_properties(ui, &path, &kind, metadata.as_ref());
-                ui.separator();
-                            Self::draw_asset_details_type_specific(ui, &path, &kind);
+    fn preview_texture_viewport(&mut self, ui: &mut egui::Ui, data: &[u8]) {
+        if let Ok(decoded) = image::load_from_memory(data) {
+            let rgba = decoded.to_rgba8();
+            let size = [rgba.width() as usize, rgba.height() as usize];
+            let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &rgba);
+            let texture = ui.ctx().load_texture(
+                "asset_preview_texture",
+                color_image,
+                egui::TextureOptions::LINEAR,
+            );
+            let available = ui.available_size();
+            let aspect = size[0] as f32 / size[1] as f32;
+            let (w, h) = if available.x / available.y > aspect {
+                (
+                    available.y * aspect * self.texture_zoom,
+                    available.y * self.texture_zoom,
+                )
+            } else {
+                (
+                    available.x * self.texture_zoom,
+                    available.x / aspect * self.texture_zoom,
+                )
+            };
+            let rect = ui
+                .allocate_exact_size(egui::vec2(w, h), Sense::click_and_drag())
+                .0;
+            // Checkerboard background
+            let painter = ui.painter_at(rect);
+            let square = 16.0_f32;
+            for x in (0..rect.width() as usize).step_by(square as usize * 2) {
+                for y in (0..rect.height() as usize).step_by(square as usize * 2) {
+                    let r = egui::Rect::from_min_size(
+                        rect.min + egui::vec2(x as f32, y as f32),
+                        egui::vec2(square, square),
+                    );
+                    painter.rect_filled(r, 0.0, Color32::from_rgb(50, 53, 58));
+                    let r2 = egui::Rect::from_min_size(
+                        rect.min + egui::vec2(x as f32 + square, y as f32 + square),
+                        egui::vec2(square, square),
+                    );
+                    painter.rect_filled(r2, 0.0, Color32::from_rgb(50, 53, 58));
+                }
             }
-
-            fn preview_mesh_viewport(&mut self, ui: &mut egui::Ui, mesh: &ObjMesh) {
-                let (rect, response) = ui.allocate_exact_size(
-                    ui.available_size(),
-                    Sense::click_and_drag(),
+            ui.put(
+                rect,
+                egui::Image::new(&texture).fit_to_exact_size(rect.size()),
+            );
+            if let Some(hover_pos) = ui.input(|i| i.pointer.hover_pos()) {
+                if rect.contains(hover_pos) {
+                    let local = hover_pos - rect.min;
+                    let tex_x = (local.x / rect.width() * size[0] as f32) as usize;
+                    let tex_y = (local.y / rect.height() * size[1] as f32) as usize;
+                    if tex_x < size[0] && tex_y < size[1] {
+                        let idx = (tex_y * size[0] + tex_x) * 4;
+                        let raw = rgba.as_raw();
+                        if idx + 3 < raw.len() {
+                            let r = raw[idx];
+                            let g = raw[idx + 1];
+                            let b = raw[idx + 2];
+                            let a = raw[idx + 3];
+                            ui.ctx().debug_painter().text(
+                                hover_pos + egui::vec2(12.0, -20.0),
+                                egui::Align2::LEFT_BOTTOM,
+                                format!("RGBA: {r}, {g}, {b}, {a}"),
+                                egui::FontId::proportional(11.0),
+                                Color32::WHITE,
+                            );
+                        }
+                    }
+                }
+            }
+        } else {
+            ui.centered_and_justified(|ui| {
+                ui.label(
+                    RichText::new("Failed to decode image").color(Color32::from_rgb(220, 100, 100)),
                 );
+            });
+        }
+    }
+
+    // Preview state functions
+    fn preview_empty_state(ui: &mut egui::Ui) {
+        ui.centered_and_justified(|ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space(40.0);
+                Icons::show(
+                    ui,
+                    Icons::FILE,
+                    IconSize::XLarge,
+                    Some(Color32::from_rgb(100, 120, 140)),
+                );
+                ui.add_space(12.0);
+                ui.label(
+                    RichText::new("Asset Preview")
+                        .size(20.0)
+                        .color(Color32::from_rgb(180, 190, 200)),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("Select an asset in the Content Browser to preview it here.")
+                        .color(Color32::from_rgb(120, 135, 155)),
+                );
+            });
+        });
+    }
+
+    fn preview_folder_state(_editor: &mut Editor, ui: &mut egui::Ui, path: &Path) {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let count = count_assets(path);
+        let entries = fs::read_dir(path).map(|rd| rd.count()).unwrap_or(0);
+        ui.centered_and_justified(|ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space(40.0);
+                Icons::show(
+                    ui,
+                    Icons::FOLDER,
+                    IconSize::XLarge,
+                    Some(Color32::from_rgb(80, 180, 230)),
+                );
+                ui.add_space(12.0);
+                ui.label(RichText::new(name).size(20.0).color(Color32::WHITE));
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(format!("{count} asset(s) В· {entries} entries"))
+                        .color(Color32::from_rgb(140, 155, 170)),
+                );
+                ui.add_space(20.0);
+                ui.label(
+                    RichText::new("Double-click in the Content Browser to navigate here.")
+                        .color(Color32::from_rgb(120, 135, 155)),
+                );
+            });
+        });
+    }
+
+    fn preview_scene_state(editor: &mut Editor, ui: &mut egui::Ui, path: &Path) {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        ui.centered_and_justified(|ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space(40.0);
+                Icons::show(
+                    ui,
+                    Icons::SCENE,
+                    IconSize::XLarge,
+                    Some(Color32::from_rgb(80, 220, 120)),
+                );
+                ui.add_space(12.0);
+                ui.label(RichText::new(name).size(20.0).color(Color32::WHITE));
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new("Double-click to open in Scene Editor")
+                        .color(Color32::from_rgb(140, 155, 170)),
+                );
+                ui.add_space(20.0);
+                if ui.button("Open in Scene Editor").clicked() {
+                    editor.open_asset_pending = Some(path.to_path_buf());
+                }
+            });
+        });
+    }
+
+    fn preview_texture_state(editor: &mut Editor, ui: &mut egui::Ui, path: &Path) {
+        if let Ok(data) = std::fs::read(path) {
+            // Show zoom controls
+            ui.horizontal(|ui| {
+                ui.label("Zoom:");
+                ui.add(
+                    egui::DragValue::new(&mut editor.texture_zoom)
+                        .speed(0.01)
+                        .clamp_range(0.1..=10.0)
+                        .suffix("x"),
+                );
+                if ui.button("Reset").clicked() {
+                    editor.texture_zoom = 1.0;
+                }
+            });
+            ui.add_space(4.0);
+            editor.preview_texture_viewport(ui, &data);
+        } else {
+            ui.centered_and_justified(|ui| {
+                ui.label(
+                    RichText::new("Failed to read texture file")
+                        .color(Color32::from_rgb(220, 100, 100)),
+                );
+            });
+        }
+    }
+
+    fn preview_model_state(editor: &mut Editor, ui: &mut egui::Ui, path: &Path) {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            if let Some(mesh) = ObjMesh::parse(&content) {
+                // Show zoom control
+                ui.horizontal(|ui| {
+                    ui.label("Zoom:");
+                    ui.add(
+                        egui::DragValue::new(&mut editor.mesh_zoom)
+                            .speed(0.1)
+                            .clamp_range(0.1..=50.0)
+                            .suffix("x"),
+                    );
+                    if ui.button("Reset").clicked() {
+                        editor.mesh_zoom = 1.0;
+                        editor.preview_yaw = 0.0;
+                        editor.preview_pitch = 0.0;
+                    }
+                    ui.separator();
+                    ui.label(format!(
+                        "Vertices: {}  Triangles: {}",
+                        mesh.vertices.len(),
+                        mesh.indices.len() / 3
+                    ));
+                });
+                ui.add_space(4.0);
+                editor.preview_mesh_viewport(ui, &mesh);
+            } else {
+                ui.centered_and_justified(|ui| {
+                    ui.label(
+                        RichText::new("Failed to parse model (OBJ only)")
+                            .color(Color32::from_rgb(220, 100, 100)),
+                    );
+                });
+            }
+        } else {
+            ui.centered_and_justified(|ui| {
+                ui.label(
+                    RichText::new("Failed to read model file")
+                        .color(Color32::from_rgb(220, 100, 100)),
+                );
+            });
+        }
+    }
+
+    fn preview_material_state(_editor: &mut Editor, ui: &mut egui::Ui, path: &Path) {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            let mut buffer = content.clone();
+            ui.vertical(|ui| {
+                ui.add_space(10.0);
+                ui.label(RichText::new("Material Preview").strong());
+                ui.add_space(8.0);
+                // Simple sphere placeholder
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(200.0, 200.0), Sense::hover());
                 let painter = ui.painter_at(rect);
                 let center = rect.center();
-                let zoom = self.mesh_zoom.max(0.1);
-                // Handle orbit drag
-                if response.dragged() {
-                    let delta = response.drag_delta();
-                    self.preview_yaw += delta.x * 0.005;
-                    self.preview_pitch = (self.preview_pitch - delta.y * 0.005).clamp(-1.5, 1.5);
-                }
-                // Scroll zoom
-                if response.hovered() {
-                    let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-                    if scroll != 0.0 {
-                        self.mesh_zoom = (self.mesh_zoom * (1.0 + scroll * 0.001)).clamp(0.1, 50.0);
-                    }
-                }
-                // Project 3D vertices to 2D
-                let cos_yaw = self.preview_yaw.cos();
-                let sin_yaw = self.preview_yaw.sin();
-                let cos_pitch = self.preview_pitch.cos();
-                let sin_pitch = self.preview_pitch.sin();
-                // Compute 2D points
-                                let points_2d: Vec<egui::Pos2> = mesh
-                    .vertices
-                    .iter()
-                    .map(|v| {
-                        let x = v[0] * cos_yaw * zoom + v[2] * sin_yaw * zoom;
-                        let y = v[1] * cos_pitch * zoom - (v[0] * sin_yaw - v[2] * cos_yaw) * sin_pitch * zoom;
-                        egui::pos2(center.x + x, center.y + y)
-                    })
-                    .collect();
-                                // Draw wireframe triangles (indices are a flat list of vertex indices, 3 per triangle)
-                let tri_color = Color32::from_rgb(80, 180, 230);
-                                for tri in mesh.indices.chunks(3) {
-                                    if tri.len() == 3 {
-                                        if let (Some(a), Some(b), Some(c)) = (
-                                            points_2d.get(tri[0] as usize),
-                                            points_2d.get(tri[1] as usize),
-                                            points_2d.get(tri[2] as usize),
-                                        ) {
-                                            painter.line_segment([*a, *b], Stroke::new(1.0, tri_color));
-                                            painter.line_segment([*b, *c], Stroke::new(1.0, tri_color));
-                                            painter.line_segment([*c, *a], Stroke::new(1.0, tri_color));
-                                        }
-                    }
-                }
-                // Draw bounds box
-                                let (min_p, max_p) = mesh.bounds();
-                                let corners = [
-                                    [min_p[0], min_p[1], min_p[2]],
-                                    [max_p[0], min_p[1], min_p[2]],
-                                    [max_p[0], max_p[1], min_p[2]],
-                                    [min_p[0], max_p[1], min_p[2]],
-                                    [min_p[0], min_p[1], max_p[2]],
-                                    [max_p[0], min_p[1], max_p[2]],
-                                    [max_p[0], max_p[1], max_p[2]],
-                                    [min_p[0], max_p[1], max_p[2]],
-                                ];
-                                let corners_2d: Vec<egui::Pos2> = corners
-                                    .iter()
-                                    .map(|v| {
-                                        let x = v[0] * cos_yaw * zoom + v[2] * sin_yaw * zoom;
-                                        let y = v[1] * cos_pitch * zoom - (v[0] * sin_yaw - v[2] * cos_yaw) * sin_pitch * zoom;
-                                        egui::pos2(center.x + x, center.y + y)
-                                    })
-                                    .collect();
-                                let box_edges = [
-                                    (0,1),(1,2),(2,3),(3,0),
-                                    (4,5),(5,6),(6,7),(7,4),
-                                    (0,4),(1,5),(2,6),(3,7),
-                                ];
-                                let box_color = Color32::from_rgb(120, 140, 160);
-                                for (a,b) in box_edges {
-                                    painter.line_segment([corners_2d[a], corners_2d[b]], Stroke::new(1.0, box_color));
-                }
-            }
+                let radius = 80.0;
+                painter.circle_filled(center, radius, Color32::from_rgb(180, 140, 100));
+                painter.circle_stroke(
+                    center,
+                    radius,
+                    Stroke::new(2.0, Color32::from_rgb(100, 80, 60)),
+                );
+                ui.add_space(12.0);
+                ui.separator();
+                ui.add_space(8.0);
+                ui.label(RichText::new("Raw Content:").strong());
+                egui::ScrollArea::vertical()
+                    .max_height(200.0)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut buffer)
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(f32::INFINITY)
+                                .interactive(false),
+                        );
+                    });
+            });
+        } else {
+            ui.centered_and_justified(|ui| {
+                ui.label(
+                    RichText::new("Failed to read material file")
+                        .color(Color32::from_rgb(220, 100, 100)),
+                );
+            });
+        }
+    }
 
-            fn preview_texture_viewport(&mut self, ui: &mut egui::Ui, data: &[u8]) {
-                            if let Ok(decoded) = image::load_from_memory(data) {
-                                let rgba = decoded.to_rgba8();
-                                let size = [rgba.width() as usize, rgba.height() as usize];
-                                let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &rgba);
-                    let texture = ui.ctx().load_texture(
-                        "asset_preview_texture",
-                        color_image,
-                        egui::TextureOptions::LINEAR,
+    fn preview_script_state(_editor: &mut Editor, ui: &mut egui::Ui, path: &Path) {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            let mut buffer = content.clone();
+            ui.vertical(|ui| {
+                ui.add_space(10.0);
+                ui.label(RichText::new("Script Preview").strong());
+                ui.add_space(8.0);
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::multiline(&mut buffer)
+                            .font(egui::TextStyle::Monospace)
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(30)
+                            .interactive(false),
                     );
-                    let available = ui.available_size();
-                    let aspect = size[0] as f32 / size[1] as f32;
-                    let (w, h) = if available.x / available.y > aspect {
-                        (available.y * aspect * self.texture_zoom, available.y * self.texture_zoom)
-                    } else {
-                        (available.x * self.texture_zoom, available.x / aspect * self.texture_zoom)
-                    };
-                    let rect = ui.allocate_exact_size(egui::vec2(w, h), Sense::click_and_drag()).0;
-                    // Checkerboard background
-                    let painter = ui.painter_at(rect);
-                                let square = 16.0_f32;
-                    for x in (0..rect.width() as usize).step_by(square as usize * 2) {
-                        for y in (0..rect.height() as usize).step_by(square as usize * 2) {
-                            let r = egui::Rect::from_min_size(
-                                rect.min + egui::vec2(x as f32, y as f32),
-                                egui::vec2(square, square),
-                            );
-                            painter.rect_filled(r, 0.0, Color32::from_rgb(50, 53, 58));
-                            let r2 = egui::Rect::from_min_size(
-                                rect.min + egui::vec2(x as f32 + square, y as f32 + square),
-                                egui::vec2(square, square),
-                            );
-                            painter.rect_filled(r2, 0.0, Color32::from_rgb(50, 53, 58));
-                        }
-                    }
-                    ui.put(rect, egui::Image::new(&texture).fit_to_exact_size(rect.size()));
-                    if let Some(hover_pos) = ui.input(|i| i.pointer.hover_pos()) {
-                        if rect.contains(hover_pos) {
-                            let local = hover_pos - rect.min;
-                            let tex_x = (local.x / rect.width() * size[0] as f32) as usize;
-                            let tex_y = (local.y / rect.height() * size[1] as f32) as usize;
-                            if tex_x < size[0] && tex_y < size[1] {
-                                let idx = (tex_y * size[0] + tex_x) * 4;
-                                                            let raw = rgba.as_raw();
-                                                            if idx + 3 < raw.len() {
-                                                                let r = raw[idx];
-                                                                let g = raw[idx + 1];
-                                                                let b = raw[idx + 2];
-                                                                let a = raw[idx + 3];
-                                    ui.ctx().debug_painter().text(
-                                        hover_pos + egui::vec2(12.0, -20.0),
-                                        egui::Align2::LEFT_BOTTOM,
-                                        format!("RGBA: {r}, {g}, {b}, {a}"),
-                                        egui::FontId::proportional(11.0),
-                                        Color32::WHITE,
-                                    );
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    ui.centered_and_justified(|ui| {
-                        ui.label(RichText::new("Failed to decode image").color(Color32::from_rgb(220, 100, 100)));
-                    });
+                });
+            });
+        } else {
+            ui.centered_and_justified(|ui| {
+                ui.label(
+                    RichText::new("Failed to read script file")
+                        .color(Color32::from_rgb(220, 100, 100)),
+                );
+            });
+        }
+    }
+
+    fn preview_shader_state(_editor: &mut Editor, ui: &mut egui::Ui, path: &Path) {
+        Self::preview_script_state(_editor, ui, path); // Same as script for now
+    }
+
+    fn preview_audio_state(_editor: &mut Editor, ui: &mut egui::Ui, path: &Path) {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let metadata = std::fs::metadata(path).ok();
+        let size = metadata.map(|m| m.len()).unwrap_or(0);
+        ui.centered_and_justified(|ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space(40.0);
+                Icons::show(
+                    ui,
+                    Icons::AUDIO,
+                    IconSize::XLarge,
+                    Some(Color32::from_rgb(220, 180, 80)),
+                );
+                ui.add_space(12.0);
+                ui.label(RichText::new(name).size(20.0).color(Color32::WHITE));
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(format!("{} bytes", format_bytes(size)))
+                        .color(Color32::from_rgb(140, 155, 170)),
+                );
+                ui.add_space(20.0);
+                ui.label(
+                    RichText::new("Audio preview not yet implemented")
+                        .color(Color32::from_rgb(120, 135, 155)),
+                );
+            });
+        });
+    }
+
+    fn preview_unsupported_state(_editor: &mut Editor, ui: &mut egui::Ui, path: &Path) {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+        ui.centered_and_justified(|ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space(40.0);
+                Icons::show(
+                    ui,
+                    Icons::FILE,
+                    IconSize::XLarge,
+                    Some(Color32::from_rgb(160, 100, 100)),
+                );
+                ui.add_space(12.0);
+                ui.label(RichText::new(name).size(20.0).color(Color32::WHITE));
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(format!("Unsupported asset type: .{}", ext))
+                        .color(Color32::from_rgb(220, 140, 140)),
+                );
+                ui.add_space(20.0);
+                ui.label(
+                    RichText::new(
+                        "No preview available. Extend the preview system to support this type.",
+                    )
+                    .color(Color32::from_rgb(120, 135, 155)),
+                );
+            });
+        });
+    }
+
+    // Asset Details helpers
+    fn draw_asset_details_header(
+        ui: &mut egui::Ui,
+        name: &str,
+        kind: &AssetKind,
+        path: &Path,
+        metadata: Option<&std::fs::Metadata>,
+    ) {
+        ui.horizontal(|ui| {
+            Icons::show(
+                ui,
+                Icons::INFO,
+                IconSize::Medium,
+                Some(Color32::from_rgb(80, 180, 230)),
+            );
+            ui.vertical(|ui| {
+                ui.label(
+                    RichText::new(name)
+                        .size(16.0)
+                        .strong()
+                        .color(Color32::WHITE),
+                );
+                ui.label(
+                    RichText::new(kind.label())
+                        .size(11.0)
+                        .color(Color32::from_rgb(140, 155, 170)),
+                );
+            });
+        });
+        ui.add_space(8.0);
+        if let Some(meta) = metadata {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Path:").color(Color32::from_rgb(120, 135, 155)));
+                ui.add(
+                    egui::TextEdit::singleline(&mut path.to_string_lossy().to_string())
+                        .desired_width(f32::INFINITY)
+                        .interactive(false),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Size:").color(Color32::from_rgb(120, 135, 155)));
+                ui.label(RichText::new(format_bytes(meta.len())).color(Color32::WHITE));
+            });
+            if let Ok(modified) = meta.modified() {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Modified:").color(Color32::from_rgb(120, 135, 155)));
+                    ui.label(RichText::new(format_modified(modified)).color(Color32::WHITE));
+                });
+            }
+        }
+    }
+
+    fn draw_asset_details_properties(
+        ui: &mut egui::Ui,
+        path: &Path,
+        kind: &AssetKind,
+        metadata: Option<&std::fs::Metadata>,
+    ) {
+        ui.label(RichText::new("Properties").strong());
+        ui.add_space(4.0);
+        egui::Grid::new("asset_details_props")
+            .num_columns(2)
+            .spacing([8.0, 4.0])
+            .show(ui, |ui| {
+                Self::property_row(
+                    ui,
+                    "Name",
+                    path.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string(),
+                );
+                Self::property_row(ui, "Type", kind.label().to_string());
+                Self::property_row(
+                    ui,
+                    "Format",
+                    path.extension()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("")
+                        .to_uppercase(),
+                );
+                if let Some(meta) = metadata {
+                    Self::property_row(ui, "Size", format_bytes(meta.len()));
                 }
-            }
+                ui.end_row();
+            });
+    }
 
-            // Preview state functions
-            fn preview_empty_state(ui: &mut egui::Ui) {
-                ui.centered_and_justified(|ui| {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(40.0);
-                        Icons::show(ui, Icons::FILE, IconSize::XLarge, Some(Color32::from_rgb(100, 120, 140)));
-                        ui.add_space(12.0);
-                        ui.label(RichText::new("Asset Preview").size(20.0).color(Color32::from_rgb(180, 190, 200)));
-                        ui.add_space(4.0);
-                        ui.label(RichText::new("Select an asset in the Content Browser to preview it here.").color(Color32::from_rgb(120, 135, 155)));
-                    });
-                });
-            }
-
-            fn preview_folder_state(_editor: &mut Editor, ui: &mut egui::Ui, path: &Path) {
-                let name = path.file_name().unwrap_or_default().to_string_lossy();
-                let count = count_assets(path);
-                            let entries = fs::read_dir(path).map(|rd| rd.count()).unwrap_or(0);
-                ui.centered_and_justified(|ui| {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(40.0);
-                        Icons::show(ui, Icons::FOLDER, IconSize::XLarge, Some(Color32::from_rgb(80, 180, 230)));
-                        ui.add_space(12.0);
-                        ui.label(RichText::new(name).size(20.0).color(Color32::WHITE));
-                        ui.add_space(8.0);
-                                    ui.label(RichText::new(format!("{count} asset(s) В· {entries} entries")).color(Color32::from_rgb(140, 155, 170)));
-                        ui.add_space(20.0);
-                                    ui.label(RichText::new("Double-click in the Content Browser to navigate here.").color(Color32::from_rgb(120, 135, 155)));
-                    });
-                });
-            }
-
-            fn preview_scene_state(editor: &mut Editor, ui: &mut egui::Ui, path: &Path) {
-                let name = path.file_name().unwrap_or_default().to_string_lossy();
-                ui.centered_and_justified(|ui| {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(40.0);
-                        Icons::show(ui, Icons::SCENE, IconSize::XLarge, Some(Color32::from_rgb(80, 220, 120)));
-                        ui.add_space(12.0);
-                        ui.label(RichText::new(name).size(20.0).color(Color32::WHITE));
-                        ui.add_space(8.0);
-                        ui.label(RichText::new("Double-click to open in Scene Editor").color(Color32::from_rgb(140, 155, 170)));
-                        ui.add_space(20.0);
-                                    if ui.button("Open in Scene Editor").clicked() {
-                                        editor.open_asset_pending = Some(path.to_path_buf());
-                        }
-                    });
-                });
-            }
-
-            fn preview_texture_state(editor: &mut Editor, ui: &mut egui::Ui, path: &Path) {
-                if let Ok(data) = std::fs::read(path) {
-                    // Show zoom controls
-                    ui.horizontal(|ui| {
-                        ui.label("Zoom:");
-                        ui.add(egui::DragValue::new(&mut editor.texture_zoom).speed(0.01).clamp_range(0.1..=10.0).suffix("x"));
-                        if ui.button("Reset").clicked() {
-                            editor.texture_zoom = 1.0;
-                        }
-                    });
-                    ui.add_space(4.0);
-                    editor.preview_texture_viewport(ui, &data);
-                } else {
-                    ui.centered_and_justified(|ui| {
-                        ui.label(RichText::new("Failed to read texture file").color(Color32::from_rgb(220, 100, 100)));
-                    });
-                }
-            }
-
-            fn preview_model_state(editor: &mut Editor, ui: &mut egui::Ui, path: &Path) {
+    fn draw_asset_details_type_specific(ui: &mut egui::Ui, path: &Path, kind: &AssetKind) {
+        match kind {
+            AssetKind::Model => {
+                ui.add_space(8.0);
+                ui.label(RichText::new("Geometry").strong());
                 if let Ok(content) = std::fs::read_to_string(path) {
                     if let Some(mesh) = ObjMesh::parse(&content) {
-                        // Show zoom control
-                        ui.horizontal(|ui| {
-                            ui.label("Zoom:");
-                            ui.add(egui::DragValue::new(&mut editor.mesh_zoom).speed(0.1).clamp_range(0.1..=50.0).suffix("x"));
-                            if ui.button("Reset").clicked() {
-                                editor.mesh_zoom = 1.0;
-                                editor.preview_yaw = 0.0;
-                                editor.preview_pitch = 0.0;
-                            }
-                            ui.separator();
-                            ui.label(format!("Vertices: {}  Triangles: {}", mesh.vertices.len(), mesh.indices.len() / 3));
-                        });
-                        ui.add_space(4.0);
-                        editor.preview_mesh_viewport(ui, &mesh);
-                    } else {
-                        ui.centered_and_justified(|ui| {
-                            ui.label(RichText::new("Failed to parse model (OBJ only)").color(Color32::from_rgb(220, 100, 100)));
-                        });
-                    }
-                } else {
-                    ui.centered_and_justified(|ui| {
-                        ui.label(RichText::new("Failed to read model file").color(Color32::from_rgb(220, 100, 100)));
-                    });
-                }
-            }
-
-            fn preview_material_state(_editor: &mut Editor, ui: &mut egui::Ui, path: &Path) {
-                if let Ok(content) = std::fs::read_to_string(path) {
-                                let mut buffer = content.clone();
-                    ui.vertical(|ui| {
-                        ui.add_space(10.0);
-                        ui.label(RichText::new("Material Preview").strong());
-                        ui.add_space(8.0);
-                        // Simple sphere placeholder
-                        let (rect, _) = ui.allocate_exact_size(egui::vec2(200.0, 200.0), Sense::hover());
-                        let painter = ui.painter_at(rect);
-                        let center = rect.center();
-                        let radius = 80.0;
-                        painter.circle_filled(center, radius, Color32::from_rgb(180, 140, 100));
-                        painter.circle_stroke(center, radius, Stroke::new(2.0, Color32::from_rgb(100, 80, 60)));
-                        ui.add_space(12.0);
-                        ui.separator();
-                        ui.add_space(8.0);
-                        ui.label(RichText::new("Raw Content:").strong());
-                        egui::ScrollArea::vertical()
-                            .max_height(200.0)
+                        let triangle_count = mesh.indices.len() / 3;
+                        let (min_p, max_p) = mesh.bounds();
+                        let size = [
+                            max_p[0] - min_p[0],
+                            max_p[1] - min_p[1],
+                            max_p[2] - min_p[2],
+                        ];
+                        egui::Grid::new("model_geometry")
+                            .num_columns(2)
+                            .spacing([8.0, 4.0])
                             .show(ui, |ui| {
-                                ui.add(
-                                                egui::TextEdit::multiline(&mut buffer)
-                                        .font(egui::TextStyle::Monospace)
-                                        .desired_width(f32::INFINITY)
-                                        .interactive(false),
+                                Self::property_row(ui, "Vertices", mesh.vertices.len().to_string());
+                                Self::property_row(ui, "Triangles", triangle_count.to_string());
+                                Self::property_row(
+                                    ui,
+                                    "Bounds",
+                                    format!("{:.2} x {:.2} x {:.2}", size[0], size[1], size[2]),
                                 );
+                                ui.end_row();
                             });
-                    });
-                } else {
-                    ui.centered_and_justified(|ui| {
-                        ui.label(RichText::new("Failed to read material file").color(Color32::from_rgb(220, 100, 100)));
-                    });
+                    }
                 }
             }
-
-            fn preview_script_state(_editor: &mut Editor, ui: &mut egui::Ui, path: &Path) {
+            AssetKind::Texture => {
+                ui.add_space(8.0);
+                ui.label(RichText::new("Image").strong());
+                if let Ok(data) = std::fs::read(path) {
+                    if let Ok(image) = image::load_from_memory(&data) {
+                        let (w, h) = (image.width(), image.height());
+                        egui::Grid::new("texture_props")
+                            .num_columns(2)
+                            .spacing([8.0, 4.0])
+                            .show(ui, |ui| {
+                                Self::property_row(ui, "Resolution", format!("{} x {}", w, h));
+                                Self::property_row(
+                                    ui,
+                                    "Color Type",
+                                    format!("{:?}", image.color()),
+                                );
+                                ui.end_row();
+                            });
+                    }
+                }
+            }
+            AssetKind::Material => {
+                ui.add_space(8.0);
+                ui.label(RichText::new("Material Parameters").strong());
                 if let Ok(content) = std::fs::read_to_string(path) {
-                                let mut buffer = content.clone();
-                    ui.vertical(|ui| {
-                        ui.add_space(10.0);
-                        ui.label(RichText::new("Script Preview").strong());
-                        ui.add_space(8.0);
-                        egui::ScrollArea::vertical().show(ui, |ui| {
-                            ui.add(
-                                            egui::TextEdit::multiline(&mut buffer)
-                                    .font(egui::TextStyle::Monospace)
-                                    .desired_width(f32::INFINITY)
-                                    .desired_rows(30)
-                                    .interactive(false),
+                    for line in content.lines() {
+                        let line = line.trim();
+                        if line.starts_with("//") || line.is_empty() {
+                            continue;
+                        }
+                        ui.horizontal(|ui| {
+                            ui.add_space(16.0);
+                            ui.label(
+                                RichText::new(line)
+                                    .monospace()
+                                    .size(11.0)
+                                    .color(Color32::from_rgb(160, 170, 180)),
                             );
                         });
-                    });
-                } else {
-                    ui.centered_and_justified(|ui| {
-                        ui.label(RichText::new("Failed to read script file").color(Color32::from_rgb(220, 100, 100)));
-                    });
+                    }
                 }
             }
-
-            fn preview_shader_state(_editor: &mut Editor, ui: &mut egui::Ui, path: &Path) {
-                            Self::preview_script_state(_editor, ui, path); // Same as script for now
-            }
-
-            fn preview_audio_state(_editor: &mut Editor, ui: &mut egui::Ui, path: &Path) {
-                let name = path.file_name().unwrap_or_default().to_string_lossy();
-                let metadata = std::fs::metadata(path).ok();
-                let size = metadata.map(|m| m.len()).unwrap_or(0);
-                ui.centered_and_justified(|ui| {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(40.0);
-                        Icons::show(ui, Icons::AUDIO, IconSize::XLarge, Some(Color32::from_rgb(220, 180, 80)));
-                        ui.add_space(12.0);
-                        ui.label(RichText::new(name).size(20.0).color(Color32::WHITE));
-                        ui.add_space(8.0);
-                        ui.label(RichText::new(format!("{} bytes", format_bytes(size))).color(Color32::from_rgb(140, 155, 170)));
-                        ui.add_space(20.0);
-                        ui.label(RichText::new("Audio preview not yet implemented").color(Color32::from_rgb(120, 135, 155)));
-                    });
-                });
-            }
-
-            fn preview_unsupported_state(_editor: &mut Editor, ui: &mut egui::Ui, path: &Path) {
-                let name = path.file_name().unwrap_or_default().to_string_lossy();
-                let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-                ui.centered_and_justified(|ui| {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(40.0);
-                        Icons::show(ui, Icons::FILE, IconSize::XLarge, Some(Color32::from_rgb(160, 100, 100)));
-                        ui.add_space(12.0);
-                        ui.label(RichText::new(name).size(20.0).color(Color32::WHITE));
-                        ui.add_space(8.0);
-                        ui.label(RichText::new(format!("Unsupported asset type: .{}", ext)).color(Color32::from_rgb(220, 140, 140)));
-                        ui.add_space(20.0);
-                        ui.label(RichText::new("No preview available. Extend the preview system to support this type.").color(Color32::from_rgb(120, 135, 155)));
-                    });
-                });
-            }
-
-            // Asset Details helpers
-            fn draw_asset_details_header(ui: &mut egui::Ui, name: &str, kind: &AssetKind, path: &Path, metadata: Option<&std::fs::Metadata>) {
-                ui.horizontal(|ui| {
-                    Icons::show(ui, Icons::INFO, IconSize::Medium, Some(Color32::from_rgb(80, 180, 230)));
-                    ui.vertical(|ui| {
-                        ui.label(RichText::new(name).size(16.0).strong().color(Color32::WHITE));
-                        ui.label(RichText::new(kind.label()).size(11.0).color(Color32::from_rgb(140, 155, 170)));
-                    });
-                });
+            AssetKind::Scene => {
                 ui.add_space(8.0);
-                if let Some(meta) = metadata {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("Path:").color(Color32::from_rgb(120, 135, 155)));
-                        ui.add(egui::TextEdit::singleline(&mut path.to_string_lossy().to_string()).desired_width(f32::INFINITY).interactive(false));
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("Size:").color(Color32::from_rgb(120, 135, 155)));
-                        ui.label(RichText::new(format_bytes(meta.len())).color(Color32::WHITE));
-                    });
-                    if let Ok(modified) = meta.modified() {
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new("Modified:").color(Color32::from_rgb(120, 135, 155)));
-                                                ui.label(RichText::new(format_modified(modified)).color(Color32::WHITE));
-                        });
+                ui.label(RichText::new("Scene Info").strong());
+                if let Ok(content) = std::fs::read_to_string(path) {
+                    if let Ok(scene) = Scene::from_ron(&content) {
+                        egui::Grid::new("scene_props")
+                            .num_columns(2)
+                            .spacing([8.0, 4.0])
+                            .show(ui, |ui| {
+                                Self::property_row(
+                                    ui,
+                                    "Entities",
+                                    scene.entities.len().to_string(),
+                                );
+                                ui.end_row();
+                            });
                     }
                 }
             }
+            AssetKind::Script | AssetKind::Shader => {
+                ui.add_space(8.0);
+                ui.label(RichText::new("Source").strong());
+            }
+            _ => {}
+        }
+    }
 
-            fn draw_asset_details_properties(ui: &mut egui::Ui, path: &Path, kind: &AssetKind, metadata: Option<&std::fs::Metadata>) {
-                ui.label(RichText::new("Properties").strong());
+    fn property_row(ui: &mut egui::Ui, label: &str, value: String) {
+        ui.label(RichText::new(label).color(Color32::from_rgb(120, 135, 155)));
+        ui.label(RichText::new(value).color(Color32::WHITE));
+        ui.end_row();
+    }
+
+    fn details_empty_state(ui: &mut egui::Ui) {
+        ui.centered_and_justified(|ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space(40.0);
+                Icons::show(
+                    ui,
+                    Icons::INFO,
+                    IconSize::XLarge,
+                    Some(Color32::from_rgb(100, 120, 140)),
+                );
+                ui.add_space(12.0);
+                ui.label(
+                    RichText::new("Asset Details")
+                        .size(20.0)
+                        .color(Color32::from_rgb(180, 190, 200)),
+                );
                 ui.add_space(4.0);
-                egui::Grid::new("asset_details_props").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
-                    Self::property_row(ui, "Name", path.file_name().unwrap_or_default().to_string_lossy().to_string());
-                    Self::property_row(ui, "Type", kind.label().to_string());
-                    Self::property_row(ui, "Format", path.extension().and_then(|s| s.to_str()).unwrap_or("").to_uppercase());
-                    if let Some(meta) = metadata {
-                        Self::property_row(ui, "Size", format_bytes(meta.len()));
-                    }
-                    ui.end_row();
-                });
-            }
+                ui.label(
+                    RichText::new("Select an asset in the Content Browser to view its properties.")
+                        .color(Color32::from_rgb(120, 135, 155)),
+                );
+            });
+        });
+    }
 
-            fn draw_asset_details_type_specific(ui: &mut egui::Ui, path: &Path, kind: &AssetKind) {
-                match kind {
-                    AssetKind::Model => {
-                        ui.add_space(8.0);
-                        ui.label(RichText::new("Geometry").strong());
-                        if let Ok(content) = std::fs::read_to_string(path) {
-                                                if let Some(mesh) = ObjMesh::parse(&content) {
-                                                    let triangle_count = mesh.indices.len() / 3;
-                                                    let (min_p, max_p) = mesh.bounds();
-                                                    let size = [
-                                                        max_p[0] - min_p[0],
-                                                        max_p[1] - min_p[1],
-                                                        max_p[2] - min_p[2],
-                                                    ];
-                                egui::Grid::new("model_geometry").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
-                                    Self::property_row(ui, "Vertices", mesh.vertices.len().to_string());
-                                                        Self::property_row(ui, "Triangles", triangle_count.to_string());
-                                                        Self::property_row(ui, "Bounds", format!("{:.2} x {:.2} x {:.2}", size[0], size[1], size[2]));
-                                    ui.end_row();
-                                });
-                            }
-                        }
-                    }
-                    AssetKind::Texture => {
-                        ui.add_space(8.0);
-                        ui.label(RichText::new("Image").strong());
-                        if let Ok(data) = std::fs::read(path) {
-                            if let Ok(image) = image::load_from_memory(&data) {
-                                                    let (w, h) = (image.width(), image.height());
-                                egui::Grid::new("texture_props").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
-                                    Self::property_row(ui, "Resolution", format!("{} x {}", w, h));
-                                    Self::property_row(ui, "Color Type", format!("{:?}", image.color()));
-                                    ui.end_row();
-                                });
-                            }
-                        }
-                    }
-                    AssetKind::Material => {
-                        ui.add_space(8.0);
-                        ui.label(RichText::new("Material Parameters").strong());
-                        if let Ok(content) = std::fs::read_to_string(path) {
-                            for line in content.lines() {
-                                let line = line.trim();
-                                if line.starts_with("//") || line.is_empty() { continue; }
-                                ui.horizontal(|ui| {
-                                    ui.add_space(16.0);
-                                    ui.label(RichText::new(line).monospace().size(11.0).color(Color32::from_rgb(160, 170, 180)));
-                                });
-                            }
-                        }
-                    }
-                    AssetKind::Scene => {
-                        ui.add_space(8.0);
-                        ui.label(RichText::new("Scene Info").strong());
-                        if let Ok(content) = std::fs::read_to_string(path) {
-                            if let Ok(scene) = Scene::from_ron(&content) {
-                                egui::Grid::new("scene_props").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
-                                    Self::property_row(ui, "Entities", scene.entities.len().to_string());
-                                    ui.end_row();
-                                });
-                            }
-                        }
-                    }
-                    AssetKind::Script | AssetKind::Shader => {
-                        ui.add_space(8.0);
-                        ui.label(RichText::new("Source").strong());
-                    }
-                    _ => {}
-                }
-            }
-
-            fn property_row(ui: &mut egui::Ui, label: &str, value: String) {
-                ui.label(RichText::new(label).color(Color32::from_rgb(120, 135, 155)));
-                ui.label(RichText::new(value).color(Color32::WHITE));
-                ui.end_row();
-            }
-
-            fn details_empty_state(ui: &mut egui::Ui) {
-                ui.centered_and_justified(|ui| {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(40.0);
-                        Icons::show(ui, Icons::INFO, IconSize::XLarge, Some(Color32::from_rgb(100, 120, 140)));
-                        ui.add_space(12.0);
-                        ui.label(RichText::new("Asset Details").size(20.0).color(Color32::from_rgb(180, 190, 200)));
-                        ui.add_space(4.0);
-                        ui.label(RichText::new("Select an asset in the Content Browser to view its properties.").color(Color32::from_rgb(120, 135, 155)));
-                    });
-                });
-            }
-
-            fn zoom_constant() -> f32 { 100.0 }
+    fn zoom_constant() -> f32 {
+        100.0
+    }
 
     fn draw_script_editor(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
@@ -2388,7 +2809,10 @@ impl Editor {
             self.navigate_content(path.to_path_buf());
             ui.close();
         }
-        if ui.button(format!("{} Create Folder", Icons::FOLDER_NEW)).clicked() {
+        if ui
+            .button(format!("{} Create Folder", Icons::FOLDER_NEW))
+            .clicked()
+        {
             self.create_content_folder();
             ui.close();
         }
@@ -2396,7 +2820,10 @@ impl Editor {
             self.rename_content(path);
             ui.close();
         }
-        if ui.button(format!("{} Duplicate", Icons::DUPLICATE)).clicked() {
+        if ui
+            .button(format!("{} Duplicate", Icons::DUPLICATE))
+            .clicked()
+        {
             self.duplicate_content(path);
             ui.close();
         }
@@ -2404,7 +2831,10 @@ impl Editor {
             self.prompt_delete_resource(path.to_path_buf());
             ui.close();
         }
-        if ui.button(format!("{} Import Sample TextureвЂ¦", Icons::IMPORT)).clicked() {
+        if ui
+            .button(format!("{} Import Sample TextureвЂ¦", Icons::IMPORT))
+            .clicked()
+        {
             let target = if path.is_dir() {
                 path.to_path_buf()
             } else {
@@ -2459,7 +2889,10 @@ impl Editor {
         let Some((path, new_name)) = self.renaming.take() else {
             return;
         };
-        if !apply || new_name.trim().is_empty() || *new_name == path.file_name().unwrap_or_default().to_string_lossy() {
+        if !apply
+            || new_name.trim().is_empty()
+            || *new_name == path.file_name().unwrap_or_default().to_string_lossy()
+        {
             return;
         }
         // Preserve extension for files: if user typed a name without extension, re-append it.
@@ -2492,7 +2925,10 @@ impl Editor {
             }
             self.log.push((
                 "INFO".into(),
-                format!("Renamed '{}'", target.file_name().unwrap_or_default().to_string_lossy()),
+                format!(
+                    "Renamed '{}'",
+                    target.file_name().unwrap_or_default().to_string_lossy()
+                ),
             ));
         }
     }
@@ -2584,7 +3020,11 @@ impl Editor {
                             .size(11.0)
                             .color(Color32::WHITE),
                     )
-                    .engine_tooltip("Create Group", "Create a new folder group to organize actors", None)
+                    .engine_tooltip(
+                        "Create Group",
+                        "Create a new folder group to organize actors",
+                        None,
+                    )
                     .clicked()
                 {
                     let e = world
@@ -2600,7 +3040,12 @@ impl Editor {
             });
         });
         ui.horizontal(|ui| {
-            Icons::show(ui, Icons::SEARCH, IconSize::Small, Some(Color32::from_rgb(120, 135, 155)));
+            Icons::show(
+                ui,
+                Icons::SEARCH,
+                IconSize::Small,
+                Some(Color32::from_rgb(120, 135, 155)),
+            );
             ui.add(
                 egui::TextEdit::singleline(&mut self.filter)
                     .hint_text("Search actorsвЂ¦")
@@ -2713,7 +3158,11 @@ impl Editor {
                 if depth > 0 {
                     ui.add_space((depth as f32) * 12.0);
                 }
-                let icon = if is_folder { Icons::FOLDER } else { Icons::ENTITY };
+                let icon = if is_folder {
+                    Icons::FOLDER
+                } else {
+                    Icons::ENTITY
+                };
                 let is_selected = self.selected_entities.contains(&entity);
                 let label = format!("{icon}  {name}");
                 let response = ui.selectable_label(is_selected, label);
@@ -2721,16 +3170,24 @@ impl Editor {
                 if response.clicked() {
                     self.set_selected_entity(Some(entity), ctrl);
                 }
-                let vis_icon = if visible { Icons::VISIBLE } else { Icons::HIDDEN };
+                let vis_icon = if visible {
+                    Icons::VISIBLE
+                } else {
+                    Icons::HIDDEN
+                };
                 if ui
-                    .button(
-                        RichText::new(vis_icon)
-                            .size(12.0)
-                            .color(if visible { Color32::from_rgb(100, 200, 100) } else { Color32::from_rgb(120, 120, 120) }),
-                    )
+                    .button(RichText::new(vis_icon).size(12.0).color(if visible {
+                        Color32::from_rgb(100, 200, 100)
+                    } else {
+                        Color32::from_rgb(120, 120, 120)
+                    }))
                     .engine_tooltip(
                         if visible { "Hide Actor" } else { "Show Actor" },
-                        if visible { "Hide this actor from the viewport" } else { "Make this actor visible in the viewport" },
+                        if visible {
+                            "Hide this actor from the viewport"
+                        } else {
+                            "Make this actor visible in the viewport"
+                        },
                         None,
                     )
                     .clicked()
@@ -2742,16 +3199,24 @@ impl Editor {
                     }
                     self.dirty = true;
                 }
-                let lock_icon = if locked { Icons::LOCKED } else { Icons::UNLOCKED };
+                let lock_icon = if locked {
+                    Icons::LOCKED
+                } else {
+                    Icons::UNLOCKED
+                };
                 if ui
-                    .button(
-                        RichText::new(lock_icon)
-                            .size(12.0)
-                            .color(if locked { Color32::from_rgb(220, 180, 60) } else { Color32::from_rgb(120, 120, 120) }),
-                    )
+                    .button(RichText::new(lock_icon).size(12.0).color(if locked {
+                        Color32::from_rgb(220, 180, 60)
+                    } else {
+                        Color32::from_rgb(120, 120, 120)
+                    }))
                     .engine_tooltip(
                         if locked { "Unlock Actor" } else { "Lock Actor" },
-                        if locked { "Allow this actor to be selected and modified" } else { "Prevent this actor from being selected or modified" },
+                        if locked {
+                            "Allow this actor to be selected and modified"
+                        } else {
+                            "Prevent this actor from being selected or modified"
+                        },
                         None,
                     )
                     .clicked()
@@ -2769,7 +3234,10 @@ impl Editor {
                         self.rename_buffer = name.clone();
                         ui.close();
                     }
-                    if ui.button(format!("{} Make Child of Selected", Icons::ENTITY)).clicked() {
+                    if ui
+                        .button(format!("{} Make Child of Selected", Icons::ENTITY))
+                        .clicked()
+                    {
                         if let Some(parent) = self.selected {
                             if parent != entity {
                                 world.entity_mut(entity).insert(Parent(parent));
@@ -2778,7 +3246,10 @@ impl Editor {
                         }
                         ui.close();
                     }
-                    if ui.button(format!("{} Detach From Parent", Icons::EMPTY_ENTITY)).clicked() {
+                    if ui
+                        .button(format!("{} Detach From Parent", Icons::EMPTY_ENTITY))
+                        .clicked()
+                    {
                         world.entity_mut(entity).remove::<Parent>();
                         self.dirty = true;
                         ui.close();
@@ -2805,7 +3276,12 @@ impl Editor {
 
         let Some(entity) = self.selected else {
             ui.vertical_centered(|ui| {
-                Icons::show(ui, Icons::EMPTY_ENTITY, IconSize::Large, Some(Color32::from_rgb(100, 105, 115)));
+                Icons::show(
+                    ui,
+                    Icons::EMPTY_ENTITY,
+                    IconSize::Large,
+                    Some(Color32::from_rgb(100, 105, 115)),
+                );
                 ui.add_space(6.0);
                 ui.label(
                     RichText::new("Select an actor to inspect properties")
@@ -2838,218 +3314,231 @@ impl Editor {
         ui.separator();
 
         egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.collapsing(
-                format!("{} Transform", Icons::TRANSFORM),
-                |ui| {
+            ui.collapsing(format!("{} Transform", Icons::TRANSFORM), |ui| {
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(
+                            RichText::new(format!("{} Copy", Icons::COPY))
+                                .size(11.0)
+                                .color(Color32::WHITE),
+                        )
+                        .engine_tooltip(
+                            "Copy Transform",
+                            "Copy the transform to clipboard",
+                            Some("Ctrl+C"),
+                        )
+                        .clicked()
+                    {
+                        if let Some(t) = world.get::<Transform>(entity) {
+                            self.copied_transform = Some(*t);
+                            self.log.push(("INFO".into(), "Transform copied".into()));
+                        }
+                    }
+                    if ui
+                        .add_enabled(
+                            self.copied_transform.is_some(),
+                            egui::Button::new(
+                                RichText::new(format!("{} Paste", Icons::PASTE)).size(11.0),
+                            ),
+                        )
+                        .engine_tooltip(
+                            "Paste Transform",
+                            "Paste transform from clipboard",
+                            Some("Ctrl+V"),
+                        )
+                        .clicked()
+                    {
+                        if let (Some(mut t), Some(src)) =
+                            (world.get_mut::<Transform>(entity), self.copied_transform)
+                        {
+                            *t = src;
+                            self.dirty = true;
+                            self.log.push(("INFO".into(), "Transform pasted".into()));
+                        }
+                    }
+                    if ui
+                        .button(
+                            RichText::new(format!("{} Reset All", Icons::RESET))
+                                .size(11.0)
+                                .color(Color32::WHITE),
+                        )
+                        .engine_tooltip(
+                            "Reset Transform",
+                            "Reset transform to default values",
+                            None,
+                        )
+                        .clicked()
+                    {
+                        if let Some(mut t) = world.get_mut::<Transform>(entity) {
+                            *t = Transform::default();
+                            self.dirty = true;
+                        }
+                    }
+                });
+
+                if let Some(mut t) = world.get_mut::<Transform>(entity) {
                     ui.horizontal(|ui| {
+                        ui.label("Location");
                         if ui
                             .button(
-                                RichText::new(format!("{} Copy", Icons::COPY))
+                                RichText::new(Icons::RESET)
                                     .size(11.0)
-                                    .color(Color32::WHITE),
+                                    .color(Color32::from_rgb(140, 145, 155)),
                             )
-                            .engine_tooltip("Copy Transform", "Copy the transform to clipboard", Some("Ctrl+C"))
+                            .engine_tooltip("Reset Location", "Set location to (0, 0, 0)", None)
                             .clicked()
                         {
-                            if let Some(t) = world.get::<Transform>(entity) {
-                                self.copied_transform = Some(*t);
-                                self.log.push(("INFO".into(), "Transform copied".into()));
-                            }
-                        }
-                        if ui
-                            .add_enabled(
-                                self.copied_transform.is_some(),
-                                egui::Button::new(
-                                    RichText::new(format!("{} Paste", Icons::PASTE)).size(11.0),
-                                ),
-                            )
-                            .engine_tooltip("Paste Transform", "Paste transform from clipboard", Some("Ctrl+V"))
-                            .clicked()
-                        {
-                            if let (Some(mut t), Some(src)) =
-                                (world.get_mut::<Transform>(entity), self.copied_transform)
-                            {
-                                *t = src;
-                                self.dirty = true;
-                                self.log.push(("INFO".into(), "Transform pasted".into()));
-                            }
-                        }
-                        if ui
-                            .button(
-                                RichText::new(format!("{} Reset All", Icons::RESET))
-                                    .size(11.0)
-                                    .color(Color32::WHITE),
-                            )
-                            .engine_tooltip("Reset Transform", "Reset transform to default values", None)
-                            .clicked()
-                        {
-                            if let Some(mut t) = world.get_mut::<Transform>(entity) {
-                                *t = Transform::default();
-                                self.dirty = true;
-                            }
+                            t.translation = Vec3::ZERO;
+                            self.dirty = true;
                         }
                     });
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::DragValue::new(&mut t.translation.x)
+                                .prefix("X ")
+                                .speed(0.1),
+                        );
+                        ui.add(
+                            egui::DragValue::new(&mut t.translation.y)
+                                .prefix("Y ")
+                                .speed(0.1),
+                        );
+                        ui.add(
+                            egui::DragValue::new(&mut t.translation.z)
+                                .prefix("Z ")
+                                .speed(0.1),
+                        );
+                    });
 
-                    if let Some(mut t) = world.get_mut::<Transform>(entity) {
-                        ui.horizontal(|ui| {
-                            ui.label("Location");
-                            if ui
-                                .button(
-                                    RichText::new(Icons::RESET)
-                                        .size(11.0)
-                                        .color(Color32::from_rgb(140, 145, 155)),
-                                )
-                                .engine_tooltip("Reset Location", "Set location to (0, 0, 0)", None)
-                                .clicked()
-                            {
-                                t.translation = Vec3::ZERO;
-                                self.dirty = true;
-                            }
-                        });
-                        ui.horizontal(|ui| {
-                            ui.add(
-                                egui::DragValue::new(&mut t.translation.x)
+                    let (mut rx, mut ry, mut rz) = t.rotation.to_euler(glam::EulerRot::XYZ);
+                    ui.horizontal(|ui| {
+                        ui.label("Rotation");
+                        if ui
+                            .button(
+                                RichText::new(Icons::RESET)
+                                    .size(11.0)
+                                    .color(Color32::from_rgb(140, 145, 155)),
+                            )
+                            .engine_tooltip(
+                                "Reset Rotation",
+                                "Set rotation to identity (no rotation)",
+                                None,
+                            )
+                            .clicked()
+                        {
+                            t.rotation = glam::Quat::IDENTITY;
+                            self.dirty = true;
+                        }
+                    });
+                    let rot_changed = ui
+                        .horizontal(|ui| {
+                            let mut changed = false;
+                            changed |= ui
+                                .add(egui::DragValue::new(&mut rx).prefix("X ").speed(0.02))
+                                .changed();
+                            changed |= ui
+                                .add(egui::DragValue::new(&mut ry).prefix("Y ").speed(0.02))
+                                .changed();
+                            changed |= ui
+                                .add(egui::DragValue::new(&mut rz).prefix("Z ").speed(0.02))
+                                .changed();
+                            changed
+                        })
+                        .inner;
+                    if rot_changed {
+                        t.rotation = glam::Quat::from_euler(glam::EulerRot::XYZ, rx, ry, rz);
+                        self.dirty = true;
+                    }
+
+                    ui.horizontal(|ui| {
+                        ui.label("Scale");
+                        if ui
+                            .button(
+                                RichText::new(Icons::RESET)
+                                    .size(11.0)
+                                    .color(Color32::from_rgb(140, 145, 155)),
+                            )
+                            .engine_tooltip("Reset Scale", "Set scale to (1, 1, 1)", None)
+                            .clicked()
+                        {
+                            t.scale = Vec3::ONE;
+                            self.dirty = true;
+                        }
+                    });
+                    let mut scale_changed = false;
+                    ui.horizontal(|ui| {
+                        scale_changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut t.scale.x)
                                     .prefix("X ")
-                                    .speed(0.1),
-                            );
-                            ui.add(
-                                egui::DragValue::new(&mut t.translation.y)
+                                    .speed(0.02)
+                                    .range(0.001..=1000.0),
+                            )
+                            .changed();
+                        scale_changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut t.scale.y)
                                     .prefix("Y ")
-                                    .speed(0.1),
-                            );
-                            ui.add(
-                                egui::DragValue::new(&mut t.translation.z)
+                                    .speed(0.02)
+                                    .range(0.001..=1000.0),
+                            )
+                            .changed();
+                        scale_changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut t.scale.z)
                                     .prefix("Z ")
-                                    .speed(0.1),
-                            );
-                        });
+                                    .speed(0.02)
+                                    .range(0.001..=1000.0),
+                            )
+                            .changed();
+                    });
+                    if scale_changed {
+                        self.dirty = true;
+                    }
+                }
+            });
 
-                        let (mut rx, mut ry, mut rz) = t.rotation.to_euler(glam::EulerRot::XYZ);
-                        ui.horizontal(|ui| {
-                            ui.label("Rotation");
-                            if ui
-                                .button(
-                                    RichText::new(Icons::RESET)
-                                        .size(11.0)
-                                        .color(Color32::from_rgb(140, 145, 155)),
-                                )
-                                .engine_tooltip("Reset Rotation", "Set rotation to identity (no rotation)", None)
-                                .clicked()
-                            {
-                                t.rotation = glam::Quat::IDENTITY;
-                                self.dirty = true;
-                            }
-                        });
-                        let rot_changed = ui
-                            .horizontal(|ui| {
-                                let mut changed = false;
-                                changed |= ui
-                                    .add(egui::DragValue::new(&mut rx).prefix("X ").speed(0.02))
-                                    .changed();
-                                changed |= ui
-                                    .add(egui::DragValue::new(&mut ry).prefix("Y ").speed(0.02))
-                                    .changed();
-                                changed |= ui
-                                    .add(egui::DragValue::new(&mut rz).prefix("Z ").speed(0.02))
-                                    .changed();
-                                changed
-                            })
-                            .inner;
-                        if rot_changed {
-                            t.rotation = glam::Quat::from_euler(glam::EulerRot::XYZ, rx, ry, rz);
-                            self.dirty = true;
-                        }
-
-                        ui.horizontal(|ui| {
-                            ui.label("Scale");
-                            if ui
-                                .button(
-                                    RichText::new(Icons::RESET)
-                                        .size(11.0)
-                                        .color(Color32::from_rgb(140, 145, 155)),
-                                )
-                                .engine_tooltip("Reset Scale", "Set scale to (1, 1, 1)", None)
-                                .clicked()
-                            {
-                                t.scale = Vec3::ONE;
-                                self.dirty = true;
-                            }
-                        });
-                        let mut scale_changed = false;
-                        ui.horizontal(|ui| {
-                            scale_changed |= ui
-                                .add(
-                                    egui::DragValue::new(&mut t.scale.x)
-                                        .prefix("X ")
-                                        .speed(0.02)
-                                        .range(0.001..=1000.0),
-                                )
-                                .changed();
-                            scale_changed |= ui
-                                .add(
-                                    egui::DragValue::new(&mut t.scale.y)
-                                        .prefix("Y ")
-                                        .speed(0.02)
-                                        .range(0.001..=1000.0),
-                                )
-                                .changed();
-                            scale_changed |= ui
-                                .add(
-                                    egui::DragValue::new(&mut t.scale.z)
-                                        .prefix("Z ")
-                                        .speed(0.02)
-                                        .range(0.001..=1000.0),
-                                )
-                                .changed();
-                        });
-                        if scale_changed {
-                            self.dirty = true;
-                        }
+            ui.collapsing(format!("{} Components", Icons::COMPONENTS), |ui| {
+                let has_parent = world.get::<Parent>(entity).is_some();
+                let has_group = world.get::<FolderGroup>(entity).is_some();
+                let has_visible = world.get::<Visible>(entity).is_some();
+                let has_locked = world.get::<Locked>(entity).is_some();
+                ui.label(format!("{} Name ({entity_name})", Icons::ENTITY));
+                ui.label(format!("{} Transform", Icons::TRANSFORM));
+                if has_parent {
+                    ui.label(format!("{} Parent", Icons::ENTITY));
+                }
+                if has_group {
+                    ui.label(format!("{} FolderGroup", Icons::FOLDER));
+                }
+                if has_visible {
+                    ui.label(format!("{} Visible", Icons::VISIBLE));
+                }
+                if has_locked {
+                    ui.label(format!("{} Locked", Icons::LOCKED));
+                }
+                ui.separator();
+                ui.menu_button(format!("{} Add Component", Icons::ADD), |ui| {
+                    if !has_group
+                        && ui
+                            .button(format!("{} FolderGroup", Icons::FOLDER))
+                            .clicked()
+                    {
+                        world
+                            .entity_mut(entity)
+                            .insert(FolderGroup("Folder".into()));
+                        self.dirty = true;
+                        ui.close();
                     }
-                },
-            );
-
-            ui.collapsing(
-                format!("{} Components", Icons::COMPONENTS),
-                |ui| {
-                    let has_parent = world.get::<Parent>(entity).is_some();
-                    let has_group = world.get::<FolderGroup>(entity).is_some();
-                    let has_visible = world.get::<Visible>(entity).is_some();
-                    let has_locked = world.get::<Locked>(entity).is_some();
-                    ui.label(format!("{} Name ({entity_name})", Icons::ENTITY));
-                    ui.label(format!("{} Transform", Icons::TRANSFORM));
-                    if has_parent {
-                        ui.label(format!("{} Parent", Icons::ENTITY));
+                    if !has_visible && ui.button(format!("{} Visible", Icons::VISIBLE)).clicked() {
+                        world.entity_mut(entity).insert(Visible(true));
+                        self.dirty = true;
+                        ui.close();
                     }
-                    if has_group {
-                        ui.label(format!("{} FolderGroup", Icons::FOLDER));
-                    }
-                    if has_visible {
-                        ui.label(format!("{} Visible", Icons::VISIBLE));
-                    }
-                    if has_locked {
-                        ui.label(format!("{} Locked", Icons::LOCKED));
-                    }
-                    ui.separator();
-                    ui.menu_button(
-                        format!("{} Add Component", Icons::ADD),
-                        |ui| {
-                            if !has_group && ui.button(format!("{} FolderGroup", Icons::FOLDER)).clicked() {
-                                world
-                                    .entity_mut(entity)
-                                    .insert(FolderGroup("Folder".into()));
-                                self.dirty = true;
-                                ui.close();
-                            }
-                            if !has_visible && ui.button(format!("{} Visible", Icons::VISIBLE)).clicked() {
-                                world.entity_mut(entity).insert(Visible(true));
-                                self.dirty = true;
-                                ui.close();
-                            }
-                            if !has_locked && ui.button(format!("{} Locked", Icons::LOCKED)).clicked() {
-                                world.entity_mut(entity).insert(Locked(false));
-                                self.dirty = true;
-                                ui.close();
+                    if !has_locked && ui.button(format!("{} Locked", Icons::LOCKED)).clicked() {
+                        world.entity_mut(entity).insert(Locked(false));
+                        self.dirty = true;
+                        ui.close();
                     }
                     ui.label("Custom scripts/components ready for expansion");
                 });
@@ -3136,35 +3625,36 @@ impl Editor {
         self.dirty = false;
         self.status = "New scene created".into();
         self.log.push(("INFO".into(), "Created empty scene".into()));
-        self.notifications.success("New Scene", "Initialized new empty scene");
+        self.notifications
+            .success("New Scene", "Initialized new empty scene");
     }
     pub fn import_dummy_resource(&mut self, target_dir: &Path) {
-            // Pick a real file from disk and copy it into the content folder.
-            if let Some(file) = rfd::FileDialog::new().pick_file() {
-                let file_name = file
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "imported_asset".into());
-                let dest = target_dir.join(&file_name);
-                match std::fs::copy(&file, &dest) {
-                    Ok(_) => {
-                        self.content_selected = Some(dest);
-                        self.status = format!("Imported '{file_name}'");
-                        self.log.push((
-                            "INFO".into(),
-                            format!("Imported resource: {file_name} -> {}", target_dir.display()),
-                        ));
-                        self.notifications.success(
-                            "Resource Imported",
-                            format!("Copied '{file_name}' into the content folder"),
-                        );
-                    }
-                    Err(e) => {
-                        self.status = format!("Import failed: {e}");
-                        self.log.push(("ERROR".into(), self.status.clone()));
-                        self.notifications.error("Import Failed", format!("{e}"));
-                    }
+        // Pick a real file from disk and copy it into the content folder.
+        if let Some(file) = rfd::FileDialog::new().pick_file() {
+            let file_name = file
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "imported_asset".into());
+            let dest = target_dir.join(&file_name);
+            match std::fs::copy(&file, &dest) {
+                Ok(_) => {
+                    self.content_selected = Some(dest);
+                    self.status = format!("Imported '{file_name}'");
+                    self.log.push((
+                        "INFO".into(),
+                        format!("Imported resource: {file_name} -> {}", target_dir.display()),
+                    ));
+                    self.notifications.success(
+                        "Resource Imported",
+                        format!("Copied '{file_name}' into the content folder"),
+                    );
                 }
+                Err(e) => {
+                    self.status = format!("Import failed: {e}");
+                    self.log.push(("ERROR".into(), self.status.clone()));
+                    self.notifications.error("Import Failed", format!("{e}"));
+                }
+            }
         }
     }
     fn delete_selected(&mut self, world: &mut World) {
@@ -3177,7 +3667,9 @@ impl Editor {
         };
         for e in targets {
             if let Some(uid) = world.get::<crate::core::uid::Uid>(e).copied() {
-                if let Some(mut registry) = world.get_resource_mut::<crate::core::resources::PersistentIdRegistry>() {
+                if let Some(mut registry) =
+                    world.get_resource_mut::<crate::core::resources::PersistentIdRegistry>()
+                {
                     registry.unregister(uid);
                 }
             }
@@ -3209,8 +3701,12 @@ impl Editor {
                     .map(|value| value.0.clone()),
                 components: crate::scene::SerializedComponents {
                     custom: Default::default(),
-                    mesh_filter: world.get::<crate::core::components::MeshFilter>(entity).cloned(),
-                    mesh_renderer: world.get::<crate::core::components::MeshRenderer>(entity).cloned(),
+                    mesh_filter: world
+                        .get::<crate::core::components::MeshFilter>(entity)
+                        .cloned(),
+                    mesh_renderer: world
+                        .get::<crate::core::components::MeshRenderer>(entity)
+                        .cloned(),
                     camera: world.get::<crate::camera::Camera3D>(entity).copied(),
                     light: world.get::<crate::core::components::Light>(entity).copied(),
                 },
@@ -3277,550 +3773,615 @@ impl Editor {
         }
     }
     fn draw_performance_monitor(&mut self, ui: &mut egui::Ui) {
-            use crate::performance::*;
+        use crate::performance::*;
 
-            let performance = ui.ctx().data_mut(|d| {
-                d.get_temp::<PerformanceMonitor>(egui::Id::new("performance_monitor"))
-            });
+        let performance = ui
+            .ctx()
+            .data_mut(|d| d.get_temp::<PerformanceMonitor>(egui::Id::new("performance_monitor")));
 
-            if let Some(perf) = performance {
-                let mut perf_clone = perf.clone();
+        if let Some(perf) = performance {
+            let mut perf_clone = perf.clone();
 
-                // Top bar with toggle and settings
-                ui.horizontal(|ui| {
-                    ui.heading("PERFORMANCE MONITOR");
-                    ui.separator();
-
-                    let mut enabled = perf_clone.enabled;
-                    if ui.checkbox(&mut enabled, "Enabled").changed() {
-                        perf_clone.enabled = enabled;
-                    }
-
-                    let mut detailed = perf_clone.detailed;
-                    if ui.checkbox(&mut detailed, "Detailed").changed() {
-                        perf_clone.detailed = detailed;
-                    }
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Clear History").clicked() {
-                                                perf_clone.reset();
-                        }
-                    });
-                });
-
+            // Top bar with toggle and settings
+            ui.horizontal(|ui| {
+                ui.heading("PERFORMANCE MONITOR");
                 ui.separator();
 
-                // Tabs
-                let tab_names = ["Overview", "CPU Profiler", "Renderer", "Memory", "ECS Inspector"];
-                let mut selected_tab = 0;
-
-                ui.horizontal(|ui| {
-                    for (i, name) in tab_names.iter().enumerate() {
-                        if ui.selectable_label(selected_tab == i, *name).clicked() {
-                            selected_tab = i;
-                        }
-                    }
-                });
-
-                ui.separator();
-
-                match selected_tab {
-                    0 => Self::draw_perf_overview(ui, &perf_clone),
-                    1 => Self::draw_perf_cpu_profiler(ui, &perf_clone),
-                    2 => Self::draw_perf_renderer(ui, &perf_clone),
-                    3 => Self::draw_perf_memory(ui, &perf_clone),
-                    4 => Self::draw_perf_ecs_inspector(ui, &perf_clone),
-                    _ => {}
+                let mut enabled = perf_clone.enabled;
+                if ui.checkbox(&mut enabled, "Enabled").changed() {
+                    perf_clone.enabled = enabled;
                 }
 
-                // Write back
-                ui.ctx().data_mut(|d| {
-                    d.insert_temp(egui::Id::new("performance_monitor"), perf_clone);
+                let mut detailed = perf_clone.detailed;
+                if ui.checkbox(&mut detailed, "Detailed").changed() {
+                    perf_clone.detailed = detailed;
+                }
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Clear History").clicked() {
+                        perf_clone.reset();
+                    }
                 });
-            } else {
-                ui.centered_and_justified(|ui| {
-                    ui.label("Performance Monitor not initialized");
-                });
+            });
+
+            ui.separator();
+
+            // Tabs
+            let tab_names = [
+                "Overview",
+                "CPU Profiler",
+                "Renderer",
+                "Memory",
+                "ECS Inspector",
+            ];
+
+            ui.horizontal(|ui| {
+                for (i, name) in tab_names.iter().enumerate() {
+                    if ui
+                        .selectable_label(self.perf_selected_tab == i, *name)
+                        .clicked()
+                    {
+                        self.perf_selected_tab = i;
+                    }
+                }
+            });
+
+            ui.separator();
+
+            match self.perf_selected_tab {
+                0 => Self::draw_perf_overview(ui, &perf_clone),
+                1 => Self::draw_perf_cpu_profiler(ui, &perf_clone),
+                2 => Self::draw_perf_renderer(ui, &perf_clone),
+                3 => Self::draw_perf_memory(ui, &perf_clone),
+                4 => Self::draw_perf_ecs_inspector(ui, &perf_clone),
+                _ => {}
             }
-        }
 
-        fn draw_perf_overview(ui: &mut egui::Ui, perf: &PerformanceMonitor) {
-            let stats = &perf.frame_stats;
-
-            ui.horizontal(|ui| {
-                // FPS
-                ui.vertical(|ui| {
-                    ui.label(RichText::new(format!("{:.1}", stats.fps)).size(32.0).strong());
-                    ui.label("FPS");
-                });
-                ui.separator();
-
-                // Frame Time
-                ui.vertical(|ui| {
-                    ui.label(RichText::new(format!("{:.2} ms", stats.frame_time_ms)).size(32.0).strong());
-                    ui.label("Frame Time");
-                });
-                ui.separator();
-
-                // CPU Time
-                ui.vertical(|ui| {
-                    ui.label(RichText::new(format!("{:.2} ms", stats.cpu_frame_time_ms)).size(32.0).strong());
-                    ui.label("CPU Time");
-                });
-                ui.separator();
-
-                // GPU Time
-                ui.vertical(|ui| {
-                    let gpu_text = stats.gpu_frame_time_ms.map_or("N/A".to_string(), |v| format!("{:.2} ms", v));
-                    ui.label(RichText::new(gpu_text).size(32.0).strong());
-                    ui.label("GPU Time");
-                });
+            // Write back
+            ui.ctx().data_mut(|d| {
+                d.insert_temp(egui::Id::new("performance_monitor"), perf_clone);
             });
-
-            ui.add_space(8.0);
-            ui.separator();
-            ui.add_space(4.0);
-
-            // Secondary metrics
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.label(RichText::new("Low FPS (1%)").strong());
-                    ui.label(format!("{:.1}", stats.one_percent_low_fps));
-                });
-                ui.separator();
-                ui.vertical(|ui| {
-                    ui.label(RichText::new("Low FPS (0.1%)").strong());
-                    ui.label(format!("{:.1}", stats.zero_one_percent_low_fps));
-                });
-                ui.separator();
-                ui.vertical(|ui| {
-                    ui.label(RichText::new("Avg Frame Time").strong());
-                    ui.label(format!("{:.2} ms", stats.avg_frame_time_ms));
-                });
-                ui.separator();
-                ui.vertical(|ui| {
-                    ui.label(RichText::new("Min / Max FPS").strong());
-                    ui.label(format!("{} / {}", stats.min_fps, stats.max_fps));
-                });
-                ui.separator();
-                ui.vertical(|ui| {
-                    ui.label(RichText::new("Fixed Updates / Frame").strong());
-                    ui.label(format!("{}", stats.fixed_updates_count));
-                });
+        } else {
+            ui.centered_and_justified(|ui| {
+                ui.label("Performance Monitor not initialized");
             });
-
-            ui.add_space(8.0);
-            ui.separator();
-            ui.add_space(4.0);
-
-            // Graphs
-            ui.label(RichText::new("FPS History").strong());
-            Self::draw_sparkline(ui, &perf.fps_history, 200.0, Color32::from_rgb(80, 200, 100));
-
-            ui.add_space(4.0);
-            ui.label(RichText::new("Frame Time History").strong());
-            Self::draw_sparkline(ui, &perf.frame_time_history, 200.0, Color32::from_rgb(200, 80, 80));
         }
+    }
 
-        fn draw_perf_cpu_profiler(ui: &mut egui::Ui, perf: &PerformanceMonitor) {
-            ui.label(RichText::new("Operation Timings (Current Frame)").strong());
-            ui.add_space(4.0);
+    fn draw_perf_overview(ui: &mut egui::Ui, perf: &PerformanceMonitor) {
+        let stats = &perf.frame_stats;
 
-            // Sort by duration descending
-            let mut metrics: Vec<_> = perf.metrics.values().collect();
-            metrics.sort_by(|a, b| b.last_duration_ms.partial_cmp(&a.last_duration_ms).unwrap_or(std::cmp::Ordering::Equal));
+        ui.horizontal(|ui| {
+            // FPS
+            ui.vertical(|ui| {
+                ui.label(
+                    RichText::new(format!("{:.1}", stats.fps))
+                        .size(32.0)
+                        .strong(),
+                );
+                ui.label("FPS");
+            });
+            ui.separator();
 
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                egui::Grid::new("cpu_profiler_grid")
-                    .num_columns(6)
-                    .striped(true)
-                    .show(ui, |ui| {
-                        ui.strong("Operation");
-                        ui.strong("Category");
-                        ui.strong("Last (ms)");
-                        ui.strong("Avg (ms)");
-                        ui.strong("Max (ms)");
-                        ui.strong("Calls");
+            // Frame Time
+            ui.vertical(|ui| {
+                ui.label(
+                    RichText::new(format!("{:.2} ms", stats.frame_time_ms))
+                        .size(32.0)
+                        .strong(),
+                );
+                ui.label("Frame Time");
+            });
+            ui.separator();
+
+            // CPU Time
+            ui.vertical(|ui| {
+                ui.label(
+                    RichText::new(format!("{:.2} ms", stats.cpu_frame_time_ms))
+                        .size(32.0)
+                        .strong(),
+                );
+                ui.label("CPU Time");
+            });
+            ui.separator();
+
+            // GPU Time
+            ui.vertical(|ui| {
+                let gpu_text = stats
+                    .gpu_frame_time_ms
+                    .map_or("N/A".to_string(), |v| format!("{:.2} ms", v));
+                ui.label(RichText::new(gpu_text).size(32.0).strong());
+                ui.label("GPU Time");
+            });
+        });
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(4.0);
+
+        // Secondary metrics
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.label(RichText::new("Low FPS (1%)").strong());
+                ui.label(format!("{:.1}", stats.one_percent_low_fps));
+            });
+            ui.separator();
+            ui.vertical(|ui| {
+                ui.label(RichText::new("Low FPS (0.1%)").strong());
+                ui.label(format!("{:.1}", stats.zero_one_percent_low_fps));
+            });
+            ui.separator();
+            ui.vertical(|ui| {
+                ui.label(RichText::new("Avg Frame Time").strong());
+                ui.label(format!("{:.2} ms", stats.avg_frame_time_ms));
+            });
+            ui.separator();
+            ui.vertical(|ui| {
+                ui.label(RichText::new("Min / Max FPS").strong());
+                ui.label(format!("{} / {}", stats.min_fps, stats.max_fps));
+            });
+            ui.separator();
+            ui.vertical(|ui| {
+                ui.label(RichText::new("Fixed Updates / Frame").strong());
+                ui.label(format!("{}", stats.fixed_updates_count));
+            });
+        });
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(4.0);
+
+        // Graphs
+        ui.label(RichText::new("FPS History").strong());
+        Self::draw_sparkline(
+            ui,
+            &perf.fps_history,
+            200.0,
+            Color32::from_rgb(80, 200, 100),
+        );
+
+        ui.add_space(4.0);
+        ui.label(RichText::new("Frame Time History").strong());
+        Self::draw_sparkline(
+            ui,
+            &perf.frame_time_history,
+            200.0,
+            Color32::from_rgb(200, 80, 80),
+        );
+    }
+
+    fn draw_perf_cpu_profiler(ui: &mut egui::Ui, perf: &PerformanceMonitor) {
+        ui.label(RichText::new("Operation Timings (Current Frame)").strong());
+        ui.add_space(4.0);
+
+        // Sort by duration descending
+        let mut metrics: Vec<_> = perf.metrics.values().collect();
+        metrics.sort_by(|a, b| {
+            b.last_duration_ms
+                .partial_cmp(&a.last_duration_ms)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            egui::Grid::new("cpu_profiler_grid")
+                .num_columns(6)
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.strong("Operation");
+                    ui.strong("Category");
+                    ui.strong("Last (ms)");
+                    ui.strong("Avg (ms)");
+                    ui.strong("Max (ms)");
+                    ui.strong("Calls");
+                    ui.end_row();
+
+                    for metric in metrics {
+                        ui.label(&metric.name);
+                        ui.label(metric.category.name());
+                        ui.label(format!("{:.3}", metric.last_duration_ms));
+                        ui.label(format!("{:.3}", metric.avg_duration_ms()));
+                        ui.label(format!("{:.3}", metric.max_duration_ms));
+                        ui.label(format!("{}", metric.call_count));
                         ui.end_row();
+                    }
+                });
+        });
 
-                        for metric in metrics {
-                            ui.label(&metric.name);
-                            ui.label(metric.category.name());
-                            ui.label(format!("{:.3}", metric.last_duration_ms));
-                            ui.label(format!("{:.3}", metric.avg_duration_ms()));
-                            ui.label(format!("{:.3}", metric.max_duration_ms));
-                            ui.label(format!("{}", metric.call_count));
-                            ui.end_row();
-                        }
-                    });
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(4.0);
+
+        // GameLoop stage timings
+        ui.label(RichText::new("GameLoop Stage Timings (Last Frame)").strong());
+        ui.add_space(4.0);
+
+        egui::Grid::new("gameloop_stages_grid")
+            .num_columns(4)
+            .striped(true)
+            .show(ui, |ui| {
+                ui.strong("Stage");
+                ui.strong("Time (ms)");
+                ui.strong("% of Frame");
+                ui.strong("Fixed Steps");
+                ui.end_row();
+
+                let total = perf.frame_stats.cpu_frame_time_ms.max(0.001);
+
+                // These would come from GameLoop timings if available
+                ui.label("Editor Update");
+                ui.label("N/A");
+                ui.label("N/A");
+                ui.label("-");
+                ui.end_row();
+
+                ui.label("Fixed Update");
+                ui.label(format!(
+                    "{:.2}",
+                    perf.frame_stats.fixed_delta_time_ms
+                        * perf.frame_stats.fixed_updates_count as f64
+                ));
+                ui.label(format!(
+                    "{:.1}%",
+                    (perf.frame_stats.fixed_delta_time_ms
+                        * perf.frame_stats.fixed_updates_count as f64)
+                        / total
+                        * 100.0
+                ));
+                ui.label(format!("{}", perf.frame_stats.fixed_updates_count));
+                ui.end_row();
+
+                ui.label("Update");
+                ui.label("N/A");
+                ui.label("N/A");
+                ui.label("-");
+                ui.end_row();
+
+                ui.label("Post Update");
+                ui.label("N/A");
+                ui.label("N/A");
+                ui.label("-");
+                ui.end_row();
+
+                ui.label("Transform Propagation");
+                ui.label("N/A");
+                ui.label("N/A");
+                ui.label("-");
+                ui.end_row();
+
+                ui.label("Renderer Extraction");
+                ui.label("N/A");
+                ui.label("N/A");
+                ui.label("-");
+                ui.end_row();
+
+                ui.label("Shadow Pass");
+                ui.label("N/A");
+                ui.label("N/A");
+                ui.label("-");
+                ui.end_row();
+
+                ui.label("Main Render Pass");
+                ui.label("N/A");
+                ui.label("N/A");
+                ui.label("-");
+                ui.end_row();
+
+                ui.label("Post Processing");
+                ui.label("N/A");
+                ui.label("N/A");
+                ui.label("-");
+                ui.end_row();
+            });
+    }
+
+    fn draw_perf_renderer(ui: &mut egui::Ui, perf: &PerformanceMonitor) {
+        let stats = &perf.renderer_stats;
+
+        ui.label(RichText::new("Scene Statistics").strong());
+        ui.add_space(4.0);
+
+        egui::Grid::new("renderer_scene_grid")
+            .num_columns(2)
+            .striped(true)
+            .show(ui, |ui| {
+                ui.label("Renderable Entities");
+                ui.label(format!("{}", stats.renderable_entities));
+                ui.end_row();
+
+                ui.label("Visible Entities");
+                ui.label(format!("{}", stats.visible_entities));
+                ui.end_row();
+
+                ui.label("Draw Calls");
+                ui.label(format!("{}", stats.draw_calls));
+                ui.end_row();
+
+                ui.label("Triangles");
+                ui.label(format!("{}", stats.triangles));
+                ui.end_row();
+
+                ui.label("Vertices");
+                ui.label(format!("{}", stats.vertices));
+                ui.end_row();
+
+                ui.label("Meshes");
+                ui.label(format!("{}", stats.meshes));
+                ui.end_row();
+
+                ui.label("Materials");
+                ui.label(format!("{}", stats.materials));
+                ui.end_row();
+
+                ui.label("Textures");
+                ui.label(stats.textures.map_or("N/A".to_string(), |v| v.to_string()));
+                ui.end_row();
+
+                ui.label("Lights");
+                ui.label(format!("{}", stats.lights));
+                ui.end_row();
+
+                ui.label("Shadow Casters");
+                ui.label(format!("{}", stats.shadow_casters));
+                ui.end_row();
+
+                ui.label("Render Passes");
+                ui.label(format!("{}", stats.passes));
+                ui.end_row();
             });
 
-            ui.add_space(8.0);
-            ui.separator();
-            ui.add_space(4.0);
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(4.0);
 
-            // GameLoop stage timings
-            ui.label(RichText::new("GameLoop Stage Timings (Last Frame)").strong());
-            ui.add_space(4.0);
+        ui.label(RichText::new("GPU Timing").strong());
+        ui.add_space(4.0);
 
-            egui::Grid::new("gameloop_stages_grid")
-                .num_columns(4)
-                .striped(true)
-                .show(ui, |ui| {
-                    ui.strong("Stage");
-                    ui.strong("Time (ms)");
-                    ui.strong("% of Frame");
-                    ui.strong("Fixed Steps");
-                    ui.end_row();
+        let gpu_text = stats.gpu_frame_time_ms.map_or(
+            "GPU timing not available (timestamp queries unsupported)".to_string(),
+            |v| format!("{:.3} ms", v),
+        );
+        ui.label(gpu_text);
 
-                    let total = perf.frame_stats.cpu_frame_time_ms.max(0.001);
+        if stats.gpu_frame_time_ms.is_none() {
+            ui.label("Note: GPU timestamp queries require appropriate device support and backend.");
+        }
+    }
 
-                    // These would come from GameLoop timings if available
-                    ui.label("Editor Update");
-                    ui.label("N/A");
-                    ui.label("N/A");
-                    ui.label("-");
-                    ui.end_row();
+    fn draw_perf_memory(ui: &mut egui::Ui, perf: &PerformanceMonitor) {
+        let stats = &perf.memory_stats;
 
-                    ui.label("Fixed Update");
-                    ui.label(format!("{:.2}", perf.frame_stats.fixed_delta_time_ms * perf.frame_stats.fixed_updates_count as f64));
-                    ui.label(format!("{:.1}%", (perf.frame_stats.fixed_delta_time_ms * perf.frame_stats.fixed_updates_count as f64) / total * 100.0));
-                    ui.label(format!("{}", perf.frame_stats.fixed_updates_count));
-                    ui.end_row();
+        ui.label(RichText::new("Process Memory").strong());
+        ui.add_space(4.0);
 
-                    ui.label("Update");
-                    ui.label("N/A");
-                    ui.label("N/A");
-                    ui.label("-");
-                    ui.end_row();
+        egui::Grid::new("memory_grid")
+            .num_columns(2)
+            .striped(true)
+            .show(ui, |ui| {
+                ui.label("Working Set");
+                ui.label(
+                    stats
+                        .process_working_set_bytes
+                        .map_or("N/A".to_string(), |v| Self::format_bytes(v)),
+                );
+                ui.end_row();
+            });
 
-                    ui.label("Post Update");
-                    ui.label("N/A");
-                    ui.label("N/A");
-                    ui.label("-");
-                    ui.end_row();
-
-                    ui.label("Transform Propagation");
-                    ui.label("N/A");
-                    ui.label("N/A");
-                    ui.label("-");
-                    ui.end_row();
-
-                    ui.label("Renderer Extraction");
-                    ui.label("N/A");
-                    ui.label("N/A");
-                    ui.label("-");
-                    ui.end_row();
-
-                    ui.label("Shadow Pass");
-                    ui.label("N/A");
-                    ui.label("N/A");
-                    ui.label("-");
-                    ui.end_row();
-
-                    ui.label("Main Render Pass");
-                    ui.label("N/A");
-                    ui.label("N/A");
-                    ui.label("-");
-                    ui.end_row();
-
-                    ui.label("Post Processing");
-                    ui.label("N/A");
-                    ui.label("N/A");
-                    ui.label("-");
-                    ui.end_row();
-                });
+        if stats.process_working_set_bytes.is_none() {
+            ui.label("Note: Process memory reading requires platform-specific support (Windows: K32GetProcessMemoryInfo)");
         }
 
-        fn draw_perf_renderer(ui: &mut egui::Ui, perf: &PerformanceMonitor) {
-            let stats = &perf.renderer_stats;
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(4.0);
 
-            ui.label(RichText::new("Scene Statistics").strong());
-            ui.add_space(4.0);
+        ui.label(RichText::new("ECS Resources").strong());
+        ui.add_space(4.0);
 
-            egui::Grid::new("renderer_scene_grid")
-                .num_columns(2)
-                .striped(true)
-                .show(ui, |ui| {
-                    ui.label("Renderable Entities");
-                    ui.label(format!("{}", stats.renderable_entities));
-                    ui.end_row();
+        egui::Grid::new("memory_ecs_grid")
+            .num_columns(2)
+            .striped(true)
+            .show(ui, |ui| {
+                ui.label("Entities");
+                ui.label(format!("{}", stats.ecs_entities_count));
+                ui.end_row();
 
-                    ui.label("Visible Entities");
-                    ui.label(format!("{}", stats.visible_entities));
-                    ui.end_row();
+                ui.label("Registered Assets");
+                ui.label(format!("{}", stats.registered_assets_count));
+                ui.end_row();
 
-                    ui.label("Draw Calls");
-                    ui.label(format!("{}", stats.draw_calls));
-                    ui.end_row();
+                ui.label("Mesh Assets");
+                ui.label(format!("{}", stats.mesh_assets_count));
+                ui.end_row();
 
-                    ui.label("Triangles");
-                    ui.label(format!("{}", stats.triangles));
-                    ui.end_row();
+                ui.label("Material Assets");
+                ui.label(format!("{}", stats.material_assets_count));
+                ui.end_row();
 
-                    ui.label("Vertices");
-                    ui.label(format!("{}", stats.vertices));
-                    ui.end_row();
+                ui.label("Texture Assets");
+                ui.label(
+                    stats
+                        .texture_assets_count
+                        .map_or("N/A".to_string(), |v| v.to_string()),
+                );
+                ui.end_row();
+            });
 
-                    ui.label("Meshes");
-                    ui.label(format!("{}", stats.meshes));
-                    ui.end_row();
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(4.0);
 
-                    ui.label("Materials");
-                    ui.label(format!("{}", stats.materials));
-                    ui.end_row();
+        ui.label(RichText::new("Performance Monitor Buffer").strong());
+        ui.add_space(4.0);
 
-                    ui.label("Textures");
-                    ui.label(stats.textures.map_or("N/A".to_string(), |v| v.to_string()));
-                    ui.end_row();
+        egui::Grid::new("memory_perf_grid")
+            .num_columns(2)
+            .striped(true)
+            .show(ui, |ui| {
+                ui.label("History Samples");
+                ui.label(format!("{}", stats.history_samples_count));
+                ui.end_row();
 
-                    ui.label("Lights");
-                    ui.label(format!("{}", stats.lights));
-                    ui.end_row();
+                ui.label("Buffer Capacity");
+                ui.label(format!("{}", stats.history_buffer_capacity));
+                ui.end_row();
+            });
+    }
 
-                    ui.label("Shadow Casters");
-                    ui.label(format!("{}", stats.shadow_casters));
-                    ui.end_row();
+    fn draw_perf_ecs_inspector(ui: &mut egui::Ui, perf: &PerformanceMonitor) {
+        let stats = &perf.ecs_stats;
 
-                    ui.label("Render Passes");
-                    ui.label(format!("{}", stats.passes));
-                    ui.end_row();
-                });
+        ui.label(RichText::new("Entity Summary").strong());
+        ui.add_space(4.0);
 
-            ui.add_space(8.0);
-            ui.separator();
-            ui.add_space(4.0);
+        egui::Grid::new("ecs_summary_grid")
+            .num_columns(2)
+            .striped(true)
+            .show(ui, |ui| {
+                ui.label("Total Entities");
+                ui.label(format!("{}", stats.entity_count));
+                ui.end_row();
 
-            ui.label(RichText::new("GPU Timing").strong());
-            ui.add_space(4.0);
+                ui.label("With Transform");
+                ui.label(format!("{}", stats.transform_entities));
+                ui.end_row();
 
-            let gpu_text = stats.gpu_frame_time_ms.map_or("GPU timing not available (timestamp queries unsupported)".to_string(), |v| format!("{:.3} ms", v));
-            ui.label(gpu_text);
+                ui.label("Renderable");
+                ui.label(format!("{}", stats.renderable_entities));
+                ui.end_row();
 
-            if stats.gpu_frame_time_ms.is_none() {
-                ui.label("Note: GPU timestamp queries require appropriate device support and backend.");
-            }
-        }
+                ui.label("Cameras");
+                ui.label(format!("{}", stats.camera_entities));
+                ui.end_row();
 
-        fn draw_perf_memory(ui: &mut egui::Ui, perf: &PerformanceMonitor) {
-            let stats = &perf.memory_stats;
+                ui.label("Lights");
+                ui.label(format!("{}", stats.light_entities));
+                ui.end_row();
 
-            ui.label(RichText::new("Process Memory").strong());
-            ui.add_space(4.0);
+                ui.label("Registered Resources");
+                ui.label(format!("{}", stats.registered_resources_count));
+                ui.end_row();
+            });
 
-            egui::Grid::new("memory_grid")
-                .num_columns(2)
-                .striped(true)
-                .show(ui, |ui| {
-                    ui.label("Working Set");
-                    ui.label(stats.process_working_set_bytes.map_or("N/A".to_string(), |v| Self::format_bytes(v)));
-                    ui.end_row();
-                });
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(4.0);
 
-            if stats.process_working_set_bytes.is_none() {
-                ui.label("Note: Process memory reading requires platform-specific support (Windows: K32GetProcessMemoryInfo)");
-            }
+        ui.label(RichText::new("Component Statistics").strong());
+        ui.add_space(4.0);
 
-            ui.add_space(8.0);
-            ui.separator();
-            ui.add_space(4.0);
-
-            ui.label(RichText::new("ECS Resources").strong());
-            ui.add_space(4.0);
-
-            egui::Grid::new("memory_ecs_grid")
-                .num_columns(2)
-                .striped(true)
-                .show(ui, |ui| {
-                    ui.label("Entities");
-                    ui.label(format!("{}", stats.ecs_entities_count));
-                    ui.end_row();
-
-                    ui.label("Registered Assets");
-                    ui.label(format!("{}", stats.registered_assets_count));
-                    ui.end_row();
-
-                    ui.label("Mesh Assets");
-                    ui.label(format!("{}", stats.mesh_assets_count));
-                    ui.end_row();
-
-                    ui.label("Material Assets");
-                    ui.label(format!("{}", stats.material_assets_count));
-                    ui.end_row();
-
-                    ui.label("Texture Assets");
-                    ui.label(stats.texture_assets_count.map_or("N/A".to_string(), |v| v.to_string()));
-                    ui.end_row();
-                });
-
-            ui.add_space(8.0);
-            ui.separator();
-            ui.add_space(4.0);
-
-            ui.label(RichText::new("Performance Monitor Buffer").strong());
-            ui.add_space(4.0);
-
-            egui::Grid::new("memory_perf_grid")
-                .num_columns(2)
-                .striped(true)
-                .show(ui, |ui| {
-                    ui.label("History Samples");
-                    ui.label(format!("{}", stats.history_samples_count));
-                    ui.end_row();
-
-                    ui.label("Buffer Capacity");
-                    ui.label(format!("{}", stats.history_buffer_capacity));
-                    ui.end_row();
-                });
-        }
-
-        fn draw_perf_ecs_inspector(ui: &mut egui::Ui, perf: &PerformanceMonitor) {
-            let stats = &perf.ecs_stats;
-
-            ui.label(RichText::new("Entity Summary").strong());
-            ui.add_space(4.0);
-
-            egui::Grid::new("ecs_summary_grid")
-                .num_columns(2)
-                .striped(true)
-                .show(ui, |ui| {
-                    ui.label("Total Entities");
-                    ui.label(format!("{}", stats.entity_count));
-                    ui.end_row();
-
-                    ui.label("With Transform");
-                    ui.label(format!("{}", stats.transform_entities));
-                    ui.end_row();
-
-                    ui.label("Renderable");
-                    ui.label(format!("{}", stats.renderable_entities));
-                    ui.end_row();
-
-                    ui.label("Cameras");
-                    ui.label(format!("{}", stats.camera_entities));
-                    ui.end_row();
-
-                    ui.label("Lights");
-                    ui.label(format!("{}", stats.light_entities));
-                    ui.end_row();
-
-                    ui.label("Registered Resources");
-                    ui.label(format!("{}", stats.registered_resources_count));
-                    ui.end_row();
-                });
-
-            ui.add_space(8.0);
-            ui.separator();
-            ui.add_space(4.0);
-
-            ui.label(RichText::new("Component Statistics").strong());
-            ui.add_space(4.0);
-
-            egui::ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
+        egui::ScrollArea::vertical()
+            .max_height(200.0)
+            .show(ui, |ui| {
                 egui::Grid::new("ecs_components_grid")
                     .num_columns(3)
                     .striped(true)
                     .show(ui, |ui| {
                         ui.strong("Component");
                         ui.strong("Entity Count");
-                        ui.strong("Type ID");
                         ui.end_row();
 
                         for comp in &stats.components {
-                                                    ui.label(&*comp.name);
-                                                    ui.label(format!("{}", comp.count));
-                                                    ui.label(format!("{:?}", comp.name));
+                            ui.label(&*comp.name);
+                            ui.label(format!("{}", comp.count));
                             ui.end_row();
                         }
                     });
             });
 
-            ui.add_space(8.0);
-            ui.separator();
-            ui.add_space(4.0);
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(4.0);
 
-            ui.label(RichText::new("ECS Resources").strong());
-            ui.add_space(4.0);
+        ui.label(RichText::new("ECS Resources").strong());
+        ui.add_space(4.0);
 
-            egui::ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
+        egui::ScrollArea::vertical()
+            .max_height(150.0)
+            .show(ui, |ui| {
                 for resource in &stats.resources {
-                                ui.label(*resource);
+                    ui.label(format!("Resource {}", resource));
                 }
             });
 
-            ui.add_space(8.0);
-            ui.separator();
-            ui.add_space(4.0);
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(4.0);
 
-            ui.label(RichText::new("System Schedule").strong());
-            ui.add_space(4.0);
+        ui.label(RichText::new("System Schedule").strong());
+        ui.add_space(4.0);
 
-            egui::ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
+        egui::ScrollArea::vertical()
+            .max_height(150.0)
+            .show(ui, |ui| {
                 for (stage, system) in &stats.systems {
                     ui.label(format!("{} -> {}", stage, system));
                 }
             });
+    }
+
+    fn draw_sparkline(ui: &mut egui::Ui, history: &PerformanceHistory, width: f32, color: Color32) {
+        let values = history.values();
+        if values.is_empty() {
+            return;
         }
 
-        fn draw_sparkline(ui: &mut egui::Ui, history: &PerformanceHistory, width: f32, color: Color32) {
-            let values = history.values();
-            if values.is_empty() {
-                return;
-            }
+        let max_val = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let min_val = values.iter().copied().fold(f32::INFINITY, f32::min);
+        let range = max_val - min_val;
 
-            let max_val = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let min_val = values.iter().copied().fold(f32::INFINITY, f32::min);
-            let range = max_val - min_val;
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 60.0), Sense::hover());
+        let painter = ui.painter();
 
-            let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 60.0), Sense::hover());
-            let painter = ui.painter();
-
-            let points: Vec<Pos2> = values.iter().enumerate().map(|(i, &v)| {
+        let points: Vec<Pos2> = values
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| {
                 let x = rect.left() + (i as f32 / (values.len() - 1).max(1) as f32) * width;
                 let y = rect.bottom() - ((v - min_val) / range.max(0.001)) * rect.height();
                 Pos2::new(x, y)
-            }).collect();
+            })
+            .collect();
 
-            // Background
-            painter.rect_filled(rect, 4.0, Color32::from_rgb(25, 26, 29));
+        // Background
+        painter.rect_filled(rect, 4.0, Color32::from_rgb(25, 26, 29));
 
-            // Line
-            if points.len() >= 2 {
-                let stroke = Stroke::new(1.5, color);
-                for i in 1..points.len() {
-                    painter.line_segment([points[i-1], points[i]], stroke);
-                }
+        // Line
+        if points.len() >= 2 {
+            let stroke = Stroke::new(1.5, color);
+            for i in 1..points.len() {
+                painter.line_segment([points[i - 1], points[i]], stroke);
             }
-
-            // Min/Max labels
-            painter.text(
-                Pos2::new(rect.left() + 4.0, rect.top() + 4.0),
-                egui::Align2::LEFT_TOP,
-                format!("{:.1}", max_val),
-                FontId::proportional(10.0),
-                color,
-            );
-            painter.text(
-                Pos2::new(rect.left() + 4.0, rect.bottom() - 4.0),
-                egui::Align2::LEFT_BOTTOM,
-                format!("{:.1}", min_val),
-                FontId::proportional(10.0),
-                color,
-            );
         }
 
-        fn format_bytes(bytes: u64) -> String {
-            const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
-            let mut size = bytes as f64;
-            let mut unit = 0;
-            while size >= 1024.0 && unit < UNITS.len() - 1 {
-                size /= 1024.0;
-                unit += 1;
-            }
-            format!("{:.2} {}", size, UNITS[unit])
-        }
+        // Min/Max labels
+        painter.text(
+            Pos2::new(rect.left() + 4.0, rect.top() + 4.0),
+            egui::Align2::LEFT_TOP,
+            format!("{:.1}", max_val),
+            FontId::proportional(10.0),
+            color,
+        );
+        painter.text(
+            Pos2::new(rect.left() + 4.0, rect.bottom() - 4.0),
+            egui::Align2::LEFT_BOTTOM,
+            format!("{:.1}", min_val),
+            FontId::proportional(10.0),
+            color,
+        );
+    }
 
-        fn reset_layout(&mut self) {
+    fn format_bytes(bytes: u64) -> String {
+        const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
+        let mut size = bytes as f64;
+        let mut unit = 0;
+        while size >= 1024.0 && unit < UNITS.len() - 1 {
+            size /= 1024.0;
+            unit += 1;
+        }
+        format!("{:.2} {}", size, UNITS[unit])
+    }
+
+    fn reset_layout(&mut self) {
         self.current_workspace = WorkspacePreset::Default;
         self.dock_state = Some(WorkspacePreset::Default.create_dock_state());
     }
@@ -3845,12 +4406,12 @@ impl<'a> egui_dock::TabViewer for EditorTabViewer<'a> {
             EditorTab::WorldOutliner => self.editor.draw_world_outliner(ui, self.world),
             EditorTab::Details => self.editor.draw_details(ui, self.world),
             EditorTab::ContentBrowser => self.editor.draw_content_browser(ui, self.world),
-                EditorTab::AssetPreview => self.editor.draw_asset_preview(ui),
-                EditorTab::AssetDetails => self.editor.draw_asset_details(ui),
+            EditorTab::AssetPreview => self.editor.draw_asset_preview(ui),
+            EditorTab::AssetDetails => self.editor.draw_asset_details(ui),
             EditorTab::OutputLog => self.editor.draw_output_log(ui),
             EditorTab::ScriptEditor => self.editor.draw_script_editor(ui),
             EditorTab::GraphicsSettings => self.editor.draw_graphics_settings(ui),
-                EditorTab::PerformanceMonitor => self.editor.draw_performance_monitor(ui),
+            EditorTab::PerformanceMonitor => self.editor.draw_performance_monitor(ui),
         }
     }
 

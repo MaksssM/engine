@@ -7,7 +7,7 @@ use bevy_ecs::world::World;
 use egui::{Color32, RichText, Stroke, Vec2};
 
 use crate::{
-    assets_ui::{classify, AssetKind},
+    assets_ui::{AssetKind, classify},
     editor::Editor,
     feedback::TooltipExt,
     icons::{IconSize, Icons},
@@ -36,15 +36,13 @@ pub fn draw_content_browser(editor: &mut Editor, ui: &mut egui::Ui, world: &mut 
             editor.content_list_view = true;
         }
         if ui
-            .button(
-                RichText::new(Icons::GRID_VIEW)
-                    .size(14.0)
-                    .color(if !editor.content_list_view {
-                        Color32::WHITE
-                    } else {
-                        Color32::from_rgb(140, 145, 155)
-                    }),
-            )
+            .button(RichText::new(Icons::GRID_VIEW).size(14.0).color(
+                if !editor.content_list_view {
+                    Color32::WHITE
+                } else {
+                    Color32::from_rgb(140, 145, 155)
+                },
+            ))
             .engine_tooltip("Grid View", "Show assets as thumbnails in a grid", None)
             .clicked()
         {
@@ -53,7 +51,11 @@ pub fn draw_content_browser(editor: &mut Editor, ui: &mut egui::Ui, world: &mut 
         ui.separator();
         if ui
             .button(RichText::new(Icons::IMPORT).size(13.0))
-            .engine_tooltip("Import", "Import a file from disk into the current folder", None)
+            .engine_tooltip(
+                "Import",
+                "Import a file from disk into the current folder",
+                None,
+            )
             .clicked()
         {
             editor.import_dummy_resource(&editor.content_dir.clone());
@@ -181,13 +183,13 @@ pub fn draw_content_browser(editor: &mut Editor, ui: &mut egui::Ui, world: &mut 
         }
     }
 
-        // F2 on current folder (when no asset selected)
-        if editor.content_selected.is_none() && ui.input(|i| i.key_pressed(egui::Key::F2)) {
-            if editor.content_dir != editor.content_root {
-                let dir = editor.content_dir.clone();
-                editor.rename_content(&dir);
-            }
+    // F2 on current folder (when no asset selected)
+    if editor.content_selected.is_none() && ui.input(|i| i.key_pressed(egui::Key::F2)) {
+        if editor.content_dir != editor.content_root {
+            let dir = editor.content_dir.clone();
+            editor.rename_content(&dir);
         }
+    }
 
     // Main split: folder tree on the left, asset list on the right
     let tree_rect = ui.available_rect_before_wrap();
@@ -195,9 +197,12 @@ pub fn draw_content_browser(editor: &mut Editor, ui: &mut egui::Ui, world: &mut 
     let list_width = tree_rect.width() - tree_width;
 
     let mut tree_ui = ui.child_ui(
-        egui::Rect::from_min_size(ui.cursor().min, Vec2::new(tree_width, ui.available_height())),
+        egui::Rect::from_min_size(
+            ui.cursor().min,
+            Vec2::new(tree_width, ui.available_height()),
+        ),
         *ui.layout(),
-            None,
+        None,
     );
     draw_folder_tree(editor, &mut tree_ui);
 
@@ -208,17 +213,25 @@ pub fn draw_content_browser(editor: &mut Editor, ui: &mut egui::Ui, world: &mut 
             Vec2::new(list_width, ui.available_height()),
         ),
         *ui.layout(),
-            None,
+        None,
     );
     draw_asset_list(editor, &mut list_ui, world);
 
-    if editor.content_selected.as_ref().is_some_and(|p| !p.exists()) {
+    if editor
+        .content_selected
+        .as_ref()
+        .is_some_and(|p| !p.exists())
+    {
         editor.content_selected = None;
     }
 }
 
 fn draw_folder_tree(editor: &mut Editor, ui: &mut egui::Ui) {
-    ui.label(RichText::new("Folders").size(10.0).color(Color32::from_rgb(120, 135, 155)));
+    ui.label(
+        RichText::new("Folders")
+            .size(10.0)
+            .color(Color32::from_rgb(120, 135, 155)),
+    );
     ui.separator();
     egui::ScrollArea::vertical().show(ui, |ui| {
         let root = crate::assets_ui::build_folder_tree(&editor.content_root, 8);
@@ -269,7 +282,11 @@ fn draw_tree_node(
 }
 
 fn draw_asset_list(editor: &mut Editor, ui: &mut egui::Ui, world: &mut World) {
-    ui.label(RichText::new("Assets").size(10.0).color(Color32::from_rgb(120, 135, 155)));
+    ui.label(
+        RichText::new("Assets")
+            .size(10.0)
+            .color(Color32::from_rgb(120, 135, 155)),
+    );
     ui.separator();
 
     let mut entries: Vec<_> = fs::read_dir(&editor.content_dir)
@@ -330,19 +347,14 @@ fn draw_asset_list(editor: &mut Editor, ui: &mut egui::Ui, world: &mut World) {
                 let icon = content_icon(&path);
 
                 // Inline rename editor
-                let renaming_this = editor
-                    .renaming
-                    .as_ref()
-                    .is_some_and(|(p, _)| p == &path);
+                let renaming_this = editor.renaming.as_ref().is_some_and(|(p, _)| p == &path);
                 if renaming_this {
-                                    let (_, text) = editor.renaming.as_mut().unwrap();
+                    let (_, text) = editor.renaming.as_mut().unwrap();
                     let response = ui.text_edit_singleline(text);
                     if response.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                         editor.commit_rename(false);
                     }
-                    if response.has_focus()
-                        && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                    {
+                    if response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         editor.commit_rename(true);
                     }
                     ui.label(format!("{}  · {}", icon, kind.label()));
@@ -366,9 +378,11 @@ fn draw_asset_list(editor: &mut Editor, ui: &mut egui::Ui, world: &mut World) {
                     if response.double_clicked() {
                         editor.open_asset(world, &path);
                     }
-                                    response
+                    response
                 });
-                drag_result.inner.context_menu(|ui| editor.content_context_menu(ui, &path));
+                drag_result
+                    .inner
+                    .context_menu(|ui| editor.content_context_menu(ui, &path));
             }
         } else {
             let columns = ((ui.available_width() / 92.0).floor() as usize).max(1);
@@ -382,26 +396,24 @@ fn draw_asset_list(editor: &mut Editor, ui: &mut egui::Ui, world: &mut World) {
                             .unwrap_or_default()
                             .to_string_lossy()
                             .to_string();
-                        let renaming_this = editor
-                            .renaming
-                            .as_ref()
-                            .is_some_and(|(p, _)| p == path);
+                        let renaming_this =
+                            editor.renaming.as_ref().is_some_and(|(p, _)| p == path);
                         if renaming_this {
-                                                    let (_, text) = editor.renaming.as_mut().unwrap();
+                            let (_, text) = editor.renaming.as_mut().unwrap();
                             let response = ui.text_edit_singleline(text);
                             if response.lost_focus()
                                 || ui.input(|i| i.key_pressed(egui::Key::Escape))
                             {
                                 editor.commit_rename(false);
                             }
-                            if response.has_focus()
-                                && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                            if response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
                             {
                                 editor.commit_rename(true);
                             }
                             continue;
                         }
-                        let item_id = egui::Id::new(format!("content_grid_item_{}", path.display()));
+                        let item_id =
+                            egui::Id::new(format!("content_grid_item_{}", path.display()));
                         let path_clone = path.clone();
                         let drag_result = ui.dnd_drag_source(item_id, path_clone, |ui| {
                             let selected = editor.content_selected.as_ref() == Some(path);
@@ -424,9 +436,7 @@ fn draw_asset_list(editor: &mut Editor, ui: &mut egui::Ui, world: &mut World) {
                                     ui.set_min_width(68.0);
                                     ui.set_min_height(70.0);
                                     ui.vertical_centered(|ui| {
-                                        ui.label(
-                                            RichText::new(content_icon(path)).size(29.0),
-                                        );
+                                        ui.label(RichText::new(content_icon(path)).size(29.0));
                                         ui.label(egui::RichText::new(name).size(11.0));
                                         ui.label(
                                             RichText::new(classify(path).label())
@@ -444,9 +454,11 @@ fn draw_asset_list(editor: &mut Editor, ui: &mut egui::Ui, world: &mut World) {
                             if frame_response.response.double_clicked() {
                                 editor.open_asset(world, path);
                             }
-                                                        frame_response.response
+                            frame_response.response
                         });
-                        drag_result.inner.context_menu(|ui| editor.content_context_menu(ui, path));
+                        drag_result
+                            .inner
+                            .context_menu(|ui| editor.content_context_menu(ui, path));
                         if (index + 1) % columns == 0 {
                             ui.end_row();
                         }
@@ -457,28 +469,27 @@ fn draw_asset_list(editor: &mut Editor, ui: &mut egui::Ui, world: &mut World) {
 
     // Drag & drop target: allow dropping assets onto the current folder to move them
     let _ = world;
-    let (_, dropped) = ui.dnd_drop_zone::<PathBuf, _>(
-        egui::Frame::none(),
-            |_| {
-            // invisible target area
-        },
-    );
-        if let Some(arc_path) = dropped {
-            let dropped_path = arc_path.as_ref();
-            let dest = editor.content_dir.clone();
-            if let Some(file_name) = dropped_path.file_name() {
-                let target = dest.join(file_name);
-                if target != *dropped_path {
-                    if let Err(e) = fs::rename(dropped_path, &target) {
-                        editor.log.push((
-                            "ERROR".into(),
-                            format!("Move failed: {e}"),
-                        ));
-                    } else {
-                        editor.log.push((
-                            "INFO".into(),
-                            format!("Moved '{}'", target.file_name().unwrap_or_default().to_string_lossy()),
-                        ));
+    let (_, dropped) = ui.dnd_drop_zone::<PathBuf, _>(egui::Frame::none(), |_| {
+        // invisible target area
+    });
+    if let Some(arc_path) = dropped {
+        let dropped_path = arc_path.as_ref();
+        let dest = editor.content_dir.clone();
+        if let Some(file_name) = dropped_path.file_name() {
+            let target = dest.join(file_name);
+            if target != *dropped_path {
+                if let Err(e) = fs::rename(dropped_path, &target) {
+                    editor
+                        .log
+                        .push(("ERROR".into(), format!("Move failed: {e}")));
+                } else {
+                    editor.log.push((
+                        "INFO".into(),
+                        format!(
+                            "Moved '{}'",
+                            target.file_name().unwrap_or_default().to_string_lossy()
+                        ),
+                    ));
                 }
             }
         }

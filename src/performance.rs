@@ -313,9 +313,9 @@ pub struct EcsStatistics {
     pub renderable_entities: u32,
     pub camera_entities: u32,
     pub light_entities: u32,
-    pub registered_resources_count: u32,
+    pub registered_resources_count: usize,
     pub components: Vec<EcsComponentStat>,
-    pub resources: Vec<&'static str>,
+    pub resources: Vec<String>,
     pub systems: Vec<(String, String)>,
 }
 
@@ -432,7 +432,11 @@ impl PerformanceMonitor {
         self.cpu_frame_ms = cpu_ms;
         let frame_ms = delta_seconds.max(0.0) * 1000.0;
         self.frame_time_history.push(frame_ms);
-        let fps = if frame_ms > 0.0 { 1000.0 / frame_ms } else { 0.0 };
+        let fps = if frame_ms > 0.0 {
+            1000.0 / frame_ms
+        } else {
+            0.0
+        };
         self.fps_history.push(fps);
 
         self.record(Metric::FrameTimeMs, frame_ms);
@@ -537,14 +541,21 @@ impl PerformanceMonitor {
         self.frame_time_history.len()
     }
 
-    pub fn refresh_memory_statistics(&mut self, entity_count: u32) {
+    pub fn refresh_memory_statistics(
+        &mut self,
+        entity_count: u32,
+        registered_assets_count: u32,
+        mesh_assets_count: u32,
+        material_assets_count: u32,
+        texture_assets_count: Option<u32>,
+    ) {
         self.memory_stats = MemoryStatistics {
             process_working_set_bytes: query_process_memory_bytes(),
             ecs_entities_count: entity_count,
-            registered_assets_count: 0,
-            mesh_assets_count: 0,
-            material_assets_count: 0,
-            texture_assets_count: None,
+            registered_assets_count,
+            mesh_assets_count,
+            material_assets_count,
+            texture_assets_count,
             history_samples_count: self.frame_time_history.len() + self.fps_history.len(),
             history_buffer_capacity: self.history_capacity,
         };
@@ -594,10 +605,7 @@ pub fn percentile_low_fps(frame_times_ms: &[f64], fraction: f64) -> f64 {
 
 pub fn collect_ecs_statistics(world: &mut World, systems: &[(String, String)]) -> EcsStatistics {
     use crate::{
-        camera::Camera3D,
-        core::components::Light,
-        renderer::Renderable,
-        transform::Transform,
+        camera::Camera3D, core::components::Light, renderer::Renderable, transform::Transform,
     };
     let transforms = world.query::<&Transform>().iter(world).count() as u32;
     let renderables = world.query::<&Renderable>().iter(world).count() as u32;
@@ -605,13 +613,19 @@ pub fn collect_ecs_statistics(world: &mut World, systems: &[(String, String)]) -
     let lights = world.query::<&Light>().iter(world).count() as u32;
     let total_entities = world.entities().len() as u32;
 
+    let resource_names: Vec<String> = world
+        .iter_resources()
+        .map(|(info, _)| info.name().to_string())
+        .collect();
+    let registered_resources_count = resource_names.len();
+
     EcsStatistics {
         entity_count: total_entities,
         transform_entities: transforms,
         renderable_entities: renderables,
         camera_entities: cameras,
         light_entities: lights,
-        registered_resources_count: 7,
+        registered_resources_count,
         components: vec![
             EcsComponentStat {
                 name: "Transform",
@@ -630,15 +644,7 @@ pub fn collect_ecs_statistics(world: &mut World, systems: &[(String, String)]) -
                 count: lights,
             },
         ],
-        resources: vec![
-            "PerformanceMonitor",
-            "InputState",
-            "Time",
-            "FpsMeter",
-            "SceneHierarchy",
-            "Clock",
-            "EventRegistry",
-        ],
+        resources: resource_names,
         systems: systems.to_vec(),
     }
 }
@@ -748,5 +754,75 @@ mod tests {
         let monitor = PerformanceMonitor::default();
         assert_eq!(monitor.frame().gpu_frame_time_ms, None);
         assert!(!monitor.gpu_timestamp_supported);
+    }
+
+    #[test]
+    fn renderer_statistics_use_real_counters() {
+        let stats = RendererStatistics {
+            renderable_entities: 10,
+            visible_entities: 8,
+            draw_calls: 8,
+            triangles: 36,
+            vertices: 24,
+            meshes: 2,
+            materials: 1,
+            textures: None,
+            lights: 1,
+            shadow_casters: 3,
+            passes: 2,
+            gpu_frame_time_ms: None,
+        };
+        assert_eq!(stats.draw_calls, 8);
+        assert_eq!(stats.vertices, 24);
+        assert_eq!(stats.shadow_casters, 3);
+        assert_eq!(stats.textures, None);
+        assert_eq!(stats.gpu_frame_time_ms, None);
+    }
+
+    #[test]
+    fn ecs_statistics_collect_from_real_world() {
+        use crate::transform::Transform;
+        let mut world = World::new();
+        world.spawn(Transform::default());
+        world.spawn(Transform::default());
+        let systems = vec![("test".to_string(), "Update".to_string())];
+        let stats = collect_ecs_statistics(&mut world, &systems);
+        assert_eq!(stats.entity_count, 2);
+        assert_eq!(stats.transform_entities, 2);
+        assert!(stats.registered_resources_count > 0);
+        assert!(!stats.resources.is_empty());
+        assert_eq!(stats.systems.len(), 1);
+    }
+
+    #[test]
+    fn ecs_statistics_reports_zero_for_empty_world() {
+        let mut world = World::new();
+        let stats = collect_ecs_statistics(&mut world, &[]);
+        assert_eq!(stats.entity_count, 0);
+        assert_eq!(stats.transform_entities, 0);
+        assert_eq!(stats.renderable_entities, 0);
+        assert_eq!(stats.camera_entities, 0);
+        assert_eq!(stats.light_entities, 0);
+    }
+
+    #[test]
+    fn memory_statistics_use_provided_counts() {
+        let mut monitor = PerformanceMonitor::new(4);
+        monitor.refresh_memory_statistics(10, 5, 3, 2, None);
+        assert_eq!(monitor.memory_stats.ecs_entities_count, 10);
+        assert_eq!(monitor.memory_stats.registered_assets_count, 5);
+        assert_eq!(monitor.memory_stats.mesh_assets_count, 3);
+        assert_eq!(monitor.memory_stats.material_assets_count, 2);
+        assert_eq!(monitor.memory_stats.texture_assets_count, None);
+    }
+
+    #[test]
+    fn editor_and_play_mode_time_are_separate() {
+        let mut monitor = PerformanceMonitor::new(4);
+        monitor.begin_frame();
+        monitor.end_frame(1.0 / 60.0);
+        let frame = monitor.frame();
+        assert!((frame.fps - 60.0).abs() < 1.0);
+        assert!(frame.frame_time_ms > 0.0);
     }
 }

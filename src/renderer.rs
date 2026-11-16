@@ -123,6 +123,7 @@ pub struct MeshAsset {
     pub(crate) vertex_buffer: wgpu::Buffer,
     pub(crate) index_buffer: wgpu::Buffer,
     pub(crate) index_count: u32,
+    pub(crate) vertex_count: u32,
     pub(crate) model_layout: wgpu::BindGroupLayout,
     pub(crate) model_buffers: HashMap<ModelKey, wgpu::Buffer>,
     pub(crate) model_bind_groups: HashMap<ModelKey, wgpu::BindGroup>,
@@ -164,11 +165,15 @@ pub struct RenderSnapshot {
 pub fn collect_render_snapshot(world: &mut World) -> RenderSnapshot {
     let renderables = collect_visible_renderables(world);
     let camera = world
-        .query::<(&Camera3D, &GlobalTransform, Option<&CameraMarker>, Option<&Visible>)>()
+        .query::<(
+            &Camera3D,
+            &GlobalTransform,
+            Option<&CameraMarker>,
+            Option<&Visible>,
+        )>()
         .iter(world)
         .filter(|(_, _, marker, visible)| {
-            marker.is_none_or(|marker| marker.is_main)
-                && visible.is_none_or(|visible| visible.0)
+            marker.is_none_or(|marker| marker.is_main) && visible.is_none_or(|visible| visible.0)
         })
         .next()
         .map(|(camera, transform, _, _)| (*camera, *transform));
@@ -179,7 +184,10 @@ pub fn collect_render_snapshot(world: &mut World) -> RenderSnapshot {
         .find_map(|(light, transform, _)| match light.kind {
             LightKind::Directional => Some((
                 light.color,
-                transform.0.transform_vector3(Vec3::NEG_Z).normalize_or_zero(),
+                transform
+                    .0
+                    .transform_vector3(Vec3::NEG_Z)
+                    .normalize_or_zero(),
             )),
             _ => None,
         });
@@ -215,14 +223,24 @@ mod tests {
         let visible_material = Handle::<MaterialAsset>::from_id(2);
         let hidden_mesh = Handle::<MeshAsset>::from_id(3);
         let hidden_material = Handle::<MaterialAsset>::from_id(4);
-        world.spawn((Renderable {
-            mesh: visible_mesh,
-            material: visible_material,
-        }, Transform::default(), GlobalTransform::default(), Visible(true)));
-        world.spawn((Renderable {
-            mesh: hidden_mesh,
-            material: hidden_material,
-        }, Transform::default(), GlobalTransform::default(), Visible(false)));
+        world.spawn((
+            Renderable {
+                mesh: visible_mesh,
+                material: visible_material,
+            },
+            Transform::default(),
+            GlobalTransform::default(),
+            Visible(true),
+        ));
+        world.spawn((
+            Renderable {
+                mesh: hidden_mesh,
+                material: hidden_material,
+            },
+            Transform::default(),
+            GlobalTransform::default(),
+            Visible(false),
+        ));
 
         let visible = collect_visible_renderables(&mut world);
         assert_eq!(visible.len(), 1);
@@ -287,6 +305,8 @@ pub struct Renderer {
     pub frame_time_ms: f64,
     pub frame_draw_calls: u32,
     pub frame_triangles: u64,
+    pub frame_vertices: u64,
+    pub frame_shadow_casters: u64,
     pub frame_passes: u32,
     pub _shader_variant: PhantomData<ShaderVariant>,
 }
@@ -641,6 +661,7 @@ impl Renderer {
                 vertex_buffer,
                 index_buffer,
                 index_count: index_data.len() as u32,
+                vertex_count: vertex_data.len() as u32,
                 model_layout,
                 model_buffers: HashMap::new(),
                 model_bind_groups: HashMap::new(),
@@ -869,6 +890,8 @@ impl Renderer {
             frame_time_ms: 0.0,
             frame_draw_calls: 0,
             frame_triangles: 0,
+            frame_vertices: 0,
+            frame_shadow_casters: 0,
             frame_passes: 0,
             color_layout,
             _shader_variant: PhantomData,
@@ -1012,10 +1035,9 @@ impl Renderer {
         self.queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&camera));
         let _ = delta_seconds;
-        let (light_color, light_direction) = snapshot.directional_light.unwrap_or((
-            [1.0, 1.0, 1.0],
-            Vec3::new(-4.0, -8.0, -4.0).normalize(),
-        ));
+        let (light_color, light_direction) = snapshot
+            .directional_light
+            .unwrap_or(([1.0, 1.0, 1.0], Vec3::new(-4.0, -8.0, -4.0).normalize()));
         let light_view = Mat4::look_at_rh(-light_direction * 10.0, Vec3::ZERO, Vec3::Y);
         let light_projection = Mat4::orthographic_rh(-8.0, 8.0, -8.0, 8.0, 0.1, 40.0);
         let light = LightUniform {
@@ -1146,6 +1168,8 @@ impl Renderer {
         });
         let mut draw_calls = 0u32;
         let mut triangles = 0u64;
+        let mut vertices = 0u64;
+        let mut shadow_casters = 0u64;
         let mut passes = 1u32;
 
         for instance in renderables {
@@ -1176,6 +1200,8 @@ impl Renderer {
             pass.draw_indexed(0..mesh.index_count, 0, 0..1);
             draw_calls = draw_calls.saturating_add(1);
             triangles = triangles.saturating_add((mesh.index_count / 3) as u64);
+            vertices = vertices.saturating_add(mesh.vertex_count as u64);
+            shadow_casters = shadow_casters.saturating_add(1);
         }
         drop(pass);
 
@@ -1207,6 +1233,8 @@ impl Renderer {
         self.queue.submit([encoder.finish()]);
         self.frame_draw_calls = draw_calls;
         self.frame_triangles = triangles;
+        self.frame_vertices = vertices;
+        self.frame_shadow_casters = shadow_casters;
         self.frame_passes = passes;
         Ok((frame, view))
     }

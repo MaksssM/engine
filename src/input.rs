@@ -168,13 +168,16 @@ mod tests {
         input.set_mouse_position(7.0, 5.0);
         input.press_mouse(MouseButton::Left);
         input.add_mouse_wheel(1.0, -2.0);
-        assert_eq!(UiInput::from_input(&input), UiInput {
-            position: (7.0, 5.0),
-            delta: (7.0, 5.0),
-            wheel: (1.0, -2.0),
-            left_down: true,
-            left_pressed: true,
-            left_released: false,
-        });
+        assert_eq!(
+            UiInput::from_input(&input),
+            UiInput {
+                position: (7.0, 5.0),
+                delta: (7.0, 5.0),
+                wheel: (1.0, -2.0),
+                left_down: true,
+                left_pressed: true,
+                left_released: false,
+            }
+        );
     }
 }

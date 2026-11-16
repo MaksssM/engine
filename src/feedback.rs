@@ -1,9 +1,9 @@
-use std::{path::PathBuf, time::Instant};
 use bevy_ecs::entity::Entity;
 use egui::{
-    Align, Align2, Area, Color32, Context, CornerRadius, Frame, Id, Key, Layout, Order,
-    Rect, Response, RichText, Stroke, Ui, Vec2,
+    Align, Align2, Area, Color32, Context, CornerRadius, Frame, Id, Key, Layout, Order, Rect,
+    Response, RichText, Stroke, Ui, Vec2,
 };
+use std::{path::PathBuf, time::Instant};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NotificationLevel {
@@ -59,7 +59,12 @@ pub struct NotificationManager {
 }
 
 impl NotificationManager {
-    pub fn push(&mut self, level: NotificationLevel, title: impl Into<String>, message: impl Into<String>) {
+    pub fn push(
+        &mut self,
+        level: NotificationLevel,
+        title: impl Into<String>,
+        message: impl Into<String>,
+    ) {
         let notif = Notification {
             id: self.next_id,
             level,
@@ -94,7 +99,8 @@ impl NotificationManager {
     }
 
     pub fn update(&mut self) {
-        self.notifications.retain(|n| n.created_at.elapsed().as_secs_f32() < n.duration);
+        self.notifications
+            .retain(|n| n.created_at.elapsed().as_secs_f32() < n.duration);
     }
 
     pub fn dismiss(&mut self, id: u64) {
@@ -160,15 +166,18 @@ impl NotificationManager {
                                                     .color(Color32::WHITE)
                                                     .size(12.5),
                                             );
-                                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                                if ui
-                                                    .add(egui::Button::new("✕").frame(false))
-                                                    .on_hover_text("Dismiss")
-                                                    .clicked()
-                                                {
-                                                    to_dismiss = Some(notif.id);
-                                                }
-                                            });
+                                            ui.with_layout(
+                                                Layout::right_to_left(Align::Center),
+                                                |ui| {
+                                                    if ui
+                                                        .add(egui::Button::new("✕").frame(false))
+                                                        .on_hover_text("Dismiss")
+                                                        .clicked()
+                                                    {
+                                                        to_dismiss = Some(notif.id);
+                                                    }
+                                                },
+                                            );
                                         });
 
                                         if !notif.message.is_empty() {
@@ -187,7 +196,11 @@ impl NotificationManager {
                                     ui.cursor().min,
                                     Vec2::new(ui.available_width() * progress, 2.0),
                                 );
-                                ui.painter().rect_filled(bar_rect, CornerRadius::same(1), border_color);
+                                ui.painter().rect_filled(
+                                    bar_rect,
+                                    CornerRadius::same(1),
+                                    border_color,
+                                );
                                 ui.add_space(2.0);
                             });
 
@@ -206,14 +219,19 @@ pub fn apply_feedback_styles(ctx: &Context) {
     ctx.style_mut(|style| {
         style.interaction.tooltip_delay = 0.35;
         // Fine-tune interaction visual states
-        style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, Color32::from_rgb(82, 166, 235));
-        style.visuals.widgets.active.bg_stroke = Stroke::new(1.5_f32, Color32::from_rgb(100, 190, 255));
-        style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, Color32::from_rgb(70, 74, 80));
-        style.visuals.widgets.open.bg_stroke = Stroke::new(1.0_f32, Color32::from_rgb(82, 166, 235));
+        style.visuals.widgets.hovered.bg_stroke =
+            Stroke::new(1.0_f32, Color32::from_rgb(82, 166, 235));
+        style.visuals.widgets.active.bg_stroke =
+            Stroke::new(1.5_f32, Color32::from_rgb(100, 190, 255));
+        style.visuals.widgets.inactive.bg_stroke =
+            Stroke::new(1.0_f32, Color32::from_rgb(70, 74, 80));
+        style.visuals.widgets.open.bg_stroke =
+            Stroke::new(1.0_f32, Color32::from_rgb(82, 166, 235));
         style.visuals.selection.bg_fill = Color32::from_rgb(38, 79, 120);
         style.visuals.selection.stroke = Stroke::new(1.0_f32, Color32::from_rgb(82, 166, 235));
         // Disabled text should be clearly muted
-        style.visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, Color32::from_rgb(110, 115, 125));
+        style.visuals.widgets.inactive.fg_stroke =
+            Stroke::new(1.0_f32, Color32::from_rgb(110, 115, 125));
     });
 }
 
@@ -309,7 +327,11 @@ impl ConfirmDialog {
         // Dim backdrop
         let screen_rect = ctx.content_rect();
         ctx.layer_painter(egui::LayerId::new(Order::Middle, Id::new("modal_backdrop")))
-            .rect_filled(screen_rect, CornerRadius::ZERO, Color32::from_rgba_unmultiplied(10, 12, 16, 170));
+            .rect_filled(
+                screen_rect,
+                CornerRadius::ZERO,
+                Color32::from_rgba_unmultiplied(10, 12, 16, 170),
+            );
 
         let title = match self {
             Self::DeleteEntities { targets, .. } => {
@@ -527,4 +549,3 @@ mod tests {
         assert_eq!(NotificationLevel::Error.icon(), "✕");
     }
 }
-

@@ -12,21 +12,14 @@ use winit::{
 
 use crate::{
     camera::{Camera3D, CameraController},
-    core::{
-        lifecycle::GameLoop,
-        resources::init_core_resources,
-        systems::SystemStage,
-    },
+    core::{lifecycle::GameLoop, resources::init_core_resources, systems::SystemStage},
     ecs::Ecs,
     editor::Editor,
     events::{EventCursor, Events},
     input::{MouseButton as EngineMouseButton, UiInput},
-    performance::{
-        collect_ecs_statistics, MemoryStatistics, Metric, PerformanceMonitor, RendererStatistics,
-        Scope,
-    },
+    performance::{Metric, PerformanceMonitor, RendererStatistics, collect_ecs_statistics},
     quality::QualityPreset,
-    renderer::{collect_render_snapshot, Renderable, Renderer},
+    renderer::{Renderable, Renderer, collect_render_snapshot},
     time::{Clock, FixedTimestep, FpsMeter},
     transform::Transform,
 };
@@ -351,8 +344,7 @@ impl EngineApp {
             .record(Metric::SimulationUpdateMs, loop_timings.update_ms);
         self.performance
             .record(Metric::PostUpdateMs, loop_timings.post_ms);
-        self.performance
-            .add_fixed_updates(loop_timings.steps);
+        self.performance.add_fixed_updates(loop_timings.steps);
 
         // Rendering resource preparation is once per frame; simulation timing is
         // owned by GameLoop so FixedUpdate cannot be executed twice.
@@ -398,12 +390,12 @@ impl EngineApp {
                         visible_entities: render_snapshot.renderables.len() as u32,
                         draw_calls: renderer.frame_draw_calls,
                         triangles: renderer.frame_triangles,
-                        vertices: renderer.frame_triangles * 3,
-                        meshes: render_snapshot.renderables.len() as u32,
-                        materials: render_snapshot.renderables.len() as u32,
+                        vertices: renderer.frame_vertices,
+                        meshes: renderer.mesh_assets.len() as u32,
+                        materials: renderer.material_assets.len() as u32,
                         textures: None,
-                        lights: if render_snapshot.directional_light.is_some() { 1 } else { 0 },
-                        shadow_casters: if render_snapshot.directional_light.is_some() { 1 } else { 0 },
+                        lights: render_snapshot.directional_light.is_some() as u32,
+                        shadow_casters: renderer.frame_shadow_casters as u32,
                         passes: renderer.frame_passes,
                         gpu_frame_time_ms: None,
                     };
@@ -414,11 +406,25 @@ impl EngineApp {
                         .scheduler
                         .timings()
                         .iter()
-                        .map(|t| (t.name.clone(), format!("{:?} ({:.3} ms)", t.stage, t.last_ms)))
+                        .map(|t| {
+                            (
+                                t.name.clone(),
+                                format!("{:?} ({:.3} ms)", t.stage, t.last_ms),
+                            )
+                        })
                         .collect::<Vec<_>>();
-                    let ecs_stats = crate::performance::collect_ecs_statistics(&mut self.ecs.world, &systems_info);
+                    let ecs_stats = crate::performance::collect_ecs_statistics(
+                        &mut self.ecs.world,
+                        &systems_info,
+                    );
                     self.performance.set_ecs(ecs_stats);
-                    self.performance.refresh_memory_statistics(entity_count as u32);
+                    self.performance.refresh_memory_statistics(
+                        entity_count as u32,
+                        (renderer.mesh_assets.len() + renderer.material_assets.len()) as u32,
+                        renderer.mesh_assets.len() as u32,
+                        renderer.material_assets.len() as u32,
+                        None,
+                    );
                     self.ecs.world.insert_resource(self.performance.clone());
 
                     if let (Some(window), Some(editor)) =
@@ -451,6 +457,8 @@ impl EngineApp {
                 Err(wgpu::SurfaceError::Other) => warn!("GPU surface error"),
             }
         }
+
+        self.performance.end_frame(frame_time.as_secs_f64());
 
         if self.fps.record_frame(frame_time).is_some() {
             let fixed_step_ms = self
@@ -585,7 +593,12 @@ impl EngineApp {
             .ecs
             .world
             .get_resource::<Events<WindowEvent>>()
-            .map(|events| events.read(&mut self.window_event_cursor).cloned().collect::<Vec<_>>())
+            .map(|events| {
+                events
+                    .read(&mut self.window_event_cursor)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default();
         for event in pending_events {
             if let WindowEvent::KeyboardInput { event, .. } = event
