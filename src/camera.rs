@@ -1,7 +1,8 @@
 use bevy_ecs::component::Component;
 use glam::{Mat4, Vec3};
+use serde::{Deserialize, Serialize};
 
-#[derive(Component, Clone, Copy, Debug)]
+#[derive(Component, Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Camera3D {
     pub fov: f32,
     pub near: f32,

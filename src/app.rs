@@ -258,32 +258,16 @@ impl EngineApp {
         }
         self.process_events();
 
-        let updates = self
-            .timestep
-            .as_mut()
-            .expect("timestep initialized with clock")
-            .add_frame(frame_time);
-        let step_seconds = self
-            .timestep
-            .as_ref()
-            .expect("timestep initialized")
-            .step()
-            .as_secs_f32();
-
-        // Always run renderer.update at least once so model buffers are created
-        // before the first render_scene call. Camera controller only advances when
-        // there are actual fixed-timestep updates.
-        if updates > 0 {
-            self.update_camera_controller(step_seconds);
-        }
-        for _ in 0..updates.max(1) {
-            if let Some(renderer) = self.renderer.as_mut() {
-                renderer.update(&mut self.ecs.world, step_seconds);
-            }
-        }
-
+        let step_seconds = self.game_loop.fixed_step as f32;
         self.game_loop
             .tick(&mut self.ecs.world, frame_time.as_secs_f64());
+
+        // Rendering resource preparation is once per frame; simulation timing is
+        // owned by GameLoop so FixedUpdate cannot be executed twice.
+        self.update_camera_controller(step_seconds);
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.update(&mut self.ecs.world, step_seconds);
+        }
         let entity_count = self
             .ecs
             .world

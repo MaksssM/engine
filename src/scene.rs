@@ -1,15 +1,17 @@
 use crate::{
+    camera::Camera3D,
     core::{
-        components::{FolderGroup, Locked, Visible},
+        components::{FolderGroup, Light, Locked, MeshFilter, MeshRenderer, Visible},
         uid::Uid,
     },
     ecs::Name,
     transform::Transform,
 };
+use bevy_ecs::component::Component;
 use bevy_ecs::entity::Entity;
 use glam::Vec3;
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::collections::{BTreeMap, HashMap};
 
 fn default_rotation() -> [f32; 4] {
     [0.0, 0.0, 0.0, 1.0]
@@ -19,6 +21,94 @@ fn default_scale() -> [f32; 3] {
 }
 fn default_visible() -> bool {
     true
+}
+
+const CURRENT_SCENE_VERSION: u32 = 2;
+
+pub trait SceneComponent:
+    Component + Clone + Serialize + DeserializeOwned + Send + Sync + 'static
+{
+    const KEY: &'static str;
+}
+
+#[derive(Default)]
+pub struct SceneComponentRegistry {
+    serializers: BTreeMap<
+        &'static str,
+        Box<dyn Fn(&bevy_ecs::world::World, Entity) -> Option<ron::Value> + Send + Sync>,
+    >,
+    restorers: BTreeMap<
+        &'static str,
+        Box<
+            dyn Fn(&mut bevy_ecs::world::World, Entity, &ron::Value) -> Result<(), String>
+                + Send
+                + Sync,
+        >,
+    >,
+}
+
+impl SceneComponentRegistry {
+    pub fn register<T: SceneComponent>(&mut self) {
+        self.serializers.insert(
+            T::KEY,
+            Box::new(|world, entity| {
+                world
+                    .get::<T>(entity)
+                    .and_then(|component| ron::from_str(&ron::to_string(component).ok()?).ok())
+            }),
+        );
+        self.restorers.insert(
+            T::KEY,
+            Box::new(|world, entity, value| {
+                let component: T =
+                    ron::from_str(&ron::to_string(value).map_err(|error| error.to_string())?)
+                        .map_err(|error| error.to_string())?;
+                world.entity_mut(entity).insert(component);
+                Ok(())
+            }),
+        );
+    }
+
+    pub fn serialize_entity(
+        &self,
+        world: &bevy_ecs::world::World,
+        entity: Entity,
+    ) -> BTreeMap<String, ron::Value> {
+        self.serializers
+            .iter()
+            .filter_map(|(key, serializer)| {
+                serializer(world, entity).map(|value| ((*key).to_string(), value))
+            })
+            .collect()
+    }
+
+    pub fn restore_entity(
+        &self,
+        world: &mut bevy_ecs::world::World,
+        entity: Entity,
+        values: &BTreeMap<String, ron::Value>,
+    ) -> Result<(), String> {
+        for (key, value) in values {
+            if let Some(restorer) = self.restorers.get(key.as_str()) {
+                restorer(world, entity, value)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct SerializedComponents {
+    #[serde(default)]
+    pub custom: BTreeMap<String, ron::Value>,
+    #[serde(default)]
+    pub mesh_filter: Option<MeshFilter>,
+    #[serde(default)]
+    pub mesh_renderer: Option<MeshRenderer>,
+    #[serde(default)]
+    pub camera: Option<Camera3D>,
+    #[serde(default)]
+    pub light: Option<Light>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -38,11 +128,28 @@ pub struct SceneEntity {
     pub locked: bool,
     #[serde(default)]
     pub folder: Option<String>,
+    #[serde(default)]
+    pub components: SerializedComponents,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Scene {
+    #[serde(default = "default_scene_version")]
+    pub version: u32,
     pub entities: Vec<SceneEntity>,
+}
+
+fn default_scene_version() -> u32 {
+    1
+}
+
+impl Default for Scene {
+    fn default() -> Self {
+        Self {
+            version: CURRENT_SCENE_VERSION,
+            entities: Vec::new(),
+        }
+    }
 }
 
 impl Scene {
@@ -90,6 +197,7 @@ impl Scene {
             visible: true,
             locked: false,
             folder: None,
+            components: SerializedComponents::default(),
         });
         index
     }
@@ -176,6 +284,18 @@ impl SceneManager {
                     Locked(item.locked),
                 ))
                 .id();
+            if let Some(component) = &item.components.mesh_filter {
+                world.entity_mut(entity).insert(component.clone());
+            }
+            if let Some(component) = &item.components.mesh_renderer {
+                world.entity_mut(entity).insert(component.clone());
+            }
+            if let Some(component) = item.components.camera {
+                world.entity_mut(entity).insert(component);
+            }
+            if let Some(component) = item.components.light {
+                world.entity_mut(entity).insert(component);
+            }
             if let Some(mut registry) =
                 world.get_resource_mut::<crate::core::resources::PersistentIdRegistry>()
             {

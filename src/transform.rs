@@ -1,7 +1,8 @@
 use bevy_ecs::{component::Component, entity::Entity, world::World};
 use glam::{Mat4, Quat, Vec3};
+use serde::{Deserialize, Serialize};
 
-#[derive(Component, Clone, Copy, Debug, PartialEq)]
+#[derive(Component, Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Transform {
     pub translation: Vec3,
     pub rotation: Quat,

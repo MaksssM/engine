@@ -3175,6 +3175,11 @@ impl Editor {
             Vec::new()
         };
         for e in targets {
+            if let Some(uid) = world.get::<crate::core::uid::Uid>(e).copied() {
+                if let Some(mut registry) = world.get_resource_mut::<crate::core::resources::PersistentIdRegistry>() {
+                    registry.unregister(uid);
+                }
+            }
             let _ = world.despawn(e);
         }
         self.selected = None;
@@ -3201,6 +3206,13 @@ impl Editor {
                 folder: world
                     .get::<crate::core::components::FolderGroup>(entity)
                     .map(|value| value.0.clone()),
+                components: crate::scene::SerializedComponents {
+                    custom: Default::default(),
+                    mesh_filter: world.get::<crate::core::components::MeshFilter>(entity).cloned(),
+                    mesh_renderer: world.get::<crate::core::components::MeshRenderer>(entity).cloned(),
+                    camera: world.get::<crate::camera::Camera3D>(entity).copied(),
+                    light: world.get::<crate::core::components::Light>(entity).copied(),
+                },
             });
         }
         if let Some(parent) = self.scene_path.parent() {

@@ -11,6 +11,8 @@ use std::fmt;
 pub enum SystemStage {
     /// Runs before anything else (resource init, pre-frame jobs).
     PreUpdate,
+    /// Editor-only work that remains active outside play mode.
+    EditorUpdate,
     /// Fixed-rate update for physics and deterministic simulation.
     FixedUpdate,
     /// Main per-frame update.

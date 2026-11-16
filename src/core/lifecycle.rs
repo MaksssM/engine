@@ -31,37 +31,51 @@ impl GameLoop {
         }
     }
 
-    /// Run one frame. FixedUpdate is executed as many times as needed,
-    /// capped to avoid a spiral of death after a stalled frame.
+    /// Run one frame with editor work always active and simulation gated by mode.
     pub fn tick(&mut self, world: &mut World, delta_seconds: f64) {
         if let Some(mut time) = world.get_resource_mut::<EngineTime>() {
-            let _ = time.clock.tick();
             time.delta_seconds = delta_seconds as f32;
             time.fixed_delta_seconds = self.fixed_step as f32;
             time.frame_number = time.frame_number.saturating_add(1);
         }
-
         self.scheduler
             .run_stage(super::systems::SystemStage::PreUpdate, world);
-
-        self.fixed_accumulator = (self.fixed_accumulator + delta_seconds)
-            .min(self.fixed_step * f64::from(self.max_fixed_steps));
-        let mut steps = 0;
-        while self.fixed_accumulator >= self.fixed_step && steps < self.max_fixed_steps {
-            self.scheduler
-                .run_stage(super::systems::SystemStage::FixedUpdate, world);
-            self.fixed_accumulator -= self.fixed_step;
-            steps += 1;
-        }
-
         self.scheduler
-            .run_stage(super::systems::SystemStage::Update, world);
+            .run_stage(super::systems::SystemStage::EditorUpdate, world);
+
+        let mode = world
+            .get_resource::<EngineMode>()
+            .copied()
+            .unwrap_or_default();
+        let simulation_enabled = matches!(mode, EngineMode::Playing);
+        if simulation_enabled {
+            self.fixed_accumulator += delta_seconds.max(0.0);
+            let mut steps = 0;
+            while self.fixed_accumulator >= self.fixed_step && steps < self.max_fixed_steps {
+                self.scheduler
+                    .run_stage(super::systems::SystemStage::FixedUpdate, world);
+                self.fixed_accumulator -= self.fixed_step;
+                steps += 1;
+            }
+            self.scheduler
+                .run_stage(super::systems::SystemStage::Update, world);
+        }
         self.scheduler
             .run_stage(super::systems::SystemStage::PostUpdate, world);
         self.scheduler
             .run_stage(super::systems::SystemStage::LateUpdate, world);
         self.scheduler
             .run_stage(super::systems::SystemStage::PreRender, world);
+    }
+
+    /// Execute exactly one fixed simulation tick while paused.
+    pub fn step(&mut self, world: &mut World) {
+        if world.get_resource::<EngineMode>().copied() == Some(EngineMode::Paused) {
+            self.scheduler
+                .run_stage(super::systems::SystemStage::FixedUpdate, world);
+            self.scheduler
+                .run_stage(super::systems::SystemStage::PostUpdate, world);
+        }
     }
 
     pub fn is_playing(world: &World) -> bool {
@@ -93,6 +107,7 @@ mod tests {
         let fixed = Arc::new(Mutex::new(0));
         let update = Arc::new(Mutex::new(0));
         let mut loop_ = GameLoop::default();
+        GameLoop::set_playing(&mut world, true);
         {
             let fixed = fixed.clone();
             loop_
