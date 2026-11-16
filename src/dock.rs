@@ -13,10 +13,11 @@ pub enum EditorTab {
     OutputLog,
     ScriptEditor,
     GraphicsSettings,
+    PerformanceMonitor,
 }
 
 impl EditorTab {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Viewport,
         Self::WorldOutliner,
         Self::Details,
@@ -26,6 +27,7 @@ impl EditorTab {
         Self::OutputLog,
         Self::ScriptEditor,
         Self::GraphicsSettings,
+        Self::PerformanceMonitor,
     ];
 
     pub fn title(&self) -> &'static str {
@@ -39,6 +41,7 @@ impl EditorTab {
             Self::OutputLog => "Output Log",
             Self::ScriptEditor => "Script Editor",
             Self::GraphicsSettings => "Graphics Settings",
+            Self::PerformanceMonitor => "Performance Monitor",
         }
     }
 
@@ -53,6 +56,7 @@ impl EditorTab {
             Self::OutputLog => "log",
             Self::ScriptEditor => "script",
             Self::GraphicsSettings => "graphics",
+            Self::PerformanceMonitor => "performance",
         }
     }
 }
@@ -113,7 +117,11 @@ impl WorkspacePreset {
                 let [_viewport_node, _bottom_node] = state.main_surface_mut().split_below(
                     viewport_node,
                     0.70,
-                    vec![EditorTab::ContentBrowser, EditorTab::OutputLog],
+                    vec![
+                        EditorTab::ContentBrowser,
+                        EditorTab::OutputLog,
+                        EditorTab::PerformanceMonitor,
+                    ],
                 );
                 state
             }
@@ -331,6 +339,7 @@ pub fn smart_open_tab(dock_state: &mut DockState<EditorTab>, tab: EditorTab) {
         EditorTab::OutputLog => Some((EditorTab::ContentBrowser, egui_dock::Split::Right, 0.5)),
         EditorTab::ScriptEditor => Some((EditorTab::Viewport, egui_dock::Split::Below, 0.35)),
         EditorTab::GraphicsSettings => Some((EditorTab::Details, egui_dock::Split::Below, 0.5)),
+        EditorTab::PerformanceMonitor => Some((EditorTab::OutputLog, egui_dock::Split::Right, 0.5)),
     };
 
     if let Some((neighbor, split, frac)) = preferred_neighbor {

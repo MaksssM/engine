@@ -285,6 +285,9 @@ pub struct Renderer {
     pub menu_open: Option<usize>,
     pub show_stats: bool,
     pub frame_time_ms: f64,
+    pub frame_draw_calls: u32,
+    pub frame_triangles: u64,
+    pub frame_passes: u32,
     pub _shader_variant: PhantomData<ShaderVariant>,
 }
 
@@ -864,6 +867,9 @@ impl Renderer {
             menu_open: None,
             show_stats: true,
             frame_time_ms: 0.0,
+            frame_draw_calls: 0,
+            frame_triangles: 0,
+            frame_passes: 0,
             color_layout,
             _shader_variant: PhantomData,
         };
@@ -1138,6 +1144,10 @@ impl Renderer {
             timestamp_writes: None,
             occlusion_query_set: None,
         });
+        let mut draw_calls = 0u32;
+        let mut triangles = 0u64;
+        let mut passes = 1u32;
+
         for instance in renderables {
             let entity = instance.entity;
             let renderable = instance.renderable;
@@ -1164,6 +1174,8 @@ impl Renderer {
             pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
             pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
             pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+            draw_calls = draw_calls.saturating_add(1);
+            triangles = triangles.saturating_add((mesh.index_count / 3) as u64);
         }
         drop(pass);
 
@@ -1171,6 +1183,7 @@ impl Renderer {
             && let (Some(pipeline), Some(bind_group)) =
                 (self.post_pipeline.as_ref(), self.post_bind_group.as_ref())
         {
+            passes = passes.saturating_add(1);
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("post pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1192,6 +1205,9 @@ impl Renderer {
         }
 
         self.queue.submit([encoder.finish()]);
+        self.frame_draw_calls = draw_calls;
+        self.frame_triangles = triangles;
+        self.frame_passes = passes;
         Ok((frame, view))
     }
 

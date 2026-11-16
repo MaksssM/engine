@@ -6,7 +6,7 @@ use std::{
 };
 
 use bevy_ecs::{entity::Entity, world::World};
-use egui::{Color32, Context, Key, RichText, Sense, Stroke, Vec2};
+use egui::{Color32, Context, FontId, Key, Pos2, RichText, Sense, Stroke, Vec2};
 use glam::Vec3;
 use serde::{Deserialize, Serialize};
 use winit::{event::WindowEvent, window::Window};
@@ -24,6 +24,7 @@ use crate::{
         TooltipExt,
     },
     icons::{IconSize, Icons},
+        performance::{PerformanceMonitor, PerformanceHistory},
     scene::{Scene, SceneEntity},
     transform::{Parent, Transform},
 };
@@ -3275,7 +3276,551 @@ impl Editor {
             let _ = std::fs::write("editor-layout.ron", s);
         }
     }
-    fn reset_layout(&mut self) {
+    fn draw_performance_monitor(&mut self, ui: &mut egui::Ui) {
+            use crate::performance::*;
+
+            let performance = ui.ctx().data_mut(|d| {
+                d.get_temp::<PerformanceMonitor>(egui::Id::new("performance_monitor"))
+            });
+
+            if let Some(perf) = performance {
+                let mut perf_clone = perf.clone();
+
+                // Top bar with toggle and settings
+                ui.horizontal(|ui| {
+                    ui.heading("PERFORMANCE MONITOR");
+                    ui.separator();
+
+                    let mut enabled = perf_clone.enabled;
+                    if ui.checkbox(&mut enabled, "Enabled").changed() {
+                        perf_clone.enabled = enabled;
+                    }
+
+                    let mut detailed = perf_clone.detailed;
+                    if ui.checkbox(&mut detailed, "Detailed").changed() {
+                        perf_clone.detailed = detailed;
+                    }
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Clear History").clicked() {
+                                                perf_clone.reset();
+                        }
+                    });
+                });
+
+                ui.separator();
+
+                // Tabs
+                let tab_names = ["Overview", "CPU Profiler", "Renderer", "Memory", "ECS Inspector"];
+                let mut selected_tab = 0;
+
+                ui.horizontal(|ui| {
+                    for (i, name) in tab_names.iter().enumerate() {
+                        if ui.selectable_label(selected_tab == i, *name).clicked() {
+                            selected_tab = i;
+                        }
+                    }
+                });
+
+                ui.separator();
+
+                match selected_tab {
+                    0 => Self::draw_perf_overview(ui, &perf_clone),
+                    1 => Self::draw_perf_cpu_profiler(ui, &perf_clone),
+                    2 => Self::draw_perf_renderer(ui, &perf_clone),
+                    3 => Self::draw_perf_memory(ui, &perf_clone),
+                    4 => Self::draw_perf_ecs_inspector(ui, &perf_clone),
+                    _ => {}
+                }
+
+                // Write back
+                ui.ctx().data_mut(|d| {
+                    d.insert_temp(egui::Id::new("performance_monitor"), perf_clone);
+                });
+            } else {
+                ui.centered_and_justified(|ui| {
+                    ui.label("Performance Monitor not initialized");
+                });
+            }
+        }
+
+        fn draw_perf_overview(ui: &mut egui::Ui, perf: &PerformanceMonitor) {
+            let stats = &perf.frame_stats;
+
+            ui.horizontal(|ui| {
+                // FPS
+                ui.vertical(|ui| {
+                    ui.label(RichText::new(format!("{:.1}", stats.fps)).size(32.0).strong());
+                    ui.label("FPS");
+                });
+                ui.separator();
+
+                // Frame Time
+                ui.vertical(|ui| {
+                    ui.label(RichText::new(format!("{:.2} ms", stats.frame_time_ms)).size(32.0).strong());
+                    ui.label("Frame Time");
+                });
+                ui.separator();
+
+                // CPU Time
+                ui.vertical(|ui| {
+                    ui.label(RichText::new(format!("{:.2} ms", stats.cpu_frame_time_ms)).size(32.0).strong());
+                    ui.label("CPU Time");
+                });
+                ui.separator();
+
+                // GPU Time
+                ui.vertical(|ui| {
+                    let gpu_text = stats.gpu_frame_time_ms.map_or("N/A".to_string(), |v| format!("{:.2} ms", v));
+                    ui.label(RichText::new(gpu_text).size(32.0).strong());
+                    ui.label("GPU Time");
+                });
+            });
+
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(4.0);
+
+            // Secondary metrics
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(RichText::new("Low FPS (1%)").strong());
+                    ui.label(format!("{:.1}", stats.one_percent_low_fps));
+                });
+                ui.separator();
+                ui.vertical(|ui| {
+                    ui.label(RichText::new("Low FPS (0.1%)").strong());
+                    ui.label(format!("{:.1}", stats.zero_one_percent_low_fps));
+                });
+                ui.separator();
+                ui.vertical(|ui| {
+                    ui.label(RichText::new("Avg Frame Time").strong());
+                    ui.label(format!("{:.2} ms", stats.avg_frame_time_ms));
+                });
+                ui.separator();
+                ui.vertical(|ui| {
+                    ui.label(RichText::new("Min / Max FPS").strong());
+                    ui.label(format!("{} / {}", stats.min_fps, stats.max_fps));
+                });
+                ui.separator();
+                ui.vertical(|ui| {
+                    ui.label(RichText::new("Fixed Updates / Frame").strong());
+                    ui.label(format!("{}", stats.fixed_updates_count));
+                });
+            });
+
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(4.0);
+
+            // Graphs
+            ui.label(RichText::new("FPS History").strong());
+            Self::draw_sparkline(ui, &perf.fps_history, 200.0, Color32::from_rgb(80, 200, 100));
+
+            ui.add_space(4.0);
+            ui.label(RichText::new("Frame Time History").strong());
+            Self::draw_sparkline(ui, &perf.frame_time_history, 200.0, Color32::from_rgb(200, 80, 80));
+        }
+
+        fn draw_perf_cpu_profiler(ui: &mut egui::Ui, perf: &PerformanceMonitor) {
+            ui.label(RichText::new("Operation Timings (Current Frame)").strong());
+            ui.add_space(4.0);
+
+            // Sort by duration descending
+            let mut metrics: Vec<_> = perf.metrics.values().collect();
+            metrics.sort_by(|a, b| b.last_duration_ms.partial_cmp(&a.last_duration_ms).unwrap_or(std::cmp::Ordering::Equal));
+
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                egui::Grid::new("cpu_profiler_grid")
+                    .num_columns(6)
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.strong("Operation");
+                        ui.strong("Category");
+                        ui.strong("Last (ms)");
+                        ui.strong("Avg (ms)");
+                        ui.strong("Max (ms)");
+                        ui.strong("Calls");
+                        ui.end_row();
+
+                        for metric in metrics {
+                            ui.label(&metric.name);
+                            ui.label(metric.category.name());
+                            ui.label(format!("{:.3}", metric.last_duration_ms));
+                            ui.label(format!("{:.3}", metric.avg_duration_ms()));
+                            ui.label(format!("{:.3}", metric.max_duration_ms));
+                            ui.label(format!("{}", metric.call_count));
+                            ui.end_row();
+                        }
+                    });
+            });
+
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(4.0);
+
+            // GameLoop stage timings
+            ui.label(RichText::new("GameLoop Stage Timings (Last Frame)").strong());
+            ui.add_space(4.0);
+
+            egui::Grid::new("gameloop_stages_grid")
+                .num_columns(4)
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.strong("Stage");
+                    ui.strong("Time (ms)");
+                    ui.strong("% of Frame");
+                    ui.strong("Fixed Steps");
+                    ui.end_row();
+
+                    let total = perf.frame_stats.cpu_frame_time_ms.max(0.001);
+
+                    // These would come from GameLoop timings if available
+                    ui.label("Editor Update");
+                    ui.label("N/A");
+                    ui.label("N/A");
+                    ui.label("-");
+                    ui.end_row();
+
+                    ui.label("Fixed Update");
+                    ui.label(format!("{:.2}", perf.frame_stats.fixed_delta_time_ms * perf.frame_stats.fixed_updates_count as f64));
+                    ui.label(format!("{:.1}%", (perf.frame_stats.fixed_delta_time_ms * perf.frame_stats.fixed_updates_count as f64) / total * 100.0));
+                    ui.label(format!("{}", perf.frame_stats.fixed_updates_count));
+                    ui.end_row();
+
+                    ui.label("Update");
+                    ui.label("N/A");
+                    ui.label("N/A");
+                    ui.label("-");
+                    ui.end_row();
+
+                    ui.label("Post Update");
+                    ui.label("N/A");
+                    ui.label("N/A");
+                    ui.label("-");
+                    ui.end_row();
+
+                    ui.label("Transform Propagation");
+                    ui.label("N/A");
+                    ui.label("N/A");
+                    ui.label("-");
+                    ui.end_row();
+
+                    ui.label("Renderer Extraction");
+                    ui.label("N/A");
+                    ui.label("N/A");
+                    ui.label("-");
+                    ui.end_row();
+
+                    ui.label("Shadow Pass");
+                    ui.label("N/A");
+                    ui.label("N/A");
+                    ui.label("-");
+                    ui.end_row();
+
+                    ui.label("Main Render Pass");
+                    ui.label("N/A");
+                    ui.label("N/A");
+                    ui.label("-");
+                    ui.end_row();
+
+                    ui.label("Post Processing");
+                    ui.label("N/A");
+                    ui.label("N/A");
+                    ui.label("-");
+                    ui.end_row();
+                });
+        }
+
+        fn draw_perf_renderer(ui: &mut egui::Ui, perf: &PerformanceMonitor) {
+            let stats = &perf.renderer_stats;
+
+            ui.label(RichText::new("Scene Statistics").strong());
+            ui.add_space(4.0);
+
+            egui::Grid::new("renderer_scene_grid")
+                .num_columns(2)
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.label("Renderable Entities");
+                    ui.label(format!("{}", stats.renderable_entities));
+                    ui.end_row();
+
+                    ui.label("Visible Entities");
+                    ui.label(format!("{}", stats.visible_entities));
+                    ui.end_row();
+
+                    ui.label("Draw Calls");
+                    ui.label(format!("{}", stats.draw_calls));
+                    ui.end_row();
+
+                    ui.label("Triangles");
+                    ui.label(format!("{}", stats.triangles));
+                    ui.end_row();
+
+                    ui.label("Vertices");
+                    ui.label(format!("{}", stats.vertices));
+                    ui.end_row();
+
+                    ui.label("Meshes");
+                    ui.label(format!("{}", stats.meshes));
+                    ui.end_row();
+
+                    ui.label("Materials");
+                    ui.label(format!("{}", stats.materials));
+                    ui.end_row();
+
+                    ui.label("Textures");
+                    ui.label(stats.textures.map_or("N/A".to_string(), |v| v.to_string()));
+                    ui.end_row();
+
+                    ui.label("Lights");
+                    ui.label(format!("{}", stats.lights));
+                    ui.end_row();
+
+                    ui.label("Shadow Casters");
+                    ui.label(format!("{}", stats.shadow_casters));
+                    ui.end_row();
+
+                    ui.label("Render Passes");
+                    ui.label(format!("{}", stats.passes));
+                    ui.end_row();
+                });
+
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(4.0);
+
+            ui.label(RichText::new("GPU Timing").strong());
+            ui.add_space(4.0);
+
+            let gpu_text = stats.gpu_frame_time_ms.map_or("GPU timing not available (timestamp queries unsupported)".to_string(), |v| format!("{:.3} ms", v));
+            ui.label(gpu_text);
+
+            if stats.gpu_frame_time_ms.is_none() {
+                ui.label("Note: GPU timestamp queries require appropriate device support and backend.");
+            }
+        }
+
+        fn draw_perf_memory(ui: &mut egui::Ui, perf: &PerformanceMonitor) {
+            let stats = &perf.memory_stats;
+
+            ui.label(RichText::new("Process Memory").strong());
+            ui.add_space(4.0);
+
+            egui::Grid::new("memory_grid")
+                .num_columns(2)
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.label("Working Set");
+                    ui.label(stats.process_working_set_bytes.map_or("N/A".to_string(), |v| Self::format_bytes(v)));
+                    ui.end_row();
+                });
+
+            if stats.process_working_set_bytes.is_none() {
+                ui.label("Note: Process memory reading requires platform-specific support (Windows: K32GetProcessMemoryInfo)");
+            }
+
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(4.0);
+
+            ui.label(RichText::new("ECS Resources").strong());
+            ui.add_space(4.0);
+
+            egui::Grid::new("memory_ecs_grid")
+                .num_columns(2)
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.label("Entities");
+                    ui.label(format!("{}", stats.ecs_entities_count));
+                    ui.end_row();
+
+                    ui.label("Registered Assets");
+                    ui.label(format!("{}", stats.registered_assets_count));
+                    ui.end_row();
+
+                    ui.label("Mesh Assets");
+                    ui.label(format!("{}", stats.mesh_assets_count));
+                    ui.end_row();
+
+                    ui.label("Material Assets");
+                    ui.label(format!("{}", stats.material_assets_count));
+                    ui.end_row();
+
+                    ui.label("Texture Assets");
+                    ui.label(stats.texture_assets_count.map_or("N/A".to_string(), |v| v.to_string()));
+                    ui.end_row();
+                });
+
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(4.0);
+
+            ui.label(RichText::new("Performance Monitor Buffer").strong());
+            ui.add_space(4.0);
+
+            egui::Grid::new("memory_perf_grid")
+                .num_columns(2)
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.label("History Samples");
+                    ui.label(format!("{}", stats.history_samples_count));
+                    ui.end_row();
+
+                    ui.label("Buffer Capacity");
+                    ui.label(format!("{}", stats.history_buffer_capacity));
+                    ui.end_row();
+                });
+        }
+
+        fn draw_perf_ecs_inspector(ui: &mut egui::Ui, perf: &PerformanceMonitor) {
+            let stats = &perf.ecs_stats;
+
+            ui.label(RichText::new("Entity Summary").strong());
+            ui.add_space(4.0);
+
+            egui::Grid::new("ecs_summary_grid")
+                .num_columns(2)
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.label("Total Entities");
+                    ui.label(format!("{}", stats.entity_count));
+                    ui.end_row();
+
+                    ui.label("With Transform");
+                    ui.label(format!("{}", stats.transform_entities));
+                    ui.end_row();
+
+                    ui.label("Renderable");
+                    ui.label(format!("{}", stats.renderable_entities));
+                    ui.end_row();
+
+                    ui.label("Cameras");
+                    ui.label(format!("{}", stats.camera_entities));
+                    ui.end_row();
+
+                    ui.label("Lights");
+                    ui.label(format!("{}", stats.light_entities));
+                    ui.end_row();
+
+                    ui.label("Registered Resources");
+                    ui.label(format!("{}", stats.registered_resources_count));
+                    ui.end_row();
+                });
+
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(4.0);
+
+            ui.label(RichText::new("Component Statistics").strong());
+            ui.add_space(4.0);
+
+            egui::ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
+                egui::Grid::new("ecs_components_grid")
+                    .num_columns(3)
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.strong("Component");
+                        ui.strong("Entity Count");
+                        ui.strong("Type ID");
+                        ui.end_row();
+
+                        for comp in &stats.components {
+                                                    ui.label(&*comp.name);
+                                                    ui.label(format!("{}", comp.count));
+                                                    ui.label(format!("{:?}", comp.name));
+                            ui.end_row();
+                        }
+                    });
+            });
+
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(4.0);
+
+            ui.label(RichText::new("ECS Resources").strong());
+            ui.add_space(4.0);
+
+            egui::ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
+                for resource in &stats.resources {
+                                ui.label(*resource);
+                }
+            });
+
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(4.0);
+
+            ui.label(RichText::new("System Schedule").strong());
+            ui.add_space(4.0);
+
+            egui::ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
+                for (stage, system) in &stats.systems {
+                    ui.label(format!("{} -> {}", stage, system));
+                }
+            });
+        }
+
+        fn draw_sparkline(ui: &mut egui::Ui, history: &PerformanceHistory, width: f32, color: Color32) {
+            let values = history.values();
+            if values.is_empty() {
+                return;
+            }
+
+            let max_val = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let min_val = values.iter().copied().fold(f32::INFINITY, f32::min);
+            let range = max_val - min_val;
+
+            let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 60.0), Sense::hover());
+            let painter = ui.painter();
+
+            let points: Vec<Pos2> = values.iter().enumerate().map(|(i, &v)| {
+                let x = rect.left() + (i as f32 / (values.len() - 1).max(1) as f32) * width;
+                let y = rect.bottom() - ((v - min_val) / range.max(0.001)) * rect.height();
+                Pos2::new(x, y)
+            }).collect();
+
+            // Background
+            painter.rect_filled(rect, 4.0, Color32::from_rgb(25, 26, 29));
+
+            // Line
+            if points.len() >= 2 {
+                let stroke = Stroke::new(1.5, color);
+                for i in 1..points.len() {
+                    painter.line_segment([points[i-1], points[i]], stroke);
+                }
+            }
+
+            // Min/Max labels
+            painter.text(
+                Pos2::new(rect.left() + 4.0, rect.top() + 4.0),
+                egui::Align2::LEFT_TOP,
+                format!("{:.1}", max_val),
+                FontId::proportional(10.0),
+                color,
+            );
+            painter.text(
+                Pos2::new(rect.left() + 4.0, rect.bottom() - 4.0),
+                egui::Align2::LEFT_BOTTOM,
+                format!("{:.1}", min_val),
+                FontId::proportional(10.0),
+                color,
+            );
+        }
+
+        fn format_bytes(bytes: u64) -> String {
+            const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
+            let mut size = bytes as f64;
+            let mut unit = 0;
+            while size >= 1024.0 && unit < UNITS.len() - 1 {
+                size /= 1024.0;
+                unit += 1;
+            }
+            format!("{:.2} {}", size, UNITS[unit])
+        }
+
+        fn reset_layout(&mut self) {
         self.current_workspace = WorkspacePreset::Default;
         self.dock_state = Some(WorkspacePreset::Default.create_dock_state());
     }
@@ -3305,6 +3850,7 @@ impl<'a> egui_dock::TabViewer for EditorTabViewer<'a> {
             EditorTab::OutputLog => self.editor.draw_output_log(ui),
             EditorTab::ScriptEditor => self.editor.draw_script_editor(ui),
             EditorTab::GraphicsSettings => self.editor.draw_graphics_settings(ui),
+                EditorTab::PerformanceMonitor => self.editor.draw_performance_monitor(ui),
         }
     }
 

@@ -224,6 +224,9 @@ pub fn init_core_resources(world: &mut World) {
     if !world.contains_resource::<PersistentIdRegistry>() {
         world.insert_resource(PersistentIdRegistry::default());
     }
+    if !world.contains_resource::<crate::performance::PerformanceMonitor>() {
+        world.insert_resource(crate::performance::PerformanceMonitor::default());
+    }
 }
 
 #[cfg(test)]

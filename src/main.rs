@@ -13,6 +13,7 @@ mod events;
 mod feedback;
 mod icons;
 mod input;
+mod performance;
 mod quality;
 mod renderer;
 mod scene;

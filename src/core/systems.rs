@@ -66,15 +66,31 @@ impl<F: FnMut(&mut World) + Send + Sync> System for FnSystem<F> {
 // ---------------------------------------------------------------------------
 
 /// Collects systems and runs them stage-by-stage each frame.
+#[derive(Clone, Debug)]
+pub struct SystemTiming {
+    pub name: String,
+    pub stage: SystemStage,
+    pub last_ms: f64,
+    pub calls: u64,
+}
+
 pub struct SystemScheduler {
     systems: Vec<Box<dyn System>>,
+    timings: Vec<SystemTiming>,
+    profiling: bool,
 }
 
 impl SystemScheduler {
     pub fn new() -> Self {
         Self {
             systems: Vec::new(),
+            timings: Vec::new(),
+            profiling: true,
         }
+    }
+
+    pub fn set_profiling(&mut self, enabled: bool) {
+        self.profiling = enabled;
     }
 
     /// Register a system for a given stage.
@@ -96,7 +112,22 @@ impl SystemScheduler {
     pub fn run_stage(&mut self, stage: SystemStage, world: &mut World) {
         for sys in self.systems.iter_mut() {
             if sys.stage() == stage {
+                let started = self.profiling.then(std::time::Instant::now);
                 sys.run(world);
+                if let Some(started) = started {
+                    let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+                    if let Some(timing) = self.timings.iter_mut().find(|timing| timing.name == sys.name()) {
+                        timing.last_ms = elapsed;
+                        timing.calls = timing.calls.saturating_add(1);
+                    } else {
+                        self.timings.push(SystemTiming {
+                            name: sys.name().to_owned(),
+                            stage,
+                            last_ms: elapsed,
+                            calls: 1,
+                        });
+                    }
+                }
             }
         }
     }
@@ -123,6 +154,10 @@ impl SystemScheduler {
     /// List registered system names grouped by stage (for debug UI).
     pub fn list(&self) -> Vec<(SystemStage, &str)> {
         self.systems.iter().map(|s| (s.stage(), s.name())).collect()
+    }
+
+    pub fn timings(&self) -> &[SystemTiming] {
+        &self.timings
     }
 }
 

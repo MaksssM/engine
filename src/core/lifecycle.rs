@@ -5,6 +5,15 @@ use bevy_ecs::world::World;
 /// Coordinates the engine's frame lifecycle around the system scheduler.
 /// The application remains responsible for window events and rendering;
 /// this type owns the deterministic order of simulation systems.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LoopTimings {
+    pub editor_ms: f64,
+    pub fixed_ms: f64,
+    pub update_ms: f64,
+    pub post_ms: f64,
+    pub steps: u32,
+}
+
 pub struct GameLoop {
     pub scheduler: SystemScheduler,
     pub fixed_accumulator: f64,
@@ -32,7 +41,7 @@ impl GameLoop {
     }
 
     /// Run one frame with editor work always active and simulation gated by mode.
-    pub fn tick(&mut self, world: &mut World, delta_seconds: f64) {
+    pub fn tick(&mut self, world: &mut World, delta_seconds: f64) -> LoopTimings {
         let frame_delta = delta_seconds.max(0.0);
         if let Some(mut time) = world.get_resource_mut::<EngineTime>() {
             time.delta_seconds = 0.0;
@@ -42,20 +51,25 @@ impl GameLoop {
         }
         self.scheduler
             .run_stage(super::systems::SystemStage::PreUpdate, world);
+        let editor_started = std::time::Instant::now();
         self.scheduler
             .run_stage(super::systems::SystemStage::EditorUpdate, world);
+        let editor_ms = editor_started.elapsed().as_secs_f64() * 1000.0;
 
         let mode = world
             .get_resource::<EngineMode>()
             .copied()
             .unwrap_or_default();
         let simulation_enabled = matches!(mode, EngineMode::Playing);
+        let mut steps = 0;
+        let mut simulation_fixed_ms = 0.0;
+        let mut simulation_update_ms = 0.0;
         if simulation_enabled {
             if let Some(mut time) = world.get_resource_mut::<EngineTime>() {
                 time.delta_seconds = frame_delta as f32;
             }
             self.fixed_accumulator += frame_delta;
-            let mut steps = 0;
+            let fixed_started = std::time::Instant::now();
             while self.fixed_accumulator >= self.fixed_step && steps < self.max_fixed_steps {
                 self.scheduler
                     .run_stage(super::systems::SystemStage::FixedUpdate, world);
@@ -65,15 +79,29 @@ impl GameLoop {
             if steps == self.max_fixed_steps && self.fixed_accumulator >= self.fixed_step {
                 self.fixed_accumulator = self.fixed_step * 0.999;
             }
+            let fixed_ms = fixed_started.elapsed().as_secs_f64() * 1000.0;
+            let update_started = std::time::Instant::now();
             self.scheduler
                 .run_stage(super::systems::SystemStage::Update, world);
+            let update_ms = update_started.elapsed().as_secs_f64() * 1000.0;
+            simulation_fixed_ms = fixed_ms;
+            simulation_update_ms = update_ms;
         }
+        let post_started = std::time::Instant::now();
         self.scheduler
             .run_stage(super::systems::SystemStage::PostUpdate, world);
+        let post_ms = post_started.elapsed().as_secs_f64() * 1000.0;
         self.scheduler
             .run_stage(super::systems::SystemStage::LateUpdate, world);
         self.scheduler
             .run_stage(super::systems::SystemStage::PreRender, world);
+        LoopTimings {
+            editor_ms,
+            fixed_ms: simulation_fixed_ms,
+            update_ms: simulation_update_ms,
+            post_ms,
+            steps,
+        }
     }
 
     /// Execute exactly one fixed simulation tick while paused.

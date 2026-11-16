@@ -21,6 +21,10 @@ use crate::{
     editor::Editor,
     events::{EventCursor, Events},
     input::{MouseButton as EngineMouseButton, UiInput},
+    performance::{
+        collect_ecs_statistics, MemoryStatistics, Metric, PerformanceMonitor, RendererStatistics,
+        Scope,
+    },
     quality::QualityPreset,
     renderer::{collect_render_snapshot, Renderable, Renderer},
     time::{Clock, FixedTimestep, FpsMeter},
@@ -67,6 +71,7 @@ struct EngineApp {
     /// Runtime system lifecycle shared by editor and future game mode.
     game_loop: GameLoop,
     window_event_cursor: EventCursor,
+    performance: PerformanceMonitor,
 }
 
 impl ApplicationHandler for EngineApp {
@@ -312,6 +317,7 @@ impl EngineApp {
     }
 
     fn update(&mut self) {
+        self.performance.begin_frame();
         let frame_time = {
             let Some(clock) = self.clock.as_mut() else {
                 return;
@@ -325,17 +331,38 @@ impl EngineApp {
         {
             input.state.begin_frame();
         }
+        let input_started = std::time::Instant::now();
         self.process_events();
+        self.performance.record(
+            Metric::InputProcessingMs,
+            input_started.elapsed().as_secs_f64() * 1000.0,
+        );
         self.sync_play_mode();
 
         let step_seconds = self.game_loop.fixed_step as f32;
-        self.game_loop
+        let loop_timings = self
+            .game_loop
             .tick(&mut self.ecs.world, frame_time.as_secs_f64());
+        self.performance
+            .record(Metric::EditorUpdateMs, loop_timings.editor_ms);
+        self.performance
+            .record(Metric::FixedUpdateTimeMs, loop_timings.fixed_ms);
+        self.performance
+            .record(Metric::SimulationUpdateMs, loop_timings.update_ms);
+        self.performance
+            .record(Metric::PostUpdateMs, loop_timings.post_ms);
+        self.performance
+            .add_fixed_updates(loop_timings.steps);
 
         // Rendering resource preparation is once per frame; simulation timing is
         // owned by GameLoop so FixedUpdate cannot be executed twice.
         self.update_camera_controller(step_seconds);
+        let extraction_started = std::time::Instant::now();
         let render_snapshot = collect_render_snapshot(&mut self.ecs.world);
+        self.performance.record(
+            Metric::RendererExtractionMs,
+            extraction_started.elapsed().as_secs_f64() * 1000.0,
+        );
         if let Some(renderer) = self.renderer.as_mut() {
             renderer.update(&render_snapshot, step_seconds);
         }
@@ -366,6 +393,34 @@ impl EngineApp {
             }
             match renderer.render_scene(&render_snapshot) {
                 Ok((frame, view)) => {
+                    let renderer_stats = crate::performance::RendererStatistics {
+                        renderable_entities: render_snapshot.renderables.len() as u32,
+                        visible_entities: render_snapshot.renderables.len() as u32,
+                        draw_calls: renderer.frame_draw_calls,
+                        triangles: renderer.frame_triangles,
+                        vertices: renderer.frame_triangles * 3,
+                        meshes: render_snapshot.renderables.len() as u32,
+                        materials: render_snapshot.renderables.len() as u32,
+                        textures: None,
+                        lights: if render_snapshot.directional_light.is_some() { 1 } else { 0 },
+                        shadow_casters: if render_snapshot.directional_light.is_some() { 1 } else { 0 },
+                        passes: renderer.frame_passes,
+                        gpu_frame_time_ms: None,
+                    };
+                    self.performance.set_renderer(renderer_stats);
+
+                    let systems_info = self
+                        .game_loop
+                        .scheduler
+                        .timings()
+                        .iter()
+                        .map(|t| (t.name.clone(), format!("{:?} ({:.3} ms)", t.stage, t.last_ms)))
+                        .collect::<Vec<_>>();
+                    let ecs_stats = crate::performance::collect_ecs_statistics(&mut self.ecs.world, &systems_info);
+                    self.performance.set_ecs(ecs_stats);
+                    self.performance.refresh_memory_statistics(entity_count as u32);
+                    self.ecs.world.insert_resource(self.performance.clone());
+
                     if let (Some(window), Some(editor)) =
                         (self.window.as_ref(), self.editor.as_mut())
                     {
@@ -379,6 +434,11 @@ impl EngineApp {
                             fps as f32,
                         );
                         renderer.wireframe_mode = editor.wireframe;
+                    }
+
+                    if let Some(res) = self.ecs.world.get_resource::<PerformanceMonitor>() {
+                        self.performance.set_enabled(res.enabled());
+                        self.performance.set_detailed(res.detailed());
                     }
                 }
                 Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
