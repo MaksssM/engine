@@ -82,8 +82,8 @@ pub enum Metric {
 }
 
 impl Metric {
-    pub const ShadowPreparationMs: Self = Self::ShadowPassPreparationMs;
-    pub const MainPassPreparationMs: Self = Self::MainRenderPassPreparationMs;
+    pub const SHADOW_PREPARATION_MS: Self = Self::ShadowPassPreparationMs;
+    pub const MAIN_PASS_PREPARATION_MS: Self = Self::MainRenderPassPreparationMs;
 
     pub const ALL: [Self; 17] = [
         Self::Fps,
@@ -333,10 +333,59 @@ pub struct PerformanceMonitor {
     pub metrics: BTreeMap<String, PerformanceMetric>,
     pub gpu_timestamp_supported: bool,
 
+    /// Target FPS for the graph's target line (default 60).
+    pub target_fps: f64,
+    /// When true, `end_frame` still computes stats but does not append samples,
+    /// so the graph freezes until resumed.
+    pub paused: bool,
+    /// Timestamped samples used by the time-windowed graphs.
+    samples: Vec<GraphSample>,
+    /// Monotonic seconds at the last recorded frame.
+    last_sample_time: f64,
+    /// Maximum number of windowed samples retained (60s at 60Hz + margin).
+    sample_capacity: usize,
+
     categories: [bool; 11],
     frame_start: Option<Instant>,
     cpu_frame_ms: f64,
     fixed_updates_count: u32,
+}
+
+/// One timestamped frame measurement for the time-windowed graphs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GraphSample {
+    /// Seconds since the monitor was created / cleared.
+    pub time_seconds: f64,
+    pub fps: f64,
+    pub frame_time_ms: f64,
+}
+
+/// Selectable display window for the graphs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimeWindow {
+    Seconds10,
+    Seconds30,
+    Seconds60,
+}
+
+impl TimeWindow {
+    pub const ALL: [Self; 3] = [Self::Seconds10, Self::Seconds30, Self::Seconds60];
+
+    pub fn seconds(self) -> f64 {
+        match self {
+            Self::Seconds10 => 10.0,
+            Self::Seconds30 => 30.0,
+            Self::Seconds60 => 60.0,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Seconds10 => "10s",
+            Self::Seconds30 => "30s",
+            Self::Seconds60 => "60s",
+        }
+    }
 }
 
 impl Default for PerformanceMonitor {
@@ -367,6 +416,11 @@ impl PerformanceMonitor {
             frame_time_history: PerformanceHistory::new(history_capacity),
             metrics,
             gpu_timestamp_supported: false,
+            target_fps: 60.0,
+            paused: false,
+            samples: Vec::new(),
+            last_sample_time: 0.0,
+            sample_capacity: (60.0f64 * 60.0).ceil() as usize + 64,
             categories: [true; 11],
             frame_start: None,
             cpu_frame_ms: 0.0,
@@ -398,9 +452,27 @@ impl PerformanceMonitor {
         self.categories[category as usize] = enabled;
     }
 
+    pub fn paused(&self) -> bool {
+        self.paused
+    }
+
+    pub fn set_paused(&mut self, paused: bool) {
+        self.paused = paused;
+    }
+
+    pub fn target_fps(&self) -> f64 {
+        self.target_fps
+    }
+
+    pub fn set_target_fps(&mut self, target_fps: f64) {
+        self.target_fps = target_fps.max(1.0);
+    }
+
     pub fn reset(&mut self) {
         self.fps_history.clear();
         self.frame_time_history.clear();
+        self.samples.clear();
+        self.last_sample_time = 0.0;
         self.frame_stats = FrameStatistics::default();
         self.fixed_updates_count = 0;
         self.cpu_frame_ms = 0.0;
@@ -410,6 +482,15 @@ impl PerformanceMonitor {
             m.max_duration_ms = 0.0;
             m.call_count = 0;
         }
+    }
+
+    /// Clear only the time-windowed graph samples and history, preserving settings
+    /// (enabled, detailed, paused, target_fps) and metric accumulators.
+    pub fn clear_graph_samples(&mut self) {
+        self.fps_history.clear();
+        self.frame_time_history.clear();
+        self.samples.clear();
+        self.last_sample_time = 0.0;
     }
 
     pub fn begin_frame(&mut self) {
@@ -438,6 +519,19 @@ impl PerformanceMonitor {
             0.0
         };
         self.fps_history.push(fps);
+
+        if !self.paused {
+            self.last_sample_time += delta_seconds.max(0.0);
+            self.samples.push(GraphSample {
+                time_seconds: self.last_sample_time,
+                fps,
+                frame_time_ms: frame_ms,
+            });
+            if self.samples.len() > self.sample_capacity {
+                let excess = self.samples.len() - self.sample_capacity;
+                self.samples.drain(0..excess);
+            }
+        }
 
         self.record(Metric::FrameTimeMs, frame_ms);
         self.record(Metric::CpuFrameTimeMs, cpu_ms);
@@ -539,6 +633,61 @@ impl PerformanceMonitor {
 
     pub fn history_len(&self) -> usize {
         self.frame_time_history.len()
+    }
+
+    /// Samples within the last `window_seconds`, oldest first.
+    pub fn windowed_samples(&self, window_seconds: f64) -> &[GraphSample] {
+        if self.samples.is_empty() {
+            return &[];
+        }
+        let now = self.samples.last().map(|s| s.time_seconds).unwrap_or(0.0);
+        let cutoff = now - window_seconds;
+        let start = self.samples.partition_point(|s| s.time_seconds < cutoff);
+        &self.samples[start..]
+    }
+
+    /// FPS values within the window, oldest first.
+    pub fn windowed_fps(&self, window_seconds: f64) -> Vec<f64> {
+        self.windowed_samples(window_seconds)
+            .iter()
+            .map(|s| s.fps)
+            .collect()
+    }
+
+    /// Frame time values (ms) within the window, oldest first.
+    pub fn windowed_frame_time(&self, window_seconds: f64) -> Vec<f64> {
+        self.windowed_samples(window_seconds)
+            .iter()
+            .map(|s| s.frame_time_ms)
+            .collect()
+    }
+
+    /// Average FPS within the window. Returns 0.0 when there is no data.
+    pub fn average_fps(&self, window_seconds: f64) -> f64 {
+        let samples = self.windowed_samples(window_seconds);
+        if samples.is_empty() {
+            return 0.0;
+        }
+        samples.iter().map(|s| s.fps).sum::<f64>() / samples.len() as f64
+    }
+
+    /// Maximum frame time (ms) within the window. Returns 0.0 when empty.
+    pub fn max_frame_time(&self, window_seconds: f64) -> f64 {
+        self.windowed_samples(window_seconds)
+            .iter()
+            .map(|s| s.frame_time_ms)
+            .fold(0.0, f64::max)
+    }
+
+    /// Drop all windowed samples (history clear).
+    pub fn clear_samples(&mut self) {
+        self.samples.clear();
+        self.last_sample_time = 0.0;
+    }
+
+    /// Number of retained windowed samples.
+    pub fn sample_count(&self) -> usize {
+        self.samples.len()
     }
 
     pub fn refresh_memory_statistics(
@@ -738,6 +887,84 @@ mod tests {
             let _scope = Scope::new(&mut monitor, Metric::RendererExtractionMs);
         }
         assert_eq!(monitor.sample(Metric::RendererExtractionMs).calls, 0);
+    }
+
+    #[test]
+    fn windowed_samples_follow_time_window() {
+        let mut monitor = PerformanceMonitor::new(16);
+        // Simulate 60 frames at 60fps → 1 second of history.
+        for _ in 0..60 {
+            monitor.end_frame(1.0 / 60.0);
+        }
+        let all = monitor.windowed_samples(60.0).to_vec();
+        assert_eq!(all.len(), 60);
+        let last = all.last().unwrap().time_seconds;
+        // A 0.5s window keeps only the newer half.
+        let half = monitor.windowed_samples(0.5);
+        assert_eq!(half.len(), 30);
+        assert!(half.first().unwrap().time_seconds > last - 1.0);
+    }
+
+    #[test]
+    fn pause_freezes_sample_buffer() {
+        let mut monitor = PerformanceMonitor::new(16);
+        monitor.end_frame(1.0 / 60.0);
+        monitor.paused = true;
+        monitor.end_frame(1.0 / 60.0);
+        monitor.end_frame(1.0 / 60.0);
+        assert_eq!(monitor.sample_count(), 1);
+        // Stats still update while paused (they read history, not samples).
+        assert!(monitor.frame().fps > 0.0);
+        monitor.paused = false;
+        monitor.end_frame(1.0 / 60.0);
+        assert_eq!(monitor.sample_count(), 2);
+    }
+
+    #[test]
+    fn clear_samples_empties_window() {
+        let mut monitor = PerformanceMonitor::new(16);
+        monitor.end_frame(1.0 / 60.0);
+        assert_eq!(monitor.sample_count(), 1);
+        monitor.clear_samples();
+        assert_eq!(monitor.sample_count(), 0);
+        assert!(monitor.windowed_samples(60.0).is_empty());
+        assert_eq!(monitor.average_fps(60.0), 0.0);
+        assert_eq!(monitor.max_frame_time(60.0), 0.0);
+    }
+
+    #[test]
+    fn average_fps_and_max_frame_time_are_real() {
+        let mut monitor = PerformanceMonitor::new(16);
+        monitor.end_frame(0.01); // 100 fps, 10 ms
+        monitor.end_frame(0.02); // 50 fps, 20 ms
+        monitor.end_frame(0.04); // 25 fps, 40 ms
+        let avg = monitor.average_fps(60.0);
+        assert!((avg - 58.333).abs() < 0.5, "avg was {avg}");
+        assert!((monitor.max_frame_time(60.0) - 40.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn empty_window_has_no_division_by_zero() {
+        let monitor = PerformanceMonitor::new(16);
+        assert_eq!(monitor.average_fps(10.0), 0.0);
+        assert_eq!(monitor.max_frame_time(10.0), 0.0);
+        assert!(monitor.windowed_fps(10.0).is_empty());
+        assert!(monitor.windowed_frame_time(10.0).is_empty());
+    }
+
+    #[test]
+    fn target_fps_defaults_to_60() {
+        let monitor = PerformanceMonitor::new(16);
+        assert!((monitor.target_fps - 60.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn sample_buffer_is_bounded() {
+        let mut monitor = PerformanceMonitor::new(16);
+        for _ in 0..2000 {
+            monitor.end_frame(1.0 / 60.0);
+        }
+        assert!(monitor.sample_count() <= monitor.sample_capacity);
     }
 
     #[test]

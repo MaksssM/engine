@@ -1,6 +1,8 @@
 //! Content Browser panel: folder tree, asset list with search/filter,
 //! list/grid views, create/import actions and context menu.
 
+#![allow(deprecated)]
+
 use std::{fs, path::PathBuf};
 
 use bevy_ecs::world::World;
@@ -234,7 +236,7 @@ fn draw_folder_tree(editor: &mut Editor, ui: &mut egui::Ui) {
     );
     ui.separator();
     egui::ScrollArea::vertical()
-        .id_source("folder_tree_scroll")
+        .id_salt("folder_tree_scroll")
         .show(ui, |ui| {
             let root = crate::assets_ui::build_folder_tree(&editor.content_root, 8);
             draw_tree_node(editor, ui, &root, 0);
@@ -337,7 +339,7 @@ fn draw_asset_list(editor: &mut Editor, ui: &mut egui::Ui, world: &mut World) {
         .collect();
 
     egui::ScrollArea::vertical()
-        .id_source("asset_list_scroll")
+        .id_salt("asset_list_scroll")
         .show(ui, |ui| {
             if editor.content_list_view {
                 for path in filtered {
@@ -436,7 +438,7 @@ fn draw_asset_list(editor: &mut Editor, ui: &mut egui::Ui, world: &mut World) {
                                     .fill(fill)
                                     .corner_radius(4)
                                     .inner_margin(6.0)
-                                    .stroke(Stroke::new(1.0, border))
+                                    .stroke(Stroke::new(1.0_f32, border))
                                     .show(ui, |ui| {
                                         ui.set_min_width(68.0);
                                         ui.set_min_height(70.0);
@@ -474,7 +476,7 @@ fn draw_asset_list(editor: &mut Editor, ui: &mut egui::Ui, world: &mut World) {
 
     // Drag & drop target: allow dropping assets onto the current folder to move them
     let _ = world;
-    let (_, dropped) = ui.dnd_drop_zone::<PathBuf, _>(egui::Frame::none(), |_| {
+    let (_, dropped) = ui.dnd_drop_zone::<PathBuf, _>(egui::Frame::NONE, |_| {
         // invisible target area
     });
     if let Some(arc_path) = dropped {

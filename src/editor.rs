@@ -6,10 +6,14 @@ use std::{
 };
 
 use bevy_ecs::{entity::Entity, world::World};
-use egui::{Color32, Context, FontId, Key, Pos2, RichText, Sense, Stroke, Vec2};
-use glam::Vec3;
+use egui::{Color32, Context, Key, RichText, Sense, Stroke, Vec2};
+use glam::{Vec3};
 use serde::{Deserialize, Serialize};
 use winit::{event::WindowEvent, window::Window};
+
+use crate::viewport::{
+    Aabb, CoordSpace, GizmoAxis, GizmoTool, ViewportCamera,
+};
 
 use egui_dock::{DockArea, DockState, NodeIndex, SurfaceIndex};
 
@@ -18,6 +22,7 @@ use crate::{
         AssetKind, ObjMesh, PreviewMode, classify, count_assets, format_bytes, format_modified,
     },
     camera::CameraController,
+    commands::{HistoryManager, DEFAULT_HISTORY_CAPACITY},
     core::components::{FolderGroup, Locked, Visible},
     dock::{DockAction, EditorTab, WorkspacePreset, editor_dock_style},
     ecs::Name,
@@ -26,7 +31,7 @@ use crate::{
         apply_feedback_styles,
     },
     icons::{IconSize, Icons},
-    performance::{PerformanceHistory, PerformanceMonitor},
+    performance::PerformanceMonitor,
     scene::{Scene, SceneEntity},
     transform::{Parent, Transform},
 };
@@ -135,7 +140,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 "#;
 
 #[derive(Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-enum ViewMode {
+pub enum ViewMode {
     #[default]
     Perspective,
     Top,
@@ -207,6 +212,8 @@ pub struct Editor {
     pub active_tool: usize,
     pub status: String,
     dirty: bool,
+    /// Undo/Redo history for scene operations.
+    pub history: HistoryManager,
     pub filter: String,
     pub content_root: PathBuf,
     pub content_dir: PathBuf,
@@ -236,6 +243,12 @@ pub struct Editor {
     pub camera_fov: f32,
     pub mouse_sensitivity: f32,
     pub perf_selected_tab: usize,
+    pub perf_window: crate::performance::TimeWindow,
+    pub perf_scale_auto: bool,
+    pub perf_fixed_max: f32,
+    pub perf_compact: bool,
+    pub perf_show_fps_graph: bool,
+    pub perf_show_frame_time_graph: bool,
 
     // Asset Preview state
     pub preview_mode: PreviewMode,
@@ -249,6 +262,15 @@ pub struct Editor {
     // Feedback & Notifications
     pub notifications: NotificationManager,
     pub confirm_dialog: Option<ConfirmDialog>,
+
+    // Viewport interaction state
+    pub gizmo_interaction: Option<(Entity, GizmoTool, GizmoAxis, CoordSpace)>,
+    gizmo_drag_start: Option<Vec2>,
+    gizmo_anchor_ray: Option<(Vec3, f32)>,
+    pub gizmo_snap_translation: f32,
+    pub gizmo_snap_rotation: f32,
+    pub gizmo_snap_scale: f32,
+    pub gizmo_local_space: bool,
 }
 
 impl Editor {
@@ -316,6 +338,12 @@ impl Editor {
             camera_fov: 75.0,
             mouse_sensitivity: 1.0,
             perf_selected_tab: 0,
+            perf_window: crate::performance::TimeWindow::Seconds10,
+            perf_scale_auto: true,
+            perf_fixed_max: 33.0,
+            perf_compact: false,
+            perf_show_fps_graph: true,
+            perf_show_frame_time_graph: true,
             preview_mode: PreviewMode::Mesh,
             mesh_zoom: 1.0,
             texture_zoom: 1.0,
@@ -325,6 +353,14 @@ impl Editor {
             open_asset_pending: None,
             notifications: NotificationManager::default(),
             confirm_dialog: None,
+            gizmo_interaction: None,
+            gizmo_drag_start: None,
+            gizmo_anchor_ray: None,
+            gizmo_snap_translation: 0.0,
+            gizmo_snap_rotation: 0.0,
+            gizmo_snap_scale: 0.0,
+            gizmo_local_space: false,
+            history: HistoryManager::new(DEFAULT_HISTORY_CAPACITY),
         }
     }
     pub fn on_window_event(&mut self, window: &Window, event: &WindowEvent) -> bool {
@@ -362,6 +398,63 @@ impl Editor {
             self.last_view_mode = self.view_mode;
         }
     }
+
+    /// Returns a ViewportCamera built from the editor's current state and ECS transform.
+    pub fn viewport_camera(&self, world: &mut World) -> ViewportCamera {
+        let (camera_pos, camera_target_vec) = if let Some((t, c)) = world
+            .query::<(&Transform, &CameraController)>()
+            .iter(world)
+            .next()
+        {
+            let pos = t.translation;
+            let tgt = pos + c.forward();
+            (pos, tgt)
+        } else {
+            (Vec3::new(0.0, 0.0, 8.0), Vec3::ZERO)
+        };
+        let orthographic = matches!(
+            self.view_mode,
+            ViewMode::Top | ViewMode::Front | ViewMode::Side | ViewMode::Orthographic
+        );
+        let fov = self.camera_fov.to_radians();
+        let (target_pos, _target_z) = match self.view_mode {
+            ViewMode::Top => ((self.orbit_target.x, self.orbit_target.y + 100.0, self.orbit_target.z), 1000.0),
+            ViewMode::Front => ((self.orbit_target.x, self.orbit_target.y + 1.0, self.orbit_target.z + 100.0), 1000.0),
+            ViewMode::Side => ((self.orbit_target.x + 100.0, self.orbit_target.y + 1.0, self.orbit_target.z), 1000.0),
+            ViewMode::Orthographic => ((self.orbit_target.x, self.orbit_target.y, self.orbit_target.z), 100.0),
+            ViewMode::Perspective => ((camera_target_vec.x, camera_target_vec.y, camera_target_vec.z), 1000.0),
+        };
+        let target = Vec3::new(target_pos.0, target_pos.1, target_pos.2);
+        if orthographic {
+            ViewportCamera {
+                position: camera_pos,
+                target,
+                fov_y: fov,
+                near: 0.1,
+                far: 1000.0,
+                orthographic: true,
+                ortho_scale: 20.0,
+            }
+        } else {
+            ViewportCamera {
+                position: camera_pos,
+                target,
+                fov_y: fov,
+                near: 0.1,
+                far: 1000.0,
+                orthographic: false,
+                ortho_scale: 20.0,
+            }
+        }
+    }
+
+    /// Convert an AABB for a renderable entity into world-space bounds.
+    fn world_aabb_from_transform(&self, transform: &Transform, local_scale: f32) -> Aabb {
+        let half = Vec3::splat(0.5 * local_scale.max(0.1));
+        let center = transform.translation;
+        Aabb::from_center_half(center, half)
+    }
+
     pub fn draw(
         &mut self,
         window: &Window,
@@ -370,11 +463,13 @@ impl Editor {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         world: &mut World,
+        perf: &mut crate::performance::PerformanceMonitor,
+        _history: (),
         fps: f32,
     ) {
         let input = self.platform.as_mut().unwrap().take_egui_input(window);
         let context = self.context.clone();
-        let output = context.run(input, |ctx| self.draw_ui(ctx, world, fps));
+        let output = context.run(input, |ctx| self.draw_ui(ctx, world, perf, fps));
         self.platform
             .as_mut()
             .unwrap()
@@ -426,7 +521,26 @@ impl Editor {
             self.save_layout();
         }
     }
-    fn draw_ui(&mut self, ctx: &Context, world: &mut World, fps: f32) {
+    fn draw_ui(&mut self, ctx: &Context, world: &mut World, perf: &mut crate::performance::PerformanceMonitor, fps: f32) {
+        // Handle Undo/Redo keyboard shortcuts
+        let undo_shortcut = ctx.input(|i| {
+            i.key_pressed(Key::Z) && (i.modifiers.ctrl || i.modifiers.mac_cmd)
+        });
+        let redo_shortcut = ctx.input(|i| {
+            (i.key_pressed(Key::Y) || (i.key_pressed(Key::Z) && i.modifiers.shift))
+                && (i.modifiers.ctrl || i.modifiers.mac_cmd)
+        });
+
+        if undo_shortcut {
+            if let Some(name) = self.history.undo(world) {
+                self.notifications.info(format!("Undo: {}", name), "History");
+            }
+        } else if redo_shortcut {
+            if let Some(name) = self.history.redo(world) {
+                self.notifications.info(format!("Redo: {}", name), "History");
+            }
+        }
+
         let mut style = (*ctx.style()).clone();
         style.visuals = egui::Visuals::dark();
         style.visuals.panel_fill = Color32::from_rgb(30, 31, 34);
@@ -701,6 +815,18 @@ impl Editor {
                                         &mut self.wireframe,
                                         format!("{} Wireframe", Icons::LIST_VIEW),
                                     );
+                                    ui.separator();
+                                    if ui
+                                        .button(format!(
+                                            "{} Performance Monitor",
+                                            Icons::PERFORMANCE
+                                        ))
+                                        .clicked()
+                                    {
+                                        actions
+                                            .push(DockAction::Open(EditorTab::PerformanceMonitor));
+                                        ui.close();
+                                    }
                                     ui.separator();
                                     if ui
                                         .button(format!("{} Reset Camera Orbit", Icons::CAMERA))
@@ -1243,6 +1369,7 @@ impl Editor {
             let mut viewer = EditorTabViewer {
                 editor: self,
                 world,
+                perf,
                 actions: &mut actions,
             };
             DockArea::new(&mut dock_state)
@@ -1702,15 +1829,15 @@ impl Editor {
             );
             p.line_segment(
                 [gizmo_origin, gizmo_origin + Vec2::new(14.0, 0.0)],
-                egui::Stroke::new(1.0, Color32::from_rgb(220, 90, 90)),
+                egui::Stroke::new(1.0_f32, Color32::from_rgb(220, 90, 90)),
             );
             p.line_segment(
                 [gizmo_origin, gizmo_origin + Vec2::new(-14.0, 0.0)],
-                egui::Stroke::new(1.0, Color32::from_rgb(90, 220, 120)),
+                egui::Stroke::new(1.0_f32, Color32::from_rgb(90, 220, 120)),
             );
             p.line_segment(
                 [gizmo_origin, gizmo_origin + Vec2::new(0.0, -14.0)],
-                egui::Stroke::new(1.0, Color32::from_rgb(90, 140, 230)),
+                egui::Stroke::new(1.0_f32, Color32::from_rgb(90, 140, 230)),
             );
         }
         for entity in &self.selected_entities {
@@ -2003,9 +2130,9 @@ impl Editor {
                     points_2d.get(tri[1] as usize),
                     points_2d.get(tri[2] as usize),
                 ) {
-                    painter.line_segment([*a, *b], Stroke::new(1.0, tri_color));
-                    painter.line_segment([*b, *c], Stroke::new(1.0, tri_color));
-                    painter.line_segment([*c, *a], Stroke::new(1.0, tri_color));
+                    painter.line_segment([*a, *b], Stroke::new(1.0_f32, tri_color));
+                    painter.line_segment([*b, *c], Stroke::new(1.0_f32, tri_color));
+                    painter.line_segment([*c, *a], Stroke::new(1.0_f32, tri_color));
                 }
             }
         }
@@ -2046,7 +2173,7 @@ impl Editor {
         ];
         let box_color = Color32::from_rgb(120, 140, 160);
         for (a, b) in box_edges {
-            painter.line_segment([corners_2d[a], corners_2d[b]], Stroke::new(1.0, box_color));
+            painter.line_segment([corners_2d[a], corners_2d[b]], Stroke::new(1.0_f32, box_color));
         }
     }
 
@@ -2219,7 +2346,7 @@ impl Editor {
                 ui.add(
                     egui::DragValue::new(&mut editor.texture_zoom)
                         .speed(0.01)
-                        .clamp_range(0.1..=10.0)
+                        .range(0.1..=10.0)
                         .suffix("x"),
                 );
                 if ui.button("Reset").clicked() {
@@ -2247,7 +2374,7 @@ impl Editor {
                     ui.add(
                         egui::DragValue::new(&mut editor.mesh_zoom)
                             .speed(0.1)
-                            .clamp_range(0.1..=50.0)
+                            .range(0.1..=50.0)
                             .suffix("x"),
                     );
                     if ui.button("Reset").clicked() {
@@ -2298,7 +2425,7 @@ impl Editor {
                 painter.circle_stroke(
                     center,
                     radius,
-                    Stroke::new(2.0, Color32::from_rgb(100, 80, 60)),
+                    Stroke::new(2.0_f32, Color32::from_rgb(100, 80, 60)),
                 );
                 ui.add_space(12.0);
                 ui.separator();
@@ -3772,134 +3899,288 @@ impl Editor {
             let _ = std::fs::write("editor-layout.ron", s);
         }
     }
-    fn draw_performance_monitor(&mut self, ui: &mut egui::Ui) {
-        use crate::performance::*;
+    fn draw_performance_monitor(&mut self, ui: &mut egui::Ui, world: &World, perf: &mut crate::performance::PerformanceMonitor) {
+        // Read EngineMode from the world
+        let mode = world
+            .get_resource::<crate::core::resources::EngineMode>()
+            .copied()
+            .unwrap_or_default();
 
-        let performance = ui
-            .ctx()
-            .data_mut(|d| d.get_temp::<PerformanceMonitor>(egui::Id::new("performance_monitor")));
+        // Use the PerformanceMonitor passed directly from App as the single source of truth.
+        // This eliminates the clone-sync problem where Clear History wouldn't persist.
 
-        if let Some(perf) = performance {
-            let mut perf_clone = perf.clone();
-
-            // Top bar with toggle and settings
-            ui.horizontal(|ui| {
-                ui.heading("PERFORMANCE MONITOR");
-                ui.separator();
-
-                let mut enabled = perf_clone.enabled;
-                if ui.checkbox(&mut enabled, "Enabled").changed() {
-                    perf_clone.enabled = enabled;
-                }
-
-                let mut detailed = perf_clone.detailed;
-                if ui.checkbox(&mut detailed, "Detailed").changed() {
-                    perf_clone.detailed = detailed;
-                }
-
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Clear History").clicked() {
-                        perf_clone.reset();
-                    }
-                });
-            });
-
+        // Top bar with toggle and settings
+        ui.horizontal(|ui| {
+            ui.heading("PERFORMANCE MONITOR");
             ui.separator();
 
-            // Tabs
-            let tab_names = [
-                "Overview",
-                "CPU Profiler",
-                "Renderer",
-                "Memory",
-                "ECS Inspector",
-            ];
-
-            ui.horizontal(|ui| {
-                for (i, name) in tab_names.iter().enumerate() {
-                    if ui
-                        .selectable_label(self.perf_selected_tab == i, *name)
-                        .clicked()
-                    {
-                        self.perf_selected_tab = i;
-                    }
+            // Editor / Play mode badge
+            let (mode_label, mode_color) = match mode {
+                crate::core::resources::EngineMode::Playing => {
+                    ("Playing", Color32::from_rgb(120, 200, 120))
                 }
-            });
+                crate::core::resources::EngineMode::Paused => {
+                    ("Paused", Color32::from_rgb(230, 200, 100))
+                }
+                crate::core::resources::EngineMode::Editor => {
+                    ("Editor", Color32::from_rgb(140, 146, 156))
+                }
+            };
+            ui.colored_label(mode_color, format!("Mode: {}", mode_label));
 
-            ui.separator();
-
-            match self.perf_selected_tab {
-                0 => Self::draw_perf_overview(ui, &perf_clone),
-                1 => Self::draw_perf_cpu_profiler(ui, &perf_clone),
-                2 => Self::draw_perf_renderer(ui, &perf_clone),
-                3 => Self::draw_perf_memory(ui, &perf_clone),
-                4 => Self::draw_perf_ecs_inspector(ui, &perf_clone),
-                _ => {}
+            let mut enabled = perf.enabled;
+            if ui.checkbox(&mut enabled, "Enabled").changed() {
+                perf.set_enabled(enabled);
             }
 
-            // Write back
-            ui.ctx().data_mut(|d| {
-                d.insert_temp(egui::Id::new("performance_monitor"), perf_clone);
+            let mut detailed = perf.detailed;
+            if ui.checkbox(&mut detailed, "Detailed").changed() {
+                perf.set_detailed(detailed);
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Clear History").clicked() {
+                    // Clear the graph samples and history but keep enabled/detailed/paused state
+                    perf.clear_graph_samples();
+                }
             });
-        } else {
-            ui.centered_and_justified(|ui| {
-                ui.label("Performance Monitor not initialized");
-            });
+        });
+
+        ui.separator();
+
+        // Tabs
+        let tab_names = [
+            "Overview",
+            "CPU Profiler",
+            "Renderer",
+            "Memory",
+            "ECS Inspector",
+        ];
+
+        ui.horizontal(|ui| {
+            for (i, name) in tab_names.iter().enumerate() {
+                if ui
+                    .selectable_label(self.perf_selected_tab == i, *name)
+                    .clicked()
+                {
+                    self.perf_selected_tab = i;
+                }
+            }
+        });
+
+        ui.separator();
+
+        match self.perf_selected_tab {
+            0 => Self::draw_perf_overview(ui, perf, self),
+            1 => Self::draw_perf_cpu_profiler(ui, perf),
+            2 => Self::draw_perf_renderer(ui, &perf),
+            3 => Self::draw_perf_memory(ui, &perf),
+            4 => Self::draw_perf_ecs_inspector(ui, &perf),
+            _ => {}
         }
     }
 
-    fn draw_perf_overview(ui: &mut egui::Ui, perf: &PerformanceMonitor) {
-        let stats = &perf.frame_stats;
+    fn draw_perf_overview(ui: &mut egui::Ui, perf: &mut PerformanceMonitor, editor: &mut Editor) {
+        use crate::performance_graph::{GraphScale, PerfGraph, PerfGraphConfig};
 
-        ui.horizontal(|ui| {
-            // FPS
-            ui.vertical(|ui| {
-                ui.label(
-                    RichText::new(format!("{:.1}", stats.fps))
-                        .size(32.0)
-                        .strong(),
-                );
-                ui.label("FPS");
-            });
-            ui.separator();
+        let window = editor.perf_window;
+        let window_secs = window.seconds();
+        let fps_values = perf.windowed_fps(window_secs);
+        let ft_values = perf.windowed_frame_time(window_secs);
 
-            // Frame Time
-            ui.vertical(|ui| {
-                ui.label(
-                    RichText::new(format!("{:.2} ms", stats.frame_time_ms))
-                        .size(32.0)
-                        .strong(),
-                );
-                ui.label("Frame Time");
-            });
-            ui.separator();
-
-            // CPU Time
-            ui.vertical(|ui| {
-                ui.label(
-                    RichText::new(format!("{:.2} ms", stats.cpu_frame_time_ms))
-                        .size(32.0)
-                        .strong(),
-                );
-                ui.label("CPU Time");
-            });
-            ui.separator();
-
-            // GPU Time
-            ui.vertical(|ui| {
-                let gpu_text = stats
-                    .gpu_frame_time_ms
-                    .map_or("N/A".to_string(), |v| format!("{:.2} ms", v));
-                ui.label(RichText::new(gpu_text).size(32.0).strong());
-                ui.label("GPU Time");
-            });
-        });
+        // ── Top panel: headline metrics (includes Memory + Entity count). ──
+        Self::draw_perf_metrics_row(ui, perf);
 
         ui.add_space(8.0);
         ui.separator();
         ui.add_space(4.0);
 
-        // Secondary metrics
+        // Compact mode: skip the FPS graph and the second metrics row; show
+        // only the Frame Time graph at reduced height.
+        if editor.perf_compact {
+            let target_ms = 1000.0 / perf.target_fps.max(1.0);
+            let mut ft_config = PerfGraphConfig::new("ms", "ms").with_target(target_ms, "target");
+            if !editor.perf_scale_auto {
+                ft_config.scale = GraphScale::Fixed;
+                ft_config.fixed_max = editor.perf_fixed_max as f64;
+            }
+            ui.add(
+                PerfGraph::new(
+                    egui::Id::new("perf_frame_time_graph"),
+                    "Frame Time",
+                    &ft_values,
+                )
+                .window_seconds(window_secs)
+                .sample_hz(60.0)
+                .config(ft_config)
+                .height(110.0),
+            );
+
+            ui.add_space(6.0);
+            ui.separator();
+            ui.add_space(2.0);
+            Self::draw_perf_controls_row(ui, perf, editor);
+            return;
+        }
+
+        // ── Center: the two live graphs. Frame Time gets more space. ──────
+        if editor.perf_show_fps_graph {
+            let mut fps_config =
+                PerfGraphConfig::new("fps", "fps").with_target(perf.target_fps, "target fps");
+            if !editor.perf_scale_auto {
+                fps_config.scale = GraphScale::Fixed;
+                fps_config.fixed_max = editor.perf_fixed_max as f64;
+            }
+            ui.add(
+                PerfGraph::new(egui::Id::new("perf_fps_graph"), "FPS", &fps_values)
+                    .window_seconds(window_secs)
+                    .sample_hz(60.0)
+                    .config(fps_config)
+                    .height(90.0),
+            );
+            ui.add_space(4.0);
+        }
+
+        if editor.perf_show_frame_time_graph {
+            let target_ms = 1000.0 / perf.target_fps.max(1.0);
+            let mut ft_config = PerfGraphConfig::new("ms", "ms").with_target(target_ms, "target");
+            if !editor.perf_scale_auto {
+                ft_config.scale = GraphScale::Fixed;
+                ft_config.fixed_max = editor.perf_fixed_max as f64;
+            }
+            ui.add(
+                PerfGraph::new(
+                    egui::Id::new("perf_frame_time_graph"),
+                    "Frame Time",
+                    &ft_values,
+                )
+                .window_seconds(window_secs)
+                .sample_hz(60.0)
+                .config(ft_config)
+                .height(150.0),
+            );
+        }
+
+        ui.add_space(6.0);
+        ui.separator();
+        ui.add_space(2.0);
+
+        // ── Bottom panel: controls. ────────────────────────────────────────
+        Self::draw_perf_controls_row(ui, perf, editor);
+    }
+
+    fn draw_perf_controls_row(
+        ui: &mut egui::Ui,
+        perf: &mut PerformanceMonitor,
+        editor: &mut Editor,
+    ) {
+        ui.horizontal(|ui| {
+            ui.label("Interval:");
+            for w in crate::performance::TimeWindow::ALL {
+                if ui
+                    .selectable_label(editor.perf_window == w, w.label())
+                    .clicked()
+                {
+                    editor.perf_window = w;
+                }
+            }
+            ui.separator();
+            ui.label("Target FPS:");
+            let mut target = perf.target_fps as f32;
+            ui.add(egui::Slider::new(&mut target, 30.0..=240.0).suffix(" fps"));
+            perf.target_fps = target as f64;
+            ui.separator();
+            if ui
+                .button(if perf.paused { "Resume" } else { "Pause" })
+                .clicked()
+            {
+                perf.paused = !perf.paused;
+            }
+            if ui.button("Clear History").clicked() {
+                perf.clear_samples();
+                perf.fps_history.clear();
+                perf.frame_time_history.clear();
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Graphs:");
+            ui.checkbox(&mut editor.perf_show_fps_graph, "FPS");
+            ui.checkbox(&mut editor.perf_show_frame_time_graph, "Frame Time");
+            ui.separator();
+            ui.label("Scale:");
+            if ui
+                .selectable_label(editor.perf_scale_auto, "Auto")
+                .clicked()
+            {
+                editor.perf_scale_auto = true;
+            }
+            if ui
+                .selectable_label(!editor.perf_scale_auto, "Fixed")
+                .clicked()
+            {
+                editor.perf_scale_auto = false;
+            }
+            if !editor.perf_scale_auto {
+                ui.add(egui::Slider::new(&mut editor.perf_fixed_max, 10.0..=200.0));
+            }
+            ui.separator();
+            ui.checkbox(&mut editor.perf_compact, "Compact");
+        });
+    }
+
+    fn draw_perf_metrics_row(ui: &mut egui::Ui, perf: &PerformanceMonitor) {
+        let stats = &perf.frame_stats;
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.label(
+                    RichText::new(format!("{:.1}", stats.fps))
+                        .size(28.0)
+                        .strong(),
+                );
+                ui.label("FPS");
+            });
+            ui.separator();
+            ui.vertical(|ui| {
+                ui.label(
+                    RichText::new(format!("{:.2} ms", stats.frame_time_ms))
+                        .size(28.0)
+                        .strong(),
+                );
+                ui.label("Frame Time");
+            });
+            ui.separator();
+            ui.vertical(|ui| {
+                ui.label(
+                    RichText::new(format!("{:.2} ms", stats.cpu_frame_time_ms))
+                        .size(28.0)
+                        .strong(),
+                );
+                ui.label("CPU Time");
+            });
+            ui.separator();
+            ui.vertical(|ui| {
+                let gpu_text = stats
+                    .gpu_frame_time_ms
+                    .map_or("N/A".to_string(), |v| format!("{:.2} ms", v));
+                ui.label(RichText::new(gpu_text).size(28.0).strong());
+                ui.label("GPU Time");
+            });
+            ui.separator();
+            ui.vertical(|ui| {
+                ui.label(
+                    RichText::new(format!("{:.1}", perf.average_fps(10.0)))
+                        .size(28.0)
+                        .strong(),
+                );
+                ui.label("Avg FPS (10s)");
+            });
+        });
+
+        ui.add_space(4.0);
+        ui.separator();
+        ui.add_space(2.0);
+
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 ui.label(RichText::new("Low FPS (1%)").strong());
@@ -3922,32 +4203,31 @@ impl Editor {
             });
             ui.separator();
             ui.vertical(|ui| {
+                ui.label(RichText::new("Max Frame Time (10s)").strong());
+                ui.label(format!("{:.2} ms", perf.max_frame_time(10.0)));
+            });
+            ui.separator();
+            ui.vertical(|ui| {
                 ui.label(RichText::new("Fixed Updates / Frame").strong());
                 ui.label(format!("{}", stats.fixed_updates_count));
             });
+            ui.separator();
+            ui.vertical(|ui| {
+                ui.label(RichText::new("Memory Usage").strong());
+                let mem_text = perf
+                    .memory_stats
+                    .process_working_set_bytes
+                    .map_or("N/A".to_string(), |b| {
+                        format!("{:.1} MB", b as f64 / 1_048_576.0)
+                    });
+                ui.label(mem_text);
+            });
+            ui.separator();
+            ui.vertical(|ui| {
+                ui.label(RichText::new("Entities").strong());
+                ui.label(format!("{}", perf.ecs_stats.entity_count));
+            });
         });
-
-        ui.add_space(8.0);
-        ui.separator();
-        ui.add_space(4.0);
-
-        // Graphs
-        ui.label(RichText::new("FPS History").strong());
-        Self::draw_sparkline(
-            ui,
-            &perf.fps_history,
-            200.0,
-            Color32::from_rgb(80, 200, 100),
-        );
-
-        ui.add_space(4.0);
-        ui.label(RichText::new("Frame Time History").strong());
-        Self::draw_sparkline(
-            ui,
-            &perf.frame_time_history,
-            200.0,
-            Color32::from_rgb(200, 80, 80),
-        );
     }
 
     fn draw_perf_cpu_profiler(ui: &mut egui::Ui, perf: &PerformanceMonitor) {
@@ -4270,7 +4550,7 @@ impl Editor {
         ui.add_space(4.0);
 
         egui::ScrollArea::vertical()
-            .id_source("ecs_components_scroll")
+            .id_salt("ecs_components_scroll")
             .max_height(200.0)
             .show(ui, |ui| {
                 egui::Grid::new("ecs_components_grid")
@@ -4297,7 +4577,7 @@ impl Editor {
         ui.add_space(4.0);
 
         egui::ScrollArea::vertical()
-            .id_source("ecs_resources_scroll")
+            .id_salt("ecs_resources_scroll")
             .max_height(150.0)
             .show(ui, |ui| {
                 for resource in &stats.resources {
@@ -4313,64 +4593,13 @@ impl Editor {
         ui.add_space(4.0);
 
         egui::ScrollArea::vertical()
-            .id_source("ecs_systems_scroll")
+            .id_salt("ecs_systems_scroll")
             .max_height(150.0)
             .show(ui, |ui| {
                 for (stage, system) in &stats.systems {
                     ui.label(format!("{} -> {}", stage, system));
                 }
             });
-    }
-
-    fn draw_sparkline(ui: &mut egui::Ui, history: &PerformanceHistory, width: f32, color: Color32) {
-        let values = history.values();
-        if values.is_empty() {
-            return;
-        }
-
-        let max_val = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let min_val = values.iter().copied().fold(f32::INFINITY, f32::min);
-        let range = max_val - min_val;
-
-        let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 60.0), Sense::hover());
-        let painter = ui.painter();
-
-        let points: Vec<Pos2> = values
-            .iter()
-            .enumerate()
-            .map(|(i, &v)| {
-                let x = rect.left() + (i as f32 / (values.len() - 1).max(1) as f32) * width;
-                let y = rect.bottom() - ((v - min_val) / range.max(0.001)) * rect.height();
-                Pos2::new(x, y)
-            })
-            .collect();
-
-        // Background
-        painter.rect_filled(rect, 4.0, Color32::from_rgb(25, 26, 29));
-
-        // Line
-        if points.len() >= 2 {
-            let stroke = Stroke::new(1.5, color);
-            for i in 1..points.len() {
-                painter.line_segment([points[i - 1], points[i]], stroke);
-            }
-        }
-
-        // Min/Max labels
-        painter.text(
-            Pos2::new(rect.left() + 4.0, rect.top() + 4.0),
-            egui::Align2::LEFT_TOP,
-            format!("{:.1}", max_val),
-            FontId::proportional(10.0),
-            color,
-        );
-        painter.text(
-            Pos2::new(rect.left() + 4.0, rect.bottom() - 4.0),
-            egui::Align2::LEFT_BOTTOM,
-            format!("{:.1}", min_val),
-            FontId::proportional(10.0),
-            color,
-        );
     }
 
     fn format_bytes(bytes: u64) -> String {
@@ -4393,6 +4622,7 @@ impl Editor {
 pub struct EditorTabViewer<'a> {
     pub editor: &'a mut Editor,
     pub world: &'a mut World,
+    pub perf: &'a mut crate::performance::PerformanceMonitor,
     pub actions: &'a mut Vec<DockAction>,
 }
 
@@ -4414,7 +4644,7 @@ impl<'a> egui_dock::TabViewer for EditorTabViewer<'a> {
             EditorTab::OutputLog => self.editor.draw_output_log(ui),
             EditorTab::ScriptEditor => self.editor.draw_script_editor(ui),
             EditorTab::GraphicsSettings => self.editor.draw_graphics_settings(ui),
-            EditorTab::PerformanceMonitor => self.editor.draw_performance_monitor(ui),
+            EditorTab::PerformanceMonitor => self.editor.draw_performance_monitor(ui, self.world, self.perf),
         }
     }
 

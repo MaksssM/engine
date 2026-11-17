@@ -17,7 +17,7 @@ use crate::{
     editor::Editor,
     events::{EventCursor, Events},
     input::{MouseButton as EngineMouseButton, UiInput},
-    performance::{Metric, PerformanceMonitor, RendererStatistics, collect_ecs_statistics},
+    performance::{Metric, PerformanceMonitor},
     quality::QualityPreset,
     renderer::{Renderable, Renderer, collect_render_snapshot},
     time::{Clock, FixedTimestep, FpsMeter},
@@ -385,6 +385,8 @@ impl EngineApp {
             }
             match renderer.render_scene(&render_snapshot) {
                 Ok((frame, view)) => {
+                    let device = &renderer.device;
+                    let queue = &renderer.queue;
                     let renderer_stats = crate::performance::RendererStatistics {
                         renderable_entities: render_snapshot.renderables.len() as u32,
                         visible_entities: render_snapshot.renderables.len() as u32,
@@ -425,7 +427,10 @@ impl EngineApp {
                         renderer.material_assets.len() as u32,
                         None,
                     );
-                    self.ecs.world.insert_resource(self.performance.clone());
+
+                    // End frame BEFORE inserting into world and drawing editor,
+                    // so the PerformanceMonitor in the world has the current frame's stats.
+                    self.performance.end_frame(frame_time.as_secs_f64());
 
                     if let (Some(window), Some(editor)) =
                         (self.window.as_ref(), self.editor.as_mut())
@@ -434,17 +439,16 @@ impl EngineApp {
                             window,
                             frame,
                             &view,
-                            &renderer.device,
-                            &renderer.queue,
+                            device,
+                            queue,
                             &mut self.ecs.world,
+                            &mut self.performance,
+                            (),
                             fps as f32,
                         );
-                        renderer.wireframe_mode = editor.wireframe;
                     }
-
-                    if let Some(res) = self.ecs.world.get_resource::<PerformanceMonitor>() {
-                        self.performance.set_enabled(res.enabled());
-                        self.performance.set_detailed(res.detailed());
+                    if let Some(editor) = self.editor.as_mut() {
+                        renderer.wireframe_mode = editor.wireframe;
                     }
                 }
                 Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
@@ -457,8 +461,6 @@ impl EngineApp {
                 Err(wgpu::SurfaceError::Other) => warn!("GPU surface error"),
             }
         }
-
-        self.performance.end_frame(frame_time.as_secs_f64());
 
         if self.fps.record_frame(frame_time).is_some() {
             let fixed_step_ms = self

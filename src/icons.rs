@@ -86,6 +86,9 @@ impl Icons {
     pub const UP: &str = "▲";
     pub const HOME: &str = "⌂";
 
+    // Diagnostics icons
+    pub const PERFORMANCE: &str = "📊";
+
     // View mode icons
     pub const GRID_VIEW: &str = "⊞";
     pub const LIST_VIEW: &str = "☰";
