@@ -349,6 +349,11 @@ impl EngineApp {
         // Rendering resource preparation is once per frame; simulation timing is
         // owned by GameLoop so FixedUpdate cannot be executed twice.
         self.update_camera_controller(step_seconds);
+        // Apply view-mode camera changes before extracting the render snapshot
+        // so the surface pass uses the same orientation as the editor viewport.
+        if let Some(editor) = self.editor.as_mut() {
+            editor.apply_view_camera(&mut self.ecs.world);
+        }
         let extraction_started = std::time::Instant::now();
         let render_snapshot = collect_render_snapshot(&mut self.ecs.world);
         self.performance.record(
@@ -356,6 +361,11 @@ impl EngineApp {
             extraction_started.elapsed().as_secs_f64() * 1000.0,
         );
         if let Some(renderer) = self.renderer.as_mut() {
+            // Apply the current camera before building this frame's uniforms,
+            // otherwise the surface render lags the editor camera by a frame.
+            if let Some((camera, transform)) = render_snapshot.camera {
+                renderer.set_camera(&camera, &transform);
+            }
             renderer.update(&render_snapshot, step_seconds);
         }
         let entity_count = self
@@ -375,63 +385,54 @@ impl EngineApp {
 
         // Process UI widgets before rendering (writes to renderer state)
         self.process_ui();
-        if let Some(editor) = self.editor.as_mut() {
-            editor.apply_view_camera(&mut self.ecs.world);
-        }
 
         if let Some(renderer) = self.renderer.as_mut() {
-            if let Some((camera, transform)) = render_snapshot.camera {
-                renderer.set_camera(&camera, &transform);
-            }
-            match renderer.render_scene(&render_snapshot) {
+            let result = renderer.render_scene(&render_snapshot);
+            let renderer_stats = crate::performance::RendererStatistics {
+                renderable_entities: render_snapshot.renderables.len() as u32,
+                visible_entities: render_snapshot.renderables.len() as u32,
+                draw_calls: renderer.frame_draw_calls,
+                triangles: renderer.frame_triangles,
+                vertices: renderer.frame_vertices,
+                meshes: renderer.mesh_assets.len() as u32,
+                materials: renderer.material_assets.len() as u32,
+                textures: None,
+                lights: render_snapshot.directional_light.is_some() as u32,
+                shadow_casters: renderer.frame_shadow_casters as u32,
+                passes: renderer.frame_passes,
+                gpu_frame_time_ms: None,
+            };
+            self.performance.set_renderer(renderer_stats);
+
+            let systems_info = self
+                .game_loop
+                .scheduler
+                .timings()
+                .iter()
+                .map(|t| {
+                    (
+                        t.name.clone(),
+                        format!("{:?} ({:.3} ms)", t.stage, t.last_ms),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let ecs_stats =
+                crate::performance::collect_ecs_statistics(&mut self.ecs.world, &systems_info);
+            self.performance.set_ecs(ecs_stats);
+            self.performance.refresh_memory_statistics(
+                entity_count as u32,
+                (renderer.mesh_assets.len() + renderer.material_assets.len()) as u32,
+                renderer.mesh_assets.len() as u32,
+                renderer.material_assets.len() as u32,
+                None,
+            );
+
+            // End frame BEFORE inserting into world and drawing editor,
+            // so the PerformanceMonitor in the world has the current frame's stats.
+            self.performance.end_frame(frame_time.as_secs_f64());
+
+            match result {
                 Ok((frame, view)) => {
-                    let device = &renderer.device;
-                    let queue = &renderer.queue;
-                    let renderer_stats = crate::performance::RendererStatistics {
-                        renderable_entities: render_snapshot.renderables.len() as u32,
-                        visible_entities: render_snapshot.renderables.len() as u32,
-                        draw_calls: renderer.frame_draw_calls,
-                        triangles: renderer.frame_triangles,
-                        vertices: renderer.frame_vertices,
-                        meshes: renderer.mesh_assets.len() as u32,
-                        materials: renderer.material_assets.len() as u32,
-                        textures: None,
-                        lights: render_snapshot.directional_light.is_some() as u32,
-                        shadow_casters: renderer.frame_shadow_casters as u32,
-                        passes: renderer.frame_passes,
-                        gpu_frame_time_ms: None,
-                    };
-                    self.performance.set_renderer(renderer_stats);
-
-                    let systems_info = self
-                        .game_loop
-                        .scheduler
-                        .timings()
-                        .iter()
-                        .map(|t| {
-                            (
-                                t.name.clone(),
-                                format!("{:?} ({:.3} ms)", t.stage, t.last_ms),
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                    let ecs_stats = crate::performance::collect_ecs_statistics(
-                        &mut self.ecs.world,
-                        &systems_info,
-                    );
-                    self.performance.set_ecs(ecs_stats);
-                    self.performance.refresh_memory_statistics(
-                        entity_count as u32,
-                        (renderer.mesh_assets.len() + renderer.material_assets.len()) as u32,
-                        renderer.mesh_assets.len() as u32,
-                        renderer.material_assets.len() as u32,
-                        None,
-                    );
-
-                    // End frame BEFORE inserting into world and drawing editor,
-                    // so the PerformanceMonitor in the world has the current frame's stats.
-                    self.performance.end_frame(frame_time.as_secs_f64());
-
                     if let (Some(window), Some(editor)) =
                         (self.window.as_ref(), self.editor.as_mut())
                     {
@@ -439,8 +440,7 @@ impl EngineApp {
                             window,
                             frame,
                             &view,
-                            device,
-                            queue,
+                            renderer,
                             &mut self.ecs.world,
                             &mut self.performance,
                             (),
@@ -488,6 +488,14 @@ impl EngineApp {
     }
 
     fn update_camera_controller(&mut self, delta_seconds: f32) {
+        // Typing in a text field must not fly the camera around.
+        if self
+            .editor
+            .as_ref()
+            .is_some_and(|editor| editor.wants_keyboard_input())
+        {
+            return;
+        }
         let Some(input) = self
             .ecs
             .world
@@ -553,6 +561,14 @@ impl EngineApp {
         let rotation = glam::Quat::from_rotation_y(controller.yaw)
             * glam::Quat::from_rotation_x(controller.pitch);
         transform.rotation = rotation;
+
+        // Keep the editor's orbit pivot in front of the camera. Otherwise a
+        // WASD fly or arrow-key turn followed by scroll/orbit would snap the
+        // camera back to a stale pivot.
+        if let Some(editor) = self.editor.as_mut() {
+            editor.orbit_target =
+                transform.translation + controller.forward() * editor.orbit_distance;
+        }
     }
 
     fn reload_active_scene(&mut self) {

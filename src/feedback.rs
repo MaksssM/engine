@@ -236,18 +236,33 @@ pub fn apply_feedback_styles(ctx: &Context) {
 }
 
 pub trait TooltipExt {
-    fn engine_tooltip(self, title: &str, description: &str, shortcut: Option<&str>) -> Self;
+    fn engine_tooltip(
+        self,
+        title: &str,
+        description: impl AsRef<str>,
+        shortcut: Option<&str>,
+    ) -> Self;
 }
 
 impl TooltipExt for Response {
-    fn engine_tooltip(self, title: &str, description: &str, shortcut: Option<&str>) -> Self {
+    fn engine_tooltip(
+        self,
+        title: &str,
+        description: impl AsRef<str>,
+        shortcut: Option<&str>,
+    ) -> Self {
         self.on_hover_ui(|ui| {
             render_tooltip_content(ui, title, description, shortcut);
         })
     }
 }
 
-pub fn render_tooltip_content(ui: &mut Ui, title: &str, description: &str, shortcut: Option<&str>) {
+pub fn render_tooltip_content(
+    ui: &mut Ui,
+    title: &str,
+    description: impl AsRef<str>,
+    shortcut: Option<&str>,
+) {
     ui.set_max_width(280.0);
     ui.horizontal(|ui| {
         ui.label(
@@ -267,10 +282,11 @@ pub fn render_tooltip_content(ui: &mut Ui, title: &str, description: &str, short
         }
     });
 
-    if !description.is_empty() {
+    let desc = description.as_ref();
+    if !desc.is_empty() {
         ui.add_space(2.0);
         ui.label(
-            RichText::new(description)
+            RichText::new(desc)
                 .color(Color32::from_rgb(165, 172, 185))
                 .size(11.0),
         );

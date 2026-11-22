@@ -88,6 +88,7 @@ impl Icons {
 
     // Diagnostics icons
     pub const PERFORMANCE: &str = "📊";
+    pub const HISTORY: &str = "🕐";
 
     // View mode icons
     pub const GRID_VIEW: &str = "⊞";

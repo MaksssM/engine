@@ -58,6 +58,11 @@ impl CameraController {
         let rot = glam::Quat::from_rotation_y(self.yaw) * glam::Quat::from_rotation_x(self.pitch);
         rot.mul_vec3(Vec3::X)
     }
+
+    pub fn up(&self) -> Vec3 {
+        let rot = glam::Quat::from_rotation_y(self.yaw) * glam::Quat::from_rotation_x(self.pitch);
+        rot.mul_vec3(Vec3::Y)
+    }
 }
 
 #[cfg(test)]

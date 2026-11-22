@@ -423,4 +423,85 @@ mod tests {
         assert!(manager.activate("copy"));
         assert_eq!(manager.active().unwrap().entities.len(), 1);
     }
+
+    #[test]
+    fn scene_round_trip_preserves_hierarchy_and_components() {
+        let mut manager = SceneManager::default();
+        let scene = manager.create("model");
+        let root = scene.add_entity("Root", Vec3::ZERO, None);
+        let child = scene.add_entity("Child", Vec3::Y * 2.0, Some(root));
+        let grandchild = scene.add_entity("Grandchild", Vec3::Z * 3.0, Some(child));
+
+        scene.entities[root].components.mesh_filter = Some(MeshFilter {
+            mesh_path: "meshes/root.obj".to_string(),
+        });
+        scene.entities[root].components.mesh_renderer = Some(MeshRenderer {
+            material_path: "materials/root.mat".to_string(),
+            cast_shadows: true,
+            receive_shadows: false,
+        });
+        scene.entities[child].components.camera = Some(Camera3D::default());
+        scene.entities[grandchild].components.light = Some(Light {
+            color: [1.0, 0.5, 0.25],
+            intensity: 3.5,
+            range: 20.0,
+            ..Default::default()
+        });
+
+        let serialized = scene.to_ron().unwrap();
+        let mut manager2 = SceneManager::default();
+        manager2.insert("copy", Scene::from_ron(&serialized).unwrap());
+        assert!(manager2.get("copy").unwrap().validate().is_ok());
+
+        let mut world = bevy_ecs::world::World::new();
+        world.insert_resource(crate::core::resources::PersistentIdRegistry::default());
+        manager2.activate("copy");
+        let entities = manager2.spawn_active(&mut world).unwrap();
+        assert_eq!(entities.len(), 3);
+
+        let e_root = entities[root];
+        let e_child = entities[child];
+        let e_grandchild = entities[grandchild];
+
+        // Hierarchy restored
+        assert_eq!(world.get::<crate::transform::Parent>(e_root), None);
+        assert_eq!(
+            world.get::<crate::transform::Parent>(e_child),
+            Some(&crate::transform::Parent(e_root))
+        );
+        assert_eq!(
+            world.get::<crate::transform::Parent>(e_grandchild),
+            Some(&crate::transform::Parent(e_child))
+        );
+
+        // Transforms restored
+        assert_eq!(
+            world.get::<Transform>(e_child).map(|t| t.translation),
+            Some(Vec3::Y * 2.0)
+        );
+
+        // Components restored
+        assert_eq!(
+            world
+                .get::<MeshFilter>(e_root)
+                .map(|c| c.mesh_path.as_str()),
+            Some("meshes/root.obj")
+        );
+        assert!(world.get::<MeshRenderer>(e_root).is_some());
+        assert!(world.get::<Camera3D>(e_child).is_some());
+        assert_eq!(
+            world.get::<Light>(e_grandchild).map(|l| l.intensity),
+            Some(3.5)
+        );
+
+        // UIDs registered
+        {
+            let registry = world.resource::<crate::core::resources::PersistentIdRegistry>();
+            assert!(
+                registry
+                    .resolve(manager2.get("copy").unwrap().entities[root].uid.unwrap())
+                    .is_some()
+            );
+        }
+    }
 }

@@ -41,7 +41,7 @@ pub struct ViewportCamera {
     pub near: f32,
     pub far: f32,
     pub orthographic: bool,
-    /// World-units-per-pixel when `orthographic` is true.
+    /// World-space height covered by the orthographic view.
     pub ortho_scale: f32,
 }
 
@@ -207,6 +207,28 @@ pub fn ray_aabb(origin: Vec3, direction: Vec3, aabb: Aabb) -> Option<f32> {
     Some(if t_min >= 0.0 { t_min } else { t_max })
 }
 
+/// Screen-space length of gizmo axis handles, in points. Keeping handles a
+/// constant size means they stay visible and clickable at any zoom level.
+pub const GIZMO_HANDLE_LENGTH: f32 = 64.0;
+
+/// Project an axis of a world-space gizmo into a fixed-length screen handle.
+/// Returns `None` when the origin/axis is behind the camera or the axis points
+/// almost straight at the camera (where its screen direction is unstable).
+pub fn gizmo_screen_handle(
+    camera: &ViewportCamera,
+    rect: ViewportRect,
+    origin: Vec3,
+    axis_dir: Vec3,
+) -> Option<Vec2> {
+    let origin_screen = world_to_screen(camera, rect, origin)?;
+    let tip_screen = world_to_screen(camera, rect, origin + axis_dir)?;
+    let direction = tip_screen - origin_screen;
+    if direction.length_squared() < 16.0 {
+        return None;
+    }
+    Some(origin_screen + direction.normalize() * GIZMO_HANDLE_LENGTH)
+}
+
 /// Closest approach between a ray and an infinite line. Returns the parameter
 /// along the line (world units from `origin` in `direction`).
 pub fn ray_line_parameter(ray_o: Vec3, ray_d: Vec3, line_o: Vec3, line_d: Vec3) -> Option<f32> {
@@ -223,7 +245,8 @@ pub fn ray_line_parameter(ray_o: Vec3, ray_d: Vec3, line_o: Vec3, line_d: Vec3) 
     if denom.abs() < 1e-6 {
         return None;
     }
-    Some((b * d - e) / denom)
+    // Parameter along `line_d` of the point closest to the ray.
+    Some((e - b * d) / denom)
 }
 
 /// Point on a ray closest to a world point, returned as a distance along the ray.
@@ -270,6 +293,65 @@ pub fn axis_vector(axis: GizmoAxis, basis: Quat) -> Vec3 {
         GizmoAxis::Uniform => Vec3::ONE.normalize(),
     };
     basis * local
+}
+
+/// Intersect a ray with an infinite plane. Returns the hit point in front of
+/// the ray origin, if any.
+pub fn ray_plane(ray_o: Vec3, ray_d: Vec3, plane_o: Vec3, plane_n: Vec3) -> Option<Vec3> {
+    let normal = plane_n.normalize_or_zero();
+    let direction = ray_d.normalize_or_zero();
+    if normal.length_squared() < 0.5 || direction.length_squared() < 0.5 {
+        return None;
+    }
+    let denom = direction.dot(normal);
+    if denom.abs() < 1e-6 {
+        return None;
+    }
+    let t = (plane_o - ray_o).dot(normal) / denom;
+    if t < 0.0 {
+        return None;
+    }
+    Some(ray_o + direction * t)
+}
+
+/// Translation delta for a gizmo drag between two screen rays.
+///
+/// Unlike [`drag_translation`] this measures the motion relative to the ray at
+/// mouse-down, so grabbing a handle away from its origin does not make the
+/// object jump on the first frame.
+pub fn drag_translation_delta(
+    axis: GizmoAxis,
+    basis: Quat,
+    start_ray_o: Vec3,
+    start_ray_d: Vec3,
+    current_ray_o: Vec3,
+    current_ray_d: Vec3,
+    anchor: Vec3,
+    snap: f32,
+) -> Vec3 {
+    let axis_dir = axis_vector(axis, basis);
+    let delta = match axis {
+        GizmoAxis::X | GizmoAxis::Y | GizmoAxis::Z => {
+            let start_t =
+                ray_line_parameter(start_ray_o, start_ray_d, anchor, axis_dir).unwrap_or(0.0);
+            let current_t =
+                ray_line_parameter(current_ray_o, current_ray_d, anchor, axis_dir).unwrap_or(0.0);
+            axis_dir * (current_t - start_t)
+        }
+        GizmoAxis::Xy | GizmoAxis::Xz | GizmoAxis::Yz => {
+            let normal = axis_dir;
+            let (Some(start_hit), Some(current_hit)) = (
+                ray_plane(start_ray_o, start_ray_d, anchor, normal),
+                ray_plane(current_ray_o, current_ray_d, anchor, normal),
+            ) else {
+                return Vec3::ZERO;
+            };
+            let delta = current_hit - start_hit;
+            delta - normal * delta.dot(normal)
+        }
+        GizmoAxis::Uniform => Vec3::ZERO,
+    };
+    snap_translation(delta, snap)
 }
 
 /// Apply a translation drag. `start` is the transform at mouse-down.
@@ -341,11 +423,7 @@ pub fn drag_rotation_angle(
 /// Scale factor from a drag. `1.0` means unchanged.
 pub fn drag_scale_factor(start_screen: Vec2, current_screen: Vec2, uniform: bool) -> f32 {
     let delta = current_screen - start_screen;
-    let pixels = if uniform {
-        delta.x - delta.y
-    } else {
-        delta.x
-    };
+    let pixels = if uniform { delta.x - delta.y } else { delta.x };
     (1.0 + pixels * 0.01).max(0.01)
 }
 
@@ -442,15 +520,7 @@ mod tests {
         let start = Vec3::new(1.0, 2.0, 3.0);
         let ray_o = Vec3::new(0.0, 2.0, 10.0);
         let ray_d = Vec3::new(0.0, 0.0, -1.0);
-        let moved = drag_translation(
-            start,
-            GizmoAxis::X,
-            Quat::IDENTITY,
-            ray_o,
-            ray_d,
-            0.0,
-            0.0,
-        );
+        let moved = drag_translation(start, GizmoAxis::X, Quat::IDENTITY, ray_o, ray_d, 0.0, 0.0);
         // Ray is parallel to Z and aimed at y of the object, so X stays put
         // when the ray never leaves the object's X.
         assert!((moved.y - start.y).abs() < 0.001);
@@ -466,6 +536,65 @@ mod tests {
     }
 
     #[test]
+    fn translation_delta_is_zero_for_unchanged_ray() {
+        let ray_o = Vec3::new(0.0, 2.0, 10.0);
+        let ray_d = Vec3::new(0.0, 0.0, -1.0);
+        let delta = drag_translation_delta(
+            GizmoAxis::X,
+            Quat::IDENTITY,
+            ray_o,
+            ray_d,
+            ray_o,
+            ray_d,
+            Vec3::new(1.0, 2.0, 3.0),
+            0.0,
+        );
+        assert!(delta.length() < 1e-5, "delta={delta:?}");
+    }
+
+    #[test]
+    fn translation_delta_moves_along_axis() {
+        let anchor = Vec3::ZERO;
+        let start_o = Vec3::new(0.0, 0.0, 10.0);
+        let start_d = Vec3::new(0.0, 0.0, -1.0);
+        // Move the ray one world unit to the right; on the X axis line through
+        // the origin that is a one unit translation.
+        let current_o = Vec3::new(1.0, 0.0, 10.0);
+        let delta = drag_translation_delta(
+            GizmoAxis::X,
+            Quat::IDENTITY,
+            start_o,
+            start_d,
+            current_o,
+            start_d,
+            anchor,
+            0.0,
+        );
+        assert!((delta.x - 1.0).abs() < 1e-4, "delta={delta:?}");
+        assert!(delta.y.abs() < 1e-4 && delta.z.abs() < 1e-4);
+    }
+
+    #[test]
+    fn ray_plane_hits_plane_in_front() {
+        let hit = ray_plane(
+            Vec3::new(0.0, 0.0, 10.0),
+            Vec3::new(0.0, 0.0, -1.0),
+            Vec3::ZERO,
+            Vec3::Z,
+        );
+        assert_eq!(hit, Some(Vec3::ZERO));
+        assert!(
+            ray_plane(
+                Vec3::new(0.0, 0.0, 10.0),
+                Vec3::new(0.0, 0.0, 1.0),
+                Vec3::ZERO,
+                Vec3::Z
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
     fn rotation_angle_is_quarter_turn() {
         let angle = drag_rotation_angle(
             Vec3::ZERO,
@@ -475,7 +604,10 @@ mod tests {
             Vec3::Z,
         );
         // Looking down -Y, the plane hit is +X. From +Z that is +90 degrees around Y.
-        assert!((angle - std::f32::consts::FRAC_PI_2).abs() < 0.05, "{angle}");
+        assert!(
+            (angle - std::f32::consts::FRAC_PI_2).abs() < 0.05,
+            "{angle}"
+        );
     }
 
     #[test]
@@ -494,7 +626,10 @@ mod tests {
 
     #[test]
     fn local_basis_rotates_x_axis() {
-        let basis = gizmo_basis(CoordSpace::Local, Quat::from_rotation_y(std::f32::consts::FRAC_PI_2));
+        let basis = gizmo_basis(
+            CoordSpace::Local,
+            Quat::from_rotation_y(std::f32::consts::FRAC_PI_2),
+        );
         let axis = axis_vector(GizmoAxis::X, basis);
         assert!(axis.dot(Vec3::Z).abs() > 0.99 || axis.dot(Vec3::NEG_Z).abs() > 0.99);
     }
@@ -508,6 +643,34 @@ mod tests {
             height: 100.0,
         };
         assert!(world_to_screen(&persp(), rect, Vec3::ZERO).is_none());
+    }
+
+    #[test]
+    fn gizmo_handles_have_constant_screen_length() {
+        let camera = persp();
+        let origin = world_to_screen(&camera, rect(), Vec3::ZERO).unwrap();
+        for axis in [Vec3::X, Vec3::Y] {
+            let tip = gizmo_screen_handle(&camera, rect(), Vec3::ZERO, axis).unwrap();
+            assert!(((tip - origin).length() - GIZMO_HANDLE_LENGTH).abs() < 1e-3);
+        }
+    }
+
+    #[test]
+    fn gizmo_handle_pointing_at_camera_is_skipped() {
+        // The perspective test camera looks down -Z from +Z, so the +Z axis
+        // projects to a single point and has no usable screen direction.
+        assert!(gizmo_screen_handle(&persp(), rect(), Vec3::ZERO, Vec3::Z).is_none());
+    }
+
+    #[test]
+    fn orthographic_gizmo_handle_has_constant_length() {
+        let camera = ViewportCamera {
+            orthographic: true,
+            ..persp()
+        };
+        let origin = world_to_screen(&camera, rect(), Vec3::ZERO).unwrap();
+        let tip = gizmo_screen_handle(&camera, rect(), Vec3::ZERO, Vec3::X).unwrap();
+        assert!(((tip - origin).length() - GIZMO_HANDLE_LENGTH).abs() < 1e-3);
     }
 
     #[test]

@@ -1,6 +1,9 @@
 #![allow(dead_code)]
 
 mod app;
+mod asset_database;
+mod asset_importer;
+mod asset_storage;
 mod assets;
 mod assets_ui;
 mod camera;
@@ -12,6 +15,7 @@ mod ecs;
 mod editor;
 mod events;
 mod feedback;
+mod gltf_importer;
 mod icons;
 mod input;
 mod performance;
@@ -21,9 +25,12 @@ mod renderer;
 mod scene;
 mod time;
 mod transform;
-mod viewport;
 mod ui;
 mod ui_new;
+mod viewport;
+
+// Re-export AssetData from assets module for other modules
+pub use crate::assets::AssetData;
 
 fn main() -> Result<(), winit::error::EventLoopError> {
     app::run()

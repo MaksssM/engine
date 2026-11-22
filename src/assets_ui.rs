@@ -322,6 +322,44 @@ impl ObjMesh {
         Some(Self { vertices, indices })
     }
 
+    /// Parse all meshes from a glTF (.gltf or .glb) file into an `ObjMesh` for 3D preview.
+    pub fn parse_gltf(path: &std::path::Path) -> Option<Self> {
+        let (document, buffers, _) = gltf::import(path).ok()?;
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+
+        for mesh in document.meshes() {
+            for primitive in mesh.primitives() {
+                let reader = primitive.reader(|buffer| Some(&buffers[buffer.index()]));
+                let base_vertex = vertices.len() as u32;
+
+                if let Some(pos_iter) = reader.read_positions() {
+                    for pos in pos_iter {
+                        vertices.push(pos);
+                    }
+                }
+
+                if let Some(indices_iter) = reader.read_indices() {
+                    for idx in indices_iter.into_u32() {
+                        indices.push(base_vertex + idx);
+                    }
+                } else {
+                    // Non-indexed geometry: sequential indices
+                    let vert_count = vertices.len() as u32 - base_vertex;
+                    for i in 0..vert_count {
+                        indices.push(base_vertex + i);
+                    }
+                }
+            }
+        }
+
+        if vertices.is_empty() || indices.is_empty() {
+            None
+        } else {
+            Some(Self { vertices, indices })
+        }
+    }
+
     /// Number of triangles (assumes triangulated faces; larger polygons are
     /// fanned).
     pub fn triangle_count(&self) -> usize {
@@ -343,6 +381,28 @@ impl ObjMesh {
             max = [0.0; 3];
         }
         (min, max)
+    }
+
+    /// Convert into `MeshData` ready for GPU upload.
+    pub fn to_mesh_data(&self, name: String) -> crate::gltf_importer::MeshData {
+        let (min, max) = self.bounds();
+        let vertices = self
+            .vertices
+            .iter()
+            .map(|&pos| crate::gltf_importer::MeshVertex {
+                position: pos,
+                normal: [0.0, 1.0, 0.0],
+                tex_coords: [0.0, 0.0],
+                tangent: [1.0, 0.0, 0.0, 1.0],
+            })
+            .collect();
+        crate::gltf_importer::MeshData {
+            vertices,
+            indices: self.indices.clone(),
+            primitive_type: crate::gltf_importer::PrimitiveType::Triangles,
+            bounds: crate::gltf_importer::MeshBounds { min, max },
+            name,
+        }
     }
 }
 

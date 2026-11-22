@@ -159,7 +159,7 @@ impl<'a> PerfGraph<'a> {
         painter.rect_filled(rect, 4.0, GRAPH_BG);
         painter.rect_stroke(
             rect,
-            4.0_f32,
+            4.0,
             Stroke::new(1.0_f32, GRID_COLOR),
             egui::StrokeKind::Middle,
         );
@@ -267,7 +267,10 @@ impl<'a> PerfGraph<'a> {
                 fill_color(),
                 Stroke::NONE,
             ));
-            painter.add(egui::Shape::line(points, Stroke::new(1.5_f32, SERIES_COLOR)));
+            painter.add(egui::Shape::line(
+                points,
+                Stroke::new(1.5_f32, SERIES_COLOR),
+            ));
         }
 
         // Hover: crosshair + value tooltip.

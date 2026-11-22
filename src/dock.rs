@@ -14,10 +14,11 @@ pub enum EditorTab {
     ScriptEditor,
     GraphicsSettings,
     PerformanceMonitor,
+    History,
 }
 
 impl EditorTab {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Viewport,
         Self::WorldOutliner,
         Self::Details,
@@ -28,6 +29,7 @@ impl EditorTab {
         Self::ScriptEditor,
         Self::GraphicsSettings,
         Self::PerformanceMonitor,
+        Self::History,
     ];
 
     pub fn title(&self) -> &'static str {
@@ -42,6 +44,7 @@ impl EditorTab {
             Self::ScriptEditor => "Script Editor",
             Self::GraphicsSettings => "Graphics Settings",
             Self::PerformanceMonitor => "Performance Monitor",
+            Self::History => "History",
         }
     }
 
@@ -57,6 +60,7 @@ impl EditorTab {
             Self::ScriptEditor => "script",
             Self::GraphicsSettings => "graphics",
             Self::PerformanceMonitor => "performance",
+            Self::History => "history",
         }
     }
 }
@@ -121,6 +125,7 @@ impl WorkspacePreset {
                         EditorTab::ContentBrowser,
                         EditorTab::OutputLog,
                         EditorTab::PerformanceMonitor,
+                        EditorTab::History,
                     ],
                 );
                 state
@@ -140,7 +145,7 @@ impl WorkspacePreset {
                 let [_viewport, _bottom] = state.main_surface_mut().split_below(
                     viewport_node,
                     0.82,
-                    vec![EditorTab::ContentBrowser],
+                    vec![EditorTab::ContentBrowser, EditorTab::History],
                 );
                 state
             }
@@ -160,7 +165,7 @@ impl WorkspacePreset {
                 let [_content_node, _log_node] = state.main_surface_mut().split_below(
                     content_node,
                     0.95,
-                    vec![EditorTab::OutputLog],
+                    vec![EditorTab::OutputLog, EditorTab::History],
                 );
                 state
             }
@@ -179,7 +184,7 @@ impl WorkspacePreset {
                 let [_script, _log] = state.main_surface_mut().split_below(
                     script_node,
                     0.70,
-                    vec![EditorTab::OutputLog],
+                    vec![EditorTab::OutputLog, EditorTab::History],
                 );
                 state
             }
@@ -190,6 +195,7 @@ impl WorkspacePreset {
                     0.88,
                     vec![EditorTab::WorldOutliner],
                 );
+                // History can be opened on demand in Minimal
                 state
             }
         }
@@ -340,6 +346,7 @@ pub fn smart_open_tab(dock_state: &mut DockState<EditorTab>, tab: EditorTab) {
         EditorTab::ScriptEditor => Some((EditorTab::Viewport, egui_dock::Split::Below, 0.35)),
         EditorTab::GraphicsSettings => Some((EditorTab::Details, egui_dock::Split::Below, 0.5)),
         EditorTab::PerformanceMonitor => Some((EditorTab::OutputLog, egui_dock::Split::Right, 0.5)),
+        EditorTab::History => Some((EditorTab::OutputLog, egui_dock::Split::Above, 0.5)),
     };
 
     if let Some((neighbor, split, frac)) = preferred_neighbor {

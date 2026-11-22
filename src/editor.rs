@@ -2,18 +2,16 @@ use std::{
     collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
-    process::Command,
+    process::Command as ProcessCommand,
 };
 
 use bevy_ecs::{entity::Entity, world::World};
 use egui::{Color32, Context, Key, RichText, Sense, Stroke, Vec2};
-use glam::{Vec3};
+use glam::{Mat4, Quat, Vec3};
 use serde::{Deserialize, Serialize};
 use winit::{event::WindowEvent, window::Window};
 
-use crate::viewport::{
-    Aabb, CoordSpace, GizmoAxis, GizmoTool, ViewportCamera,
-};
+use crate::viewport::{Aabb, CoordSpace, GizmoAxis, GizmoTool, ViewportCamera, ViewportRect};
 
 use egui_dock::{DockArea, DockState, NodeIndex, SurfaceIndex};
 
@@ -22,7 +20,7 @@ use crate::{
         AssetKind, ObjMesh, PreviewMode, classify, count_assets, format_bytes, format_modified,
     },
     camera::CameraController,
-    commands::{HistoryManager, DEFAULT_HISTORY_CAPACITY},
+    commands::{Command as EditorCommand, DEFAULT_HISTORY_CAPACITY, HistoryManager},
     core::components::{FolderGroup, Locked, Visible},
     dock::{DockAction, EditorTab, WorkspacePreset, editor_dock_style},
     ecs::Name,
@@ -33,8 +31,28 @@ use crate::{
     icons::{IconSize, Icons},
     performance::PerformanceMonitor,
     scene::{Scene, SceneEntity},
-    transform::{Parent, Transform},
+    transform::{GlobalTransform, Parent, Transform},
 };
+
+/// State the Viewport panel needs in order to draw the 3D scene.
+#[derive(Clone, Copy)]
+pub struct ViewportTextureState {
+    pub texture_id: egui::TextureId,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Snap a vector component-wise to the given step. A step of `0` disables snapping.
+fn apply_snap(value: Vec3, step: f32) -> Vec3 {
+    if step <= 0.0 {
+        return value;
+    }
+    Vec3::new(
+        (value.x / step).round() * step,
+        (value.y / step).round() * step,
+        (value.z / step).round() * step,
+    )
+}
 
 const DEFAULT_SCRIPT_CONTROLLER: &str = r#"// Player Character Controller
 use engine::prelude::*;
@@ -230,6 +248,8 @@ pub struct Editor {
     pub orbit_target: Vec3,
     pub orbit_distance: f32,
     pub last_view_mode: ViewMode,
+    /// Track previous engine mode to detect play mode transitions
+    pub last_engine_mode: crate::core::resources::EngineMode,
 
     // Docking & Workspaces
     pub dock_state: Option<DockState<EditorTab>>,
@@ -258,6 +278,9 @@ pub struct Editor {
     pub preview_pitch: f32,
     pub preview_orbit_drag: Option<(f32, f32)>,
     pub open_asset_pending: Option<PathBuf>,
+    pub pending_instantiate_model: Option<PathBuf>,
+    pub pending_reimport_asset: Option<PathBuf>,
+    pub asset_database: crate::asset_database::AssetDatabase,
 
     // Feedback & Notifications
     pub notifications: NotificationManager,
@@ -265,12 +288,31 @@ pub struct Editor {
 
     // Viewport interaction state
     pub gizmo_interaction: Option<(Entity, GizmoTool, GizmoAxis, CoordSpace)>,
-    gizmo_drag_start: Option<Vec2>,
-    gizmo_anchor_ray: Option<(Vec3, f32)>,
+    pub gizmo_drag_start: Option<egui::Pos2>,
     pub gizmo_snap_translation: f32,
     pub gizmo_snap_rotation: f32,
     pub gizmo_snap_scale: f32,
     pub gizmo_local_space: bool,
+    /// Transform captured at gizmo drag start, so the whole gesture commits as
+    /// a single undoable command.
+    pub gizmo_drag_start_transform: Option<Transform>,
+    /// World-space transform at drag start (differs from the local transform
+    /// for parented entities).
+    pub gizmo_drag_start_world: Option<Transform>,
+    /// Inverse parent transform when dragging a child; `None` for roots.
+    pub gizmo_drag_parent_inverse: Option<Mat4>,
+
+    // Details panel editing state
+    pub transform_edit_start: Option<Transform>,
+
+    // Viewport scene texture (rendered offscreen, then blitted into panel).
+    viewport_texture_id: Option<egui::TextureId>,
+    viewport_texture_size: (u32, u32),
+    /// Set by `draw_viewport` so the offscreen scene pass can be skipped when
+    /// the viewport panel is not visible (e.g. Asset Editing workspace).
+    viewport_panel_drawn: bool,
+    /// Entity under the cursor, used for the hover highlight.
+    pub hovered_entity: Option<Entity>,
 }
 
 impl Editor {
@@ -351,22 +393,41 @@ impl Editor {
             preview_pitch: 0.3,
             preview_orbit_drag: None,
             open_asset_pending: None,
+            pending_instantiate_model: None,
+            pending_reimport_asset: None,
+            asset_database: crate::asset_database::AssetDatabase::load_or_create(&PathBuf::from(
+                "assets/asset_database.ron",
+            )),
             notifications: NotificationManager::default(),
             confirm_dialog: None,
             gizmo_interaction: None,
             gizmo_drag_start: None,
-            gizmo_anchor_ray: None,
             gizmo_snap_translation: 0.0,
             gizmo_snap_rotation: 0.0,
             gizmo_snap_scale: 0.0,
             gizmo_local_space: false,
+            viewport_texture_id: None,
+            viewport_texture_size: (0, 0),
+            viewport_panel_drawn: false,
+            hovered_entity: None,
+            gizmo_drag_start_transform: None,
+            gizmo_drag_start_world: None,
+            gizmo_drag_parent_inverse: None,
             history: HistoryManager::new(DEFAULT_HISTORY_CAPACITY),
+            last_engine_mode: crate::core::resources::EngineMode::Editor,
+            transform_edit_start: None,
         }
     }
     pub fn on_window_event(&mut self, window: &Window, event: &WindowEvent) -> bool {
         self.platform
             .as_mut()
             .is_some_and(|p| p.on_window_event(window, event).consumed)
+    }
+
+    /// True while a text widget owns the keyboard. Used to keep editor
+    /// shortcuts and fly-camera movement from firing while the user types.
+    pub fn wants_keyboard_input(&self) -> bool {
+        self.context.wants_keyboard_input()
     }
     pub fn apply_view_camera(&mut self, world: &mut World) {
         if self.view_mode != self.last_view_mode {
@@ -400,59 +461,319 @@ impl Editor {
     }
 
     /// Returns a ViewportCamera built from the editor's current state and ECS transform.
+    ///
+    /// The camera transform is the single source of truth for orientation in
+    /// every view mode: `apply_view_camera` writes the top/front/side rotation
+    /// into the same controller, so projecting from `position + forward` keeps
+    /// picking, gizmos and the rendered image aligned.
     pub fn viewport_camera(&self, world: &mut World) -> ViewportCamera {
-        let (camera_pos, camera_target_vec) = if let Some((t, c)) = world
+        let (position, forward) = if let Some((t, c)) = world
             .query::<(&Transform, &CameraController)>()
             .iter(world)
             .next()
         {
-            let pos = t.translation;
-            let tgt = pos + c.forward();
-            (pos, tgt)
+            (t.translation, c.forward())
         } else {
-            (Vec3::new(0.0, 0.0, 8.0), Vec3::ZERO)
+            (Vec3::new(0.0, 0.0, 8.0), Vec3::NEG_Z)
         };
         let orthographic = matches!(
             self.view_mode,
             ViewMode::Top | ViewMode::Front | ViewMode::Side | ViewMode::Orthographic
         );
-        let fov = self.camera_fov.to_radians();
-        let (target_pos, _target_z) = match self.view_mode {
-            ViewMode::Top => ((self.orbit_target.x, self.orbit_target.y + 100.0, self.orbit_target.z), 1000.0),
-            ViewMode::Front => ((self.orbit_target.x, self.orbit_target.y + 1.0, self.orbit_target.z + 100.0), 1000.0),
-            ViewMode::Side => ((self.orbit_target.x + 100.0, self.orbit_target.y + 1.0, self.orbit_target.z), 1000.0),
-            ViewMode::Orthographic => ((self.orbit_target.x, self.orbit_target.y, self.orbit_target.z), 100.0),
-            ViewMode::Perspective => ((camera_target_vec.x, camera_target_vec.y, camera_target_vec.z), 1000.0),
-        };
-        let target = Vec3::new(target_pos.0, target_pos.1, target_pos.2);
-        if orthographic {
-            ViewportCamera {
-                position: camera_pos,
-                target,
-                fov_y: fov,
-                near: 0.1,
-                far: 1000.0,
-                orthographic: true,
-                ortho_scale: 20.0,
-            }
-        } else {
-            ViewportCamera {
-                position: camera_pos,
-                target,
-                fov_y: fov,
-                near: 0.1,
-                far: 1000.0,
-                orthographic: false,
-                ortho_scale: 20.0,
-            }
+        ViewportCamera {
+            position,
+            target: position + forward,
+            fov_y: self.camera_fov.to_radians(),
+            near: 0.1,
+            far: 1000.0,
+            orthographic,
+            // Match the perspective framing at the current orbit distance so
+            // switching between projections keeps the subject roughly the
+            // same size; scrolling changes orbit_distance and thus zoom.
+            ortho_scale: (2.0
+                * self.orbit_distance
+                * (self.camera_fov.to_radians() * 0.5).tan())
+            .max(0.1),
         }
     }
 
-    /// Convert an AABB for a renderable entity into world-space bounds.
-    fn world_aabb_from_transform(&self, transform: &Transform, local_scale: f32) -> Aabb {
-        let half = Vec3::splat(0.5 * local_scale.max(0.1));
-        let center = transform.translation;
-        Aabb::from_center_half(center, half)
+    /// Pick the entity under a screen-space cursor using a real ray cast.
+    ///
+    /// Each entity's AABB (derived from its Transform scale) is intersected with
+    /// the camera ray. The closest hit in depth order is returned.
+    fn pick_entity(
+        &self,
+        world: &mut World,
+        camera: &crate::viewport::ViewportCamera,
+        rect: crate::viewport::ViewportRect,
+        screen: egui::Pos2,
+    ) -> Option<Entity> {
+        let screen = glam::Vec2::new(screen.x, screen.y);
+        let (origin, direction) = crate::viewport::screen_ray(camera, rect, screen);
+        let mut best: Option<(f32, Entity)> = None;
+
+        for (entity, transform, global, parent, controller, visible, locked) in world
+            .query::<(
+                Entity,
+                &Transform,
+                Option<&GlobalTransform>,
+                Option<&Parent>,
+                Option<&CameraController>,
+                Option<&Visible>,
+                Option<&Locked>,
+            )>()
+            .iter(world)
+        {
+            // The editor camera sits at the ray origin; picking its AABB would
+            // always win. Hidden and locked actors are not selectable either.
+            if controller.is_some()
+                || visible.is_some_and(|v| !v.0)
+                || locked.is_some_and(|l| l.0)
+            {
+                continue;
+            }
+            // Children are rendered at their global transform; use the same
+            // position for the pick volume so clicks match the image.
+            let world_transform = if parent.is_some() {
+                global
+                    .map(|g| {
+                        let (scale, rotation, translation) =
+                            g.0.to_scale_rotation_translation();
+                        Transform {
+                            translation,
+                            rotation,
+                            scale,
+                        }
+                    })
+                    .unwrap_or(*transform)
+            } else {
+                *transform
+            };
+            let scale = world_transform.scale.abs().max(Vec3::splat(0.1));
+            let aabb = Aabb::from_center_half(world_transform.translation, scale * 0.5);
+            if let Some(t) = crate::viewport::ray_aabb(origin, direction, aabb) {
+                if best.is_none_or(|(closest, _)| t < closest) {
+                    best = Some((t, entity));
+                }
+            }
+        }
+        best.map(|(_, entity)| entity)
+    }
+
+    /// Resolve an entity's transform into world space. Root entities use their
+    /// local transform directly; children are decomposed from `GlobalTransform`
+    /// so the gizmo and selection markers line up with what is rendered.
+    fn world_transform_of(world: &World, entity: Entity) -> Option<Transform> {
+        let local = *world.get::<Transform>(entity)?;
+        if world.get::<Parent>(entity).is_none() {
+            return Some(local);
+        }
+        let global = world.get::<GlobalTransform>(entity)?;
+        let (scale, rotation, translation) = global.0.to_scale_rotation_translation();
+        Some(Transform {
+            translation,
+            rotation,
+            scale,
+        })
+    }
+
+    /// Build the gizmo transform for the current selection.
+    ///
+    /// Returns the entity, the gizmo origin (its world translation), the basis
+    /// rotation (identity in World space, the entity rotation in Local space)
+    /// and the entity scale.
+    fn gizmo_transform(&self, world: &mut World) -> Option<(Entity, Vec3, Quat, Vec3)> {
+        let entity = self.selected?;
+        if world.get::<Locked>(entity).is_some_and(|locked| locked.0) {
+            return None;
+        }
+        let transform = Self::world_transform_of(world, entity)?;
+        let space = if self.gizmo_local_space {
+            CoordSpace::Local
+        } else {
+            CoordSpace::World
+        };
+        let basis = crate::viewport::gizmo_basis(space, transform.rotation);
+        Some((entity, transform.translation, basis, transform.scale))
+    }
+
+    /// Coordinate space for the gizmo, derived from the toolbar toggle.
+    fn gizmo_space(&self) -> CoordSpace {
+        if self.gizmo_local_space {
+            CoordSpace::Local
+        } else {
+            CoordSpace::World
+        }
+    }
+
+    /// Which gizmo the current toolbar tool maps to.
+    fn gizmo_tool(&self) -> GizmoTool {
+        match self.active_tool {
+            1 => GizmoTool::Move,
+            2 => GizmoTool::Rotate,
+            3 => GizmoTool::Scale,
+            _ => GizmoTool::Select,
+        }
+    }
+
+    /// Hit-test the gizmo axis handles at a screen position.
+    ///
+    /// Each handle is drawn as a line from the gizmo origin along its axis, so
+    /// the test measures the perpendicular distance from the cursor to that
+    /// line and picks the closest handle within a small pixel tolerance.
+    fn hit_test_gizmo_axis(
+        &self,
+        camera: &crate::viewport::ViewportCamera,
+        rect: crate::viewport::ViewportRect,
+        screen: egui::Pos2,
+        origin: Vec3,
+        basis: Quat,
+    ) -> Option<GizmoAxis> {
+        let origin_screen = crate::viewport::world_to_screen(camera, rect, origin)?;
+        let o = glam::Vec2::new(origin_screen.x, origin_screen.y);
+        let cursor = glam::Vec2::new(screen.x, screen.y);
+
+        let candidates = [GizmoAxis::X, GizmoAxis::Y, GizmoAxis::Z];
+
+        let mut best: Option<(f32, GizmoAxis)> = None;
+        for axis in candidates {
+            let dir = crate::viewport::axis_vector(axis, basis);
+            let Some(tip) =
+                crate::viewport::gizmo_screen_handle(camera, rect, origin, dir)
+            else {
+                continue;
+            };
+            let t = glam::Vec2::new(tip.x, tip.y);
+            let handle = t - o;
+            let len_sq = handle.length_squared();
+            if len_sq < 1e-6 {
+                continue;
+            }
+            // Project the cursor onto the handle segment.
+            let along = ((cursor - o).dot(handle) / len_sq).clamp(0.0, 1.0);
+            let closest = o + handle * along;
+            let distance = (cursor - closest).length();
+            if distance <= 12.0 && best.is_none_or(|(d, _)| distance < d) {
+                best = Some((distance, axis));
+            }
+        }
+        best.map(|(_, axis)| axis)
+    }
+
+    /// Render the 3D scene into an offscreen texture and register it with egui.
+    /// Returns `None` when the scene cannot be rendered yet.
+    fn prepare_viewport_texture(
+        &mut self,
+        renderer: &mut crate::renderer::Renderer,
+        world: &mut World,
+    ) -> Option<ViewportTextureState> {
+        // Make imported MeshFilter/MeshRenderer entities visible to the
+        // snapshot collector before the viewport pass runs.
+        renderer.sync_world_renderables(world);
+        // The editor may have moved objects after this frame's regular
+        // transform pass, so refresh global transforms before extracting.
+        crate::transform::propagate_transforms(world);
+        let snapshot = crate::renderer::collect_render_snapshot(world);
+        let camera = self.viewport_camera(world);
+
+        // Size the offscreen target from the previous frame's panel rect; the
+        // first frame has no rect yet, so start at a sane default.
+        let (width, height) = if self.viewport_texture_size.0 > 1 {
+            self.viewport_texture_size
+        } else {
+            (640, 360)
+        };
+
+        let view = renderer.render_scene_to_viewport(&snapshot, width, height, &camera)?;
+
+        let egui_renderer = self.renderer.as_mut()?;
+        let texture_id = match self.viewport_texture_id {
+            Some(id) => {
+                // Re-register the (possibly resized) view under the same id.
+                egui_renderer.update_egui_texture_from_wgpu_texture(
+                    &renderer.device,
+                    &view,
+                    wgpu::FilterMode::Linear,
+                    id,
+                );
+                id
+            }
+            None => {
+                let id = egui_renderer.register_native_texture(
+                    &renderer.device,
+                    &view,
+                    wgpu::FilterMode::Linear,
+                );
+                self.viewport_texture_id = Some(id);
+                id
+            }
+        };
+
+        Some(ViewportTextureState {
+            texture_id,
+            width,
+            height,
+        })
+    }
+
+    /// Reimport `path` through the import pipeline, preserving its AssetId and
+    /// bumping its revision, then invalidate the GPU copy so the next frame
+    /// uploads the updated data. Returns the preserved (or newly assigned) id.
+    fn reimport_asset_path(
+        &mut self,
+        path: &std::path::Path,
+        renderer: &mut crate::renderer::Renderer,
+    ) -> Result<crate::asset_database::AssetId, String> {
+        let storage = crate::asset_storage::AssetStorage::new(
+            crate::asset_storage::AssetStorageConfig::default(),
+        )
+        .map_err(|e| e.to_string())?;
+        let mut pipeline = crate::asset_importer::ImportPipeline::new(
+            std::mem::take(&mut self.asset_database.registry),
+            storage,
+        );
+        pipeline.register_importer(Box::new(crate::gltf_importer::GltfImporter));
+
+        let result = pipeline.reimport_file(path);
+        let asset_id = pipeline.asset_registry.find_by_source_path(path);
+        self.asset_database.registry = pipeline.asset_registry;
+        let result = result.map_err(|e| e.to_string())?;
+
+        let asset_id = asset_id.unwrap_or(result.asset_id);
+        renderer.invalidate_asset(asset_id);
+        renderer.forget_meshes_for_source(path);
+        for dependency in &result.dependencies {
+            renderer.invalidate_asset(*dependency);
+        }
+
+        let _ = self
+            .asset_database
+            .save_to_file(&PathBuf::from("assets/asset_database.ron"));
+        Ok(asset_id)
+    }
+
+    /// Drain a queued reimport once per frame, now that the renderer is in scope.
+    fn process_pending_reimport(&mut self, renderer: &mut crate::renderer::Renderer) {
+        let Some(path) = self.pending_reimport_asset.take() else {
+            return;
+        };
+        match self.reimport_asset_path(&path, renderer) {
+            Ok(asset_id) => {
+                self.log_info(&format!("Reimported asset {} ({asset_id})", path.display()));
+                self.notifications.success(
+                    "Asset Reimported",
+                    format!(
+                        "Reimported {}",
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    ),
+                );
+            }
+            Err(err) => {
+                self.log
+                    .push(("ERROR".into(), format!("Reimport failed: {err}")));
+                self.notifications.error("Reimport Failed", err);
+            }
+        }
     }
 
     pub fn draw(
@@ -460,16 +781,37 @@ impl Editor {
         window: &Window,
         frame: wgpu::SurfaceTexture,
         view: &wgpu::TextureView,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
+        renderer: &mut crate::renderer::Renderer,
         world: &mut World,
         perf: &mut crate::performance::PerformanceMonitor,
         _history: (),
         fps: f32,
     ) {
+        // The viewport image is drawn during `draw_ui`, but the scene pass runs
+        // after it so it uses the camera and panel size produced by this
+        // frame's input instead of lagging one frame behind. The texture id is
+        // stable, so re-rendering before the UI pass is submitted updates the
+        // image the UI already queued.
+        let viewport_state = self.viewport_texture_id.map(|texture_id| ViewportTextureState {
+            texture_id,
+            width: self.viewport_texture_size.0,
+            height: self.viewport_texture_size.1,
+        });
+        self.process_pending_reimport(renderer);
+
+        self.viewport_panel_drawn = false;
         let input = self.platform.as_mut().unwrap().take_egui_input(window);
         let context = self.context.clone();
-        let output = context.run(input, |ctx| self.draw_ui(ctx, world, perf, fps));
+        let output = context.run(input, |ctx| {
+            self.draw_ui(ctx, world, perf, fps, viewport_state)
+        });
+        // Re-render at the size and camera the viewport panel reported this
+        // frame. `draw_ui` only needs the stable texture id.
+        if self.viewport_panel_drawn {
+            let _ = self.prepare_viewport_texture(renderer, world);
+        }
+        let device = &renderer.device;
+        let queue = &renderer.queue;
         self.platform
             .as_mut()
             .unwrap()
@@ -521,24 +863,55 @@ impl Editor {
             self.save_layout();
         }
     }
-    fn draw_ui(&mut self, ctx: &Context, world: &mut World, perf: &mut crate::performance::PerformanceMonitor, fps: f32) {
-        // Handle Undo/Redo keyboard shortcuts
-        let undo_shortcut = ctx.input(|i| {
-            i.key_pressed(Key::Z) && (i.modifiers.ctrl || i.modifiers.mac_cmd)
-        });
-        let redo_shortcut = ctx.input(|i| {
-            (i.key_pressed(Key::Y) || (i.key_pressed(Key::Z) && i.modifiers.shift))
-                && (i.modifiers.ctrl || i.modifiers.mac_cmd)
-        });
+    fn draw_ui(
+        &mut self,
+        ctx: &Context,
+        world: &mut World,
+        perf: &mut crate::performance::PerformanceMonitor,
+        fps: f32,
+        viewport_state: Option<ViewportTextureState>,
+    ) {
+        // Handle Undo/Redo keyboard shortcuts. When a text widget has focus,
+        // egui owns these keys (text undo), so the scene history must not
+        // react to them as well.
+        let keyboard_captured = ctx.wants_keyboard_input();
+        let undo_shortcut = !keyboard_captured
+            && ctx.input(|i| i.key_pressed(Key::Z) && (i.modifiers.ctrl || i.modifiers.mac_cmd));
+        let redo_shortcut = !keyboard_captured
+            && ctx.input(|i| {
+                (i.key_pressed(Key::Y) || (i.key_pressed(Key::Z) && i.modifiers.shift))
+                    && (i.modifiers.ctrl || i.modifiers.mac_cmd)
+            });
 
         if undo_shortcut {
             if let Some(name) = self.history.undo(world) {
-                self.notifications.info(format!("Undo: {}", name), "History");
+                self.notifications
+                    .info(format!("Undo: {}", name), "History");
             }
         } else if redo_shortcut {
             if let Some(name) = self.history.redo(world) {
-                self.notifications.info(format!("Redo: {}", name), "History");
+                self.notifications
+                    .info(format!("Redo: {}", name), "History");
             }
+        }
+
+        // Detect play mode transitions and clear history
+        let current_mode = world
+            .get_resource::<crate::core::resources::EngineMode>()
+            .copied()
+            .unwrap_or_default();
+        if self.last_engine_mode != current_mode {
+            // Mode changed - clear history on play mode enter/exit
+            if current_mode == crate::core::resources::EngineMode::Playing
+                || self.last_engine_mode == crate::core::resources::EngineMode::Playing
+            {
+                self.history.clear();
+                self.log_info(&format!(
+                    "History cleared (mode change: {:?} -> {:?})",
+                    self.last_engine_mode, current_mode
+                ));
+            }
+            self.last_engine_mode = current_mode;
         }
 
         let mut style = (*ctx.style()).clone();
@@ -554,6 +927,40 @@ impl Editor {
             self.current_workspace = WorkspacePreset::LevelEditing;
             self.load_scene_from_path(world, &path);
         }
+
+        // Process pending model instantiation requests
+        if let Some(path) = self.pending_instantiate_model.take() {
+            match crate::commands::build_model_hierarchy(&path) {
+                Ok(nodes) => {
+                    let model_name = path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("Model")
+                        .to_string();
+                    let count = nodes.len();
+                    let cmd =
+                        crate::commands::SpawnModelHierarchyCommand::new(model_name.clone(), nodes);
+                    self.history.push(Box::new(cmd), world);
+                    self.dirty = true;
+                    self.log_info(&format!(
+                        "Instantiated model '{model_name}' ({count} entities)"
+                    ));
+                    self.notifications.success(
+                        "Model Instantiated",
+                        format!("Added '{model_name}' with {count} node(s) to scene"),
+                    );
+                }
+                Err(err) => {
+                    self.log.push((
+                        "ERROR".into(),
+                        format!("Failed to instantiate model: {err}"),
+                    ));
+                    self.notifications.error("Instantiation Failed", err);
+                }
+            }
+        }
+
+        // Reimport requests are drained in `draw`, where the renderer is in scope.
 
         let mut dock_state = self
             .dock_state
@@ -692,6 +1099,88 @@ impl Editor {
                                     }
                                 }
                                 "Edit" => {
+                                    // Undo/Redo at top
+                                    let can_undo = self.history.can_undo();
+                                    if ui
+                                        .add_enabled(
+                                            can_undo,
+                                            egui::Button::new(
+                                                RichText::new(format!(
+                                                    "{} Undo (Ctrl+Z)",
+                                                    Icons::UNDO
+                                                ))
+                                                .size(11.0)
+                                                .color(if can_undo {
+                                                    Color32::WHITE
+                                                } else {
+                                                    Color32::from_rgb(120, 120, 120)
+                                                }),
+                                            )
+                                            .fill(
+                                                if can_undo {
+                                                    Color32::from_rgb(50, 65, 100)
+                                                } else {
+                                                    Color32::TRANSPARENT
+                                                },
+                                            ),
+                                        )
+                                        .clicked()
+                                    {
+                                        if let Some(name) = self.history.undo(world) {
+                                            self.dirty = true;
+                                            self.log_info(&format!("Undo: {}", name));
+                                        }
+                                        ui.close();
+                                    }
+
+                                    let can_redo = self.history.can_redo();
+                                    if ui
+                                        .add_enabled(
+                                            can_redo,
+                                            egui::Button::new(
+                                                RichText::new(format!(
+                                                    "{} Redo (Ctrl+Y)",
+                                                    Icons::REDO
+                                                ))
+                                                .size(11.0)
+                                                .color(if can_redo {
+                                                    Color32::WHITE
+                                                } else {
+                                                    Color32::from_rgb(120, 120, 120)
+                                                }),
+                                            )
+                                            .fill(
+                                                if can_redo {
+                                                    Color32::from_rgb(50, 80, 50)
+                                                } else {
+                                                    Color32::TRANSPARENT
+                                                },
+                                            ),
+                                        )
+                                        .clicked()
+                                    {
+                                        if let Some(name) = self.history.redo(world) {
+                                            self.dirty = true;
+                                            self.log_info(&format!("Redo: {}", name));
+                                        }
+                                        ui.close();
+                                    }
+
+                                    ui.separator();
+
+                                    if ui
+                                        .button(format!(
+                                            "{} History Panel (Ctrl+H)",
+                                            Icons::HISTORY
+                                        ))
+                                        .clicked()
+                                    {
+                                        actions.push(DockAction::Open(EditorTab::History));
+                                        ui.close();
+                                    }
+
+                                    ui.separator();
+
                                     if ui
                                         .button(format!("{} Select All (Ctrl+A)", Icons::ENTITY))
                                         .clicked()
@@ -733,7 +1222,7 @@ impl Editor {
                                         .clicked()
                                     {
                                         if let Some(e) = self.selected {
-                                            if let Some(t) = world.get::<Transform>(e) {
+                                            if let Some(t) = Self::world_transform_of(world, e) {
                                                 self.orbit_target = t.translation;
                                                 self.update_camera(world);
                                             }
@@ -1012,6 +1501,99 @@ impl Editor {
                         .clicked()
                     {
                         self.save_scene(world);
+                    }
+                    ui.separator();
+                    // Undo/Redo buttons with icons
+                    let can_undo = self.history.can_undo();
+                    if ui
+                        .add_enabled(
+                            can_undo,
+                            egui::Button::new(
+                                RichText::new(format!("{} Undo", Icons::UNDO))
+                                    .size(11.0)
+                                    .color(if can_undo {
+                                        Color32::WHITE
+                                    } else {
+                                        Color32::from_rgb(120, 120, 120)
+                                    }),
+                            )
+                            .frame(false)
+                            .min_size(egui::vec2(64.0, 28.0))
+                            .fill(if can_undo {
+                                Color32::from_rgb(60, 80, 120)
+                            } else {
+                                Color32::TRANSPARENT
+                            })
+                            .corner_radius(egui::CornerRadius::same(4)),
+                        )
+                        .engine_tooltip(
+                            "Undo",
+                            format!(
+                                "Undo last action ({})",
+                                self.history.undo_name().unwrap_or("none")
+                            ),
+                            Some("Ctrl+Z"),
+                        )
+                        .clicked()
+                    {
+                        if let Some(name) = self.history.undo(world) {
+                            self.dirty = true;
+                            self.log_info(&format!("Undo: {}", name));
+                        }
+                    }
+
+                    let can_redo = self.history.can_redo();
+                    if ui
+                        .add_enabled(
+                            can_redo,
+                            egui::Button::new(
+                                RichText::new(format!("{} Redo", Icons::REDO))
+                                    .size(11.0)
+                                    .color(if can_redo {
+                                        Color32::WHITE
+                                    } else {
+                                        Color32::from_rgb(120, 120, 120)
+                                    }),
+                            )
+                            .frame(false)
+                            .min_size(egui::vec2(64.0, 28.0))
+                            .fill(if can_redo {
+                                Color32::from_rgb(60, 100, 60)
+                            } else {
+                                Color32::TRANSPARENT
+                            })
+                            .corner_radius(egui::CornerRadius::same(4)),
+                        )
+                        .engine_tooltip(
+                            "Redo",
+                            format!(
+                                "Redo last undone action ({})",
+                                self.history.redo_name().unwrap_or("none")
+                            ),
+                            Some("Ctrl+Y"),
+                        )
+                        .clicked()
+                    {
+                        if let Some(name) = self.history.redo(world) {
+                            self.dirty = true;
+                            self.log_info(&format!("Redo: {}", name));
+                        }
+                    }
+                    // History panel toggle
+                    if ui
+                        .button(
+                            RichText::new(format!("{} History", Icons::HISTORY))
+                                .size(11.0)
+                                .color(Color32::WHITE),
+                        )
+                        .engine_tooltip(
+                            "History",
+                            "Open History panel to view full undo/redo stack",
+                            Some("Ctrl+H"),
+                        )
+                        .clicked()
+                    {
+                        actions.push(DockAction::Open(EditorTab::History));
                     }
                     ui.separator();
                     // View modes with icons
@@ -1300,69 +1882,74 @@ impl Editor {
             });
 
         // Shortcuts
-        ctx.input(|i| {
-            if i.modifiers.ctrl {
-                if i.key_pressed(Key::Num1) {
-                    actions.push(DockAction::Open(EditorTab::Viewport));
-                }
-                if i.key_pressed(Key::Num2) {
-                    actions.push(DockAction::Open(EditorTab::WorldOutliner));
-                }
-                if i.key_pressed(Key::Num3) {
-                    actions.push(DockAction::Open(EditorTab::Details));
-                }
-                if i.key_pressed(Key::Num4) {
-                    actions.push(DockAction::Open(EditorTab::ContentBrowser));
-                }
-                if i.key_pressed(Key::Num5) {
-                    actions.push(DockAction::Open(EditorTab::OutputLog));
-                }
-                if i.key_pressed(Key::Num6) {
-                    actions.push(DockAction::Open(EditorTab::ScriptEditor));
-                }
-                if i.key_pressed(Key::Num7) {
-                    actions.push(DockAction::Open(EditorTab::GraphicsSettings));
-                }
-                if i.key_pressed(Key::S) {
-                    self.save_scene(world);
-                }
-                if i.key_pressed(Key::A) {
-                    self.select_all(world);
-                }
-                if i.key_pressed(Key::D) {
-                    self.duplicate_selected(world);
-                }
-            }
-            if !i.modifiers.ctrl && !i.modifiers.alt && self.confirm_dialog.is_none() {
-                if i.key_pressed(Key::Q) {
-                    self.active_tool = 0;
-                }
-                if i.key_pressed(Key::W) {
-                    self.active_tool = 1;
-                }
-                if i.key_pressed(Key::E) {
-                    self.active_tool = 2;
-                }
-                if i.key_pressed(Key::R) {
-                    self.active_tool = 3;
-                }
-                if i.key_pressed(Key::Delete) {
-                    self.prompt_delete_selected(world);
-                }
-                if i.key_pressed(Key::F) {
-                    if let Some(e) = self.selected {
-                        if let Some(t) = world.get::<Transform>(e) {
-                            self.orbit_target = t.translation;
-                            self.update_camera(world);
-                        }
+        if !keyboard_captured {
+            ctx.input(|i| {
+                if i.modifiers.ctrl {
+                    if i.key_pressed(Key::Num1) {
+                        actions.push(DockAction::Open(EditorTab::Viewport));
+                    }
+                    if i.key_pressed(Key::Num2) {
+                        actions.push(DockAction::Open(EditorTab::WorldOutliner));
+                    }
+                    if i.key_pressed(Key::Num3) {
+                        actions.push(DockAction::Open(EditorTab::Details));
+                    }
+                    if i.key_pressed(Key::Num4) {
+                        actions.push(DockAction::Open(EditorTab::ContentBrowser));
+                    }
+                    if i.key_pressed(Key::Num5) {
+                        actions.push(DockAction::Open(EditorTab::OutputLog));
+                    }
+                    if i.key_pressed(Key::Num6) {
+                        actions.push(DockAction::Open(EditorTab::ScriptEditor));
+                    }
+                    if i.key_pressed(Key::Num7) {
+                        actions.push(DockAction::Open(EditorTab::GraphicsSettings));
+                    }
+                    if i.key_pressed(Key::H) {
+                        actions.push(DockAction::Open(EditorTab::History));
+                    }
+                    if i.key_pressed(Key::S) {
+                        self.save_scene(world);
+                    }
+                    if i.key_pressed(Key::A) {
+                        self.select_all(world);
+                    }
+                    if i.key_pressed(Key::D) {
+                        self.duplicate_selected(world);
                     }
                 }
-                if i.key_pressed(Key::Escape) {
-                    self.selected = None;
-                    self.selected_entities.clear();
+                if !i.modifiers.ctrl && !i.modifiers.alt && self.confirm_dialog.is_none() {
+                    if i.key_pressed(Key::Q) {
+                        self.active_tool = 0;
+                    }
+                    if i.key_pressed(Key::W) {
+                        self.active_tool = 1;
+                    }
+                    if i.key_pressed(Key::E) {
+                        self.active_tool = 2;
+                    }
+                    if i.key_pressed(Key::R) {
+                        self.active_tool = 3;
+                    }
+                    if i.key_pressed(Key::Delete) {
+                        self.prompt_delete_selected(world);
+                    }
+                    if i.key_pressed(Key::F) {
+                        if let Some(e) = self.selected {
+                            if let Some(t) = Self::world_transform_of(world, e) {
+                                self.orbit_target = t.translation;
+                                self.update_camera(world);
+                            }
+                        }
+                    }
+                    if i.key_pressed(Key::Escape) {
+                        self.selected = None;
+                        self.selected_entities.clear();
+                    }
                 }
-            }
-        });
+            });
+        }
 
         // Render main DockArea with dark editor style
         {
@@ -1371,6 +1958,7 @@ impl Editor {
                 world,
                 perf,
                 actions: &mut actions,
+                viewport_state,
             };
             DockArea::new(&mut dock_state)
                 .style(editor_dock_style(ctx))
@@ -1399,19 +1987,41 @@ impl Editor {
                     DialogResult::Confirmed => {
                         match dialog {
                             ConfirmDialog::DeleteEntities { targets, .. } => {
-                                let count = targets.len();
-                                for e in targets {
-                                    let _ = world.despawn(e);
+                                use crate::commands::{CompositeCommand, DespawnEntityCommand};
+
+                                let target_count = targets.len();
+                                if target_count == 1 {
+                                    // Single entity deletion
+                                    if let Some(cmd) = DespawnEntityCommand::new(world, targets[0])
+                                    {
+                                        self.history.push(Box::new(cmd), world);
+                                    }
+                                } else {
+                                    // Multiple entities - use composite command
+                                    let mut composite = CompositeCommand::new(format!(
+                                        "Delete {} Actors",
+                                        target_count
+                                    ));
+                                    for e in &targets {
+                                        if let Some(cmd) = DespawnEntityCommand::new(world, *e) {
+                                            composite.add(Box::new(cmd));
+                                        }
+                                    }
+                                    if !composite.is_empty() {
+                                        self.history.push(Box::new(composite), world);
+                                    }
                                 }
+
                                 self.selected = None;
                                 self.selected_entities.clear();
                                 self.dirty = true;
-                                self.status = format!("Deleted {count} actor(s)");
-                                self.log
-                                    .push(("INFO".into(), format!("Deleted {count} actor(s)")));
+                                self.status = format!("Deleted {} actor(s)", target_count);
                                 self.notifications.warning(
                                     "Actor Deleted",
-                                    format!("Permanently removed {count} actor(s) from scene"),
+                                    format!(
+                                        "Permanently removed {} actor(s) from scene",
+                                        targets.len()
+                                    ),
                                 );
                             }
                             ConfirmDialog::DeleteContent { path, .. } => {
@@ -1553,7 +2163,12 @@ impl Editor {
         );
     }
 
-    fn draw_viewport(&mut self, ui: &mut egui::Ui, world: &mut World) {
+    fn draw_viewport(
+        &mut self,
+        ui: &mut egui::Ui,
+        world: &mut World,
+        viewport_state: Option<ViewportTextureState>,
+    ) {
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new(format!(
@@ -1631,7 +2246,7 @@ impl Editor {
                         )
                         .clicked()
                     {
-                        if let Some(t) = world.get::<Transform>(e) {
+                        if let Some(t) = Self::world_transform_of(world, e) {
                             self.orbit_target = t.translation;
                             self.update_camera(world);
                         }
@@ -1642,6 +2257,22 @@ impl Editor {
 
         let (rect, response) =
             ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
+        self.viewport_panel_drawn = true;
+
+        // Update the offscreen viewport texture dimensions for subsequent frames.
+        // Use physical pixels so the viewport stays sharp on HiDPI displays.
+        let pixels_per_point = ui.ctx().pixels_per_point();
+        self.viewport_texture_size = (
+            (rect.width() * pixels_per_point).round().max(1.0) as u32,
+            (rect.height() * pixels_per_point).round().max(1.0) as u32,
+        );
+        let viewport_rect = ViewportRect {
+            min_x: rect.min.x,
+            min_y: rect.min.y,
+            width: rect.width(),
+            height: rect.height(),
+        };
+
         if response.hovered() {
             let scroll = ui.input(|i| i.raw_scroll_delta.y);
             if scroll != 0.0 {
@@ -1649,69 +2280,253 @@ impl Editor {
                     (self.orbit_distance * (-scroll * 0.001).exp()).clamp(0.25, 500.0);
                 self.update_camera(world);
             }
-            if response.dragged_by(egui::PointerButton::Secondary) {
-                let delta = response.drag_delta();
+            // `drag_delta()` is cumulative for the whole gesture; applying it
+            // every frame accelerates the camera. `pointer.delta()` is per-frame.
+            let pointer_delta = ui.input(|i| i.pointer.delta());
+            if response.dragged_by(egui::PointerButton::Secondary)
+                && pointer_delta != Vec2::ZERO
+            {
                 if let Some((mut t, mut c)) = world
                     .query::<(&mut Transform, &mut CameraController)>()
                     .iter_mut(world)
                     .next()
                 {
-                    c.yaw -= delta.x * c.mouse_sensitivity * 0.01 * self.mouse_sensitivity;
+                    c.yaw -= pointer_delta.x * c.mouse_sensitivity * 0.01 * self.mouse_sensitivity;
                     c.pitch = (c.pitch
-                        - delta.y * c.mouse_sensitivity * 0.01 * self.mouse_sensitivity)
+                        - pointer_delta.y * c.mouse_sensitivity * 0.01 * self.mouse_sensitivity)
                         .clamp(-1.55, 1.55);
                     t.rotation =
                         glam::Quat::from_rotation_y(c.yaw) * glam::Quat::from_rotation_x(c.pitch);
                     t.translation = self.orbit_target - c.forward() * self.orbit_distance;
                 }
             }
-            if response.dragged_by(egui::PointerButton::Middle) {
-                let d = response.drag_delta();
-                self.orbit_target += Vec3::new(-d.x, d.y, 0.0) * 0.01;
-                self.update_camera(world);
-            }
-        }
-        if response.clicked() {
-            let mut hit = None;
-            for (e, t) in world.query::<(Entity, &Transform)>().iter(world) {
-                let center =
-                    rect.center() + Vec2::new(t.translation.x * 24.0, -t.translation.y * 24.0);
-                if let Some(pos) = response.interact_pointer_pos() {
-                    if (pos - center).length() < 24.0 {
-                        hit = Some(e);
-                        break;
-                    }
+            if response.dragged_by(egui::PointerButton::Middle)
+                && pointer_delta != Vec2::ZERO
+            {
+                // Pan in the camera's screen plane rather than world X/Y, and
+                // scale the speed with distance so it feels consistent at any
+                // zoom level.
+                let basis = world
+                    .query::<&CameraController>()
+                    .iter(world)
+                    .next()
+                    .map(|c| (c.right(), c.up()));
+                if let Some((right, up)) = basis {
+                    let scale = (self.orbit_distance * 0.0015).max(0.0001);
+                    self.orbit_target += right * (-pointer_delta.x * scale)
+                        + up * (pointer_delta.y * scale);
+                    self.update_camera(world);
                 }
             }
+        }
+
+        // Click picking uses the same camera/projection as the rendered image.
+        if response.clicked() {
+            let camera = self.viewport_camera(world);
+            let hit = response
+                .interact_pointer_pos()
+                .and_then(|pos| self.pick_entity(world, &camera, viewport_rect, pos));
             if let Some(e) = hit {
                 self.set_selected_entity(Some(e), false);
             } else if ui.input(|i| !i.modifiers.ctrl && !i.modifiers.shift) {
                 self.set_selected_entity(None, false);
             }
             if let Some(e) = self.selected {
-                if let Some(t) = world.get::<Transform>(e) {
+                if let Some(t) = Self::world_transform_of(world, e) {
                     self.orbit_target = t.translation;
                 }
             }
         }
-        if response.dragged_by(egui::PointerButton::Primary) && self.show_gizmos {
-            if let Some(e) = self.selected {
-                if let Some(mut t) = world.get_mut::<Transform>(e) {
-                    let d = response.drag_delta();
-                    match self.active_tool {
-                        1 => {
-                            t.translation.x += d.x * 0.01;
-                            t.translation.y -= d.y * 0.01;
+
+        // Hover highlight follows the same ray cast as picking.
+        self.hovered_entity = if response.hovered() {
+            response.hover_pos().and_then(|pos| {
+                let camera = self.viewport_camera(world);
+                self.pick_entity(world, &camera, viewport_rect, pos)
+            })
+        } else {
+            None
+        };
+
+        // Gizmo drag start: only begin a transform gesture when the pointer
+        // actually grabbed one of the axis handles.
+        if response.drag_started_by(egui::PointerButton::Primary) {
+            self.gizmo_interaction = None;
+            self.gizmo_drag_start_transform = None;
+            self.gizmo_drag_start_world = None;
+            self.gizmo_drag_parent_inverse = None;
+            self.gizmo_drag_start = None;
+            if self.show_gizmos && self.active_tool != 0 {
+                if let Some(pos) = response.interact_pointer_pos() {
+                    let camera = self.viewport_camera(world);
+                    if let Some((entity, origin, basis, _scale)) = self.gizmo_transform(world) {
+                        if let Some(axis) =
+                            self.hit_test_gizmo_axis(&camera, viewport_rect, pos, origin, basis)
+                        {
+                            self.gizmo_interaction =
+                                Some((entity, self.gizmo_tool(), axis, self.gizmo_space()));
+                            self.gizmo_drag_start = Some(pos);
+                            self.gizmo_drag_start_transform =
+                                world.get::<Transform>(entity).copied();
+                            self.gizmo_drag_start_world =
+                                Self::world_transform_of(world, entity);
+                            self.gizmo_drag_parent_inverse = world.get::<Parent>(entity).map(|p| {
+                                world
+                                    .get::<GlobalTransform>(p.0)
+                                    .map(|g| g.0.inverse())
+                                    .unwrap_or(Mat4::IDENTITY)
+                            });
                         }
-                        2 => {
-                            t.rotation = glam::Quat::from_rotation_y(d.x * 0.01) * t.rotation;
-                        }
-                        3 => t.scale *= ((d.x - d.y) * 0.005 + 1.0).max(0.01),
-                        _ => {}
                     }
+                }
+            }
+        }
+
+        // Gizmo drag: compute an absolute transform from the gesture start so
+        // the object follows the cursor instead of accumulating every frame.
+        if response.dragged_by(egui::PointerButton::Primary) {
+            if let (
+                Some((entity, tool, axis, space)),
+                Some(start_pos),
+                Some(start_world),
+                Some(current_pos),
+            ) = (
+                self.gizmo_interaction,
+                self.gizmo_drag_start,
+                self.gizmo_drag_start_world,
+                response.interact_pointer_pos(),
+            ) {
+                let parent_inverse = self.gizmo_drag_parent_inverse;
+                let camera = self.viewport_camera(world);
+                let basis = crate::viewport::gizmo_basis(space, start_world.rotation);
+                let origin = start_world.translation;
+                let start_screen = glam::Vec2::new(start_pos.x, start_pos.y);
+                let current_screen = glam::Vec2::new(current_pos.x, current_pos.y);
+                let mut new_world = start_world;
+
+                match tool {
+                    GizmoTool::Move => {
+                        let (start_o, start_d) =
+                            crate::viewport::screen_ray(&camera, viewport_rect, start_screen);
+                        let (current_o, current_d) =
+                            crate::viewport::screen_ray(&camera, viewport_rect, current_screen);
+                        let delta = crate::viewport::drag_translation_delta(
+                            axis,
+                            basis,
+                            start_o,
+                            start_d,
+                            current_o,
+                            current_d,
+                            origin,
+                            self.gizmo_snap_translation,
+                        );
+                        new_world.translation = start_world.translation + delta;
+                    }
+                    GizmoTool::Rotate => {
+                        let axis_dir =
+                            crate::viewport::axis_vector(axis, basis).normalize_or(Vec3::Y);
+                        let (start_o, start_d) =
+                            crate::viewport::screen_ray(&camera, viewport_rect, start_screen);
+                        let start_hit =
+                            crate::viewport::ray_plane(start_o, start_d, origin, axis_dir)
+                                .unwrap_or(origin + camera.right());
+                        let (current_o, current_d) =
+                            crate::viewport::screen_ray(&camera, viewport_rect, current_screen);
+                        let angle = crate::viewport::drag_rotation_angle(
+                            origin,
+                            axis_dir,
+                            current_o,
+                            current_d,
+                            start_hit - origin,
+                        );
+                        let angle =
+                            crate::viewport::snap_angle(angle, self.gizmo_snap_rotation);
+                        new_world.rotation =
+                            Quat::from_axis_angle(axis_dir, angle) * start_world.rotation;
+                    }
+                    GizmoTool::Scale => {
+                        let uniform = matches!(
+                            axis,
+                            GizmoAxis::Uniform
+                                | GizmoAxis::Xy
+                                | GizmoAxis::Xz
+                                | GizmoAxis::Yz
+                        );
+                        let factor = crate::viewport::snap_scale(
+                            crate::viewport::drag_scale_factor(
+                                start_screen,
+                                current_screen,
+                                uniform,
+                            ),
+                            self.gizmo_snap_scale,
+                        );
+                        new_world.scale = match axis {
+                            GizmoAxis::X => Vec3::new(
+                                start_world.scale.x * factor,
+                                start_world.scale.y,
+                                start_world.scale.z,
+                            ),
+                            GizmoAxis::Y => Vec3::new(
+                                start_world.scale.x,
+                                start_world.scale.y * factor,
+                                start_world.scale.z,
+                            ),
+                            GizmoAxis::Z => Vec3::new(
+                                start_world.scale.x,
+                                start_world.scale.y,
+                                start_world.scale.z * factor,
+                            ),
+                            _ => start_world.scale * factor,
+                        };
+                    }
+                    GizmoTool::Select => {}
+                }
+
+                // Convert the edited world transform back into the entity's
+                // local space when it has a parent.
+                let new_local = if let Some(inverse) = parent_inverse {
+                    let matrix = inverse * new_world.matrix();
+                    let (scale, rotation, translation) =
+                        matrix.to_scale_rotation_translation();
+                    Transform {
+                        translation,
+                        rotation,
+                        scale,
+                    }
+                } else {
+                    new_world
+                };
+
+                if let Some(mut t) = world.get_mut::<Transform>(entity) {
+                    *t = new_local;
                     self.dirty = true;
                 }
             }
+        }
+
+        // Gizmo drag end: commit the whole gesture as one undoable command.
+        if response.drag_stopped_by(egui::PointerButton::Primary) {
+            if let Some((entity, _, _, _)) = self.gizmo_interaction {
+                if let Some(start_transform) = self.gizmo_drag_start_transform.take() {
+                    if let Some(current_transform) = world.get::<Transform>(entity).copied() {
+                        if current_transform != start_transform {
+                            use crate::commands::SetTransformCommand;
+                            if let Some(cmd) = SetTransformCommand::from_pair(
+                                entity,
+                                start_transform,
+                                current_transform,
+                            ) {
+                                self.history.push(Box::new(cmd), world);
+                            }
+                        }
+                    }
+                }
+            }
+            self.gizmo_interaction = None;
+            self.gizmo_drag_start = None;
+            self.gizmo_drag_start_transform = None;
+            self.gizmo_drag_start_world = None;
+            self.gizmo_drag_parent_inverse = None;
         }
         response.context_menu(|ui| {
             ui.label(RichText::new(format!("{} Viewport", Icons::VIEW)).strong());
@@ -1744,7 +2559,7 @@ impl Editor {
                 .clicked()
             {
                 if let Some(e) = self.selected {
-                    if let Some(t) = world.get::<Transform>(e) {
+                    if let Some(t) = Self::world_transform_of(world, e) {
                         self.orbit_target = t.translation;
                         self.update_camera(world);
                     }
@@ -1761,15 +2576,96 @@ impl Editor {
                 ui.close();
             }
         });
+
+        // Project the gizmo and selection markers with the same camera used for
+        // the scene so the overlay stays aligned with the rendered geometry.
+        let overlay_camera = self.viewport_camera(world);
+        let gizmo_overlay = if self.show_gizmos && self.active_tool != 0 {
+            self.gizmo_transform(world)
+                .and_then(|(_entity, origin, basis, _scale)| {
+                    let origin_screen =
+                        crate::viewport::world_to_screen(&overlay_camera, viewport_rect, origin)?;
+                    if !rect.contains(egui::pos2(origin_screen.x, origin_screen.y)) {
+                        return None;
+                    }
+                    let mut axes = Vec::new();
+                    for axis in [GizmoAxis::X, GizmoAxis::Y, GizmoAxis::Z] {
+                        let dir = crate::viewport::axis_vector(axis, basis);
+                        if let Some(tip) = crate::viewport::gizmo_screen_handle(
+                            &overlay_camera,
+                            viewport_rect,
+                            origin,
+                            dir,
+                        ) {
+                            axes.push((axis, tip));
+                        }
+                    }
+                    let hovered_axis = if response.hovered()
+                        && !response.dragged_by(egui::PointerButton::Primary)
+                    {
+                        response.hover_pos().and_then(|pos| {
+                            self.hit_test_gizmo_axis(
+                                &overlay_camera,
+                                viewport_rect,
+                                pos,
+                                origin,
+                                basis,
+                            )
+                        })
+                    } else {
+                        None
+                    };
+                    Some((origin_screen, axes, hovered_axis))
+                })
+        } else {
+            None
+        };
+        let selection_markers: Vec<egui::Pos2> = self
+            .selected_entities
+            .iter()
+            .filter_map(|&entity| {
+                let transform = Self::world_transform_of(world, entity)?;
+                let screen = crate::viewport::world_to_screen(
+                    &overlay_camera,
+                    viewport_rect,
+                    transform.translation,
+                )?;
+                let pos = egui::pos2(screen.x, screen.y);
+                rect.contains(pos).then_some(pos)
+            })
+            .collect();
+        let hover_marker = self.hovered_entity.and_then(|entity| {
+            if self.selected_entities.contains(&entity) {
+                return None;
+            }
+            let transform = Self::world_transform_of(world, entity)?;
+            let screen = crate::viewport::world_to_screen(
+                &overlay_camera,
+                viewport_rect,
+                transform.translation,
+            )?;
+            let pos = egui::pos2(screen.x, screen.y);
+            rect.contains(pos).then_some(pos)
+        });
+
         let p = ui.painter();
-        p.rect_filled(rect, 0.0, Color32::from_rgb(23, 25, 29));
+        if let Some(state) = viewport_state {
+            p.image(
+                state.texture_id,
+                rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        } else {
+            p.rect_filled(rect, 0.0, Color32::from_rgb(23, 25, 29));
+        }
         p.rect_stroke(
             rect,
             0.0,
             egui::Stroke::new(1.0_f32, Color32::from_gray(58)),
             egui::StrokeKind::Inside,
         );
-        if self.grid {
+        if self.grid && viewport_state.is_none() {
             let center = rect.center();
             for i in 0..24 {
                 let off = i as f32 * 22.0;
@@ -1803,7 +2699,36 @@ impl Editor {
                 egui::Stroke::new(2.0_f32, Color32::from_rgb(80, 160, 100)),
             );
         }
-        if self.show_gizmos {
+        if let Some((origin, axes, hovered_axis)) = gizmo_overlay {
+            let origin = egui::pos2(origin.x, origin.y);
+            for (axis, tip) in axes {
+                let (color, label) = match axis {
+                    GizmoAxis::X => (Color32::from_rgb(220, 90, 90), "X"),
+                    GizmoAxis::Y => (Color32::from_rgb(90, 220, 120), "Y"),
+                    GizmoAxis::Z => (Color32::from_rgb(90, 140, 230), "Z"),
+                    _ => (Color32::WHITE, ""),
+                };
+                let highlighted = hovered_axis == Some(axis);
+                let color = if highlighted {
+                    color.linear_multiply(1.35)
+                } else {
+                    color
+                };
+                let width = if highlighted { 3.5_f32 } else { 2.0_f32 };
+                let tip = egui::pos2(tip.x, tip.y);
+                p.line_segment([origin, tip], egui::Stroke::new(width, color));
+                p.circle_filled(tip, if highlighted { 5.5 } else { 4.0 }, color);
+                p.text(
+                    tip + Vec2::new(5.0, -5.0),
+                    egui::Align2::LEFT_BOTTOM,
+                    label,
+                    egui::FontId::proportional(10.0),
+                    color,
+                );
+            }
+            p.circle_filled(origin, 3.5, Color32::WHITE);
+        } else if self.show_gizmos {
+            // No selection: show a compact orientation indicator.
             let gizmo_origin = rect.left_bottom() + Vec2::new(24.0, -24.0);
             // Colored axis indicators (X red, Y green, Z blue)
             p.text(
@@ -1840,23 +2765,26 @@ impl Editor {
                 egui::Stroke::new(1.0_f32, Color32::from_rgb(90, 140, 230)),
             );
         }
-        for entity in &self.selected_entities {
-            if let Some(t) = world.get::<Transform>(*entity) {
-                let center =
-                    rect.center() + Vec2::new(t.translation.x * 24.0, -t.translation.y * 24.0);
-                p.circle_stroke(
-                    center,
-                    12.0,
-                    egui::Stroke::new(2.0_f32, Color32::from_rgb(255, 178, 64)),
-                );
-                p.text(
-                    center + Vec2::new(0.0, -16.0),
-                    egui::Align2::CENTER_BOTTOM,
-                    "Selected",
-                    egui::FontId::proportional(10.0),
-                    Color32::from_rgb(255, 206, 120),
-                );
-            }
+        for center in &selection_markers {
+            p.circle_stroke(
+                *center,
+                12.0,
+                egui::Stroke::new(2.0_f32, Color32::from_rgb(255, 178, 64)),
+            );
+            p.text(
+                *center + Vec2::new(0.0, -16.0),
+                egui::Align2::CENTER_BOTTOM,
+                "Selected",
+                egui::FontId::proportional(10.0),
+                Color32::from_rgb(255, 206, 120),
+            );
+        }
+        if let Some(center) = hover_marker {
+            p.circle_stroke(
+                center,
+                10.0,
+                egui::Stroke::new(1.0_f32, Color32::from_rgb(200, 200, 200)),
+            );
         }
     }
 
@@ -2013,15 +2941,71 @@ impl Editor {
                     .iter(world)
                     .collect();
                 for e in entities {
+                    if let Some(uid) = world.get::<crate::core::uid::Uid>(e).copied() {
+                        if let Some(mut registry) =
+                            world.get_resource_mut::<crate::core::resources::PersistentIdRegistry>()
+                        {
+                            registry.unregister(uid);
+                        }
+                    }
                     let _ = world.despawn(e);
                 }
                 let count = scene.entities.len();
-                for item in scene.entities {
+                let mut spawned_entities = Vec::with_capacity(count);
+
+                for item in &scene.entities {
                     let mut t = Transform::from_translation(Vec3::from_array(item.translation));
                     t.rotation = glam::Quat::from_array(item.rotation);
                     t.scale = Vec3::from_array(item.scale);
-                    world.spawn((Name(item.name), t));
+                    let uid = item.uid.unwrap_or_else(crate::core::uid::Uid::new);
+
+                    let mut entity_cmds = world.spawn((
+                        Name(item.name.clone()),
+                        t,
+                        uid,
+                        crate::core::components::Visible(item.visible),
+                        crate::core::components::Locked(item.locked),
+                    ));
+
+                    if let Some(ref folder) = item.folder {
+                        entity_cmds.insert(crate::core::components::FolderGroup(folder.clone()));
+                    }
+                    if let Some(ref mf) = item.components.mesh_filter {
+                        entity_cmds.insert(mf.clone());
+                    }
+                    if let Some(ref mr) = item.components.mesh_renderer {
+                        entity_cmds.insert(mr.clone());
+                    }
+                    if let Some(cam) = item.components.camera {
+                        entity_cmds.insert(cam);
+                    }
+                    if let Some(light) = item.components.light {
+                        entity_cmds.insert(light);
+                    }
+
+                    let entity = entity_cmds.id();
+                    spawned_entities.push(entity);
+
+                    if let Some(mut registry) =
+                        world.get_resource_mut::<crate::core::resources::PersistentIdRegistry>()
+                    {
+                        let _ = registry.register(uid, entity);
+                    }
                 }
+
+                // Restore parent-child hierarchy
+                for (idx, item) in scene.entities.iter().enumerate() {
+                    if let Some(parent_idx) = item.parent {
+                        if parent_idx < spawned_entities.len() {
+                            let child_entity = spawned_entities[idx];
+                            let parent_entity = spawned_entities[parent_idx];
+                            world
+                                .entity_mut(child_entity)
+                                .insert(crate::transform::Parent(parent_entity));
+                        }
+                    }
+                }
+
                 self.dirty = false;
                 self.status = "Loaded".into();
                 self.log
@@ -2033,6 +3017,8 @@ impl Editor {
                         path.file_name().unwrap_or_default().to_string_lossy()
                     ),
                 );
+                // Clear undo/redo history on scene load
+                self.history.clear();
             }
             None => {
                 self.status = "Scene load failed".into();
@@ -2092,9 +3078,10 @@ impl Editor {
         let painter = ui.painter_at(rect);
         let center = rect.center();
         let zoom = self.mesh_zoom.max(0.1);
-        // Handle orbit drag
+        // Handle orbit drag. `drag_delta()` is cumulative for the gesture, so
+        // use the per-frame pointer delta to avoid accelerating the orbit.
         if response.dragged() {
-            let delta = response.drag_delta();
+            let delta = ui.input(|i| i.pointer.delta());
             self.preview_yaw += delta.x * 0.005;
             self.preview_pitch = (self.preview_pitch - delta.y * 0.005).clamp(-1.5, 1.5);
         }
@@ -2173,7 +3160,10 @@ impl Editor {
         ];
         let box_color = Color32::from_rgb(120, 140, 160);
         for (a, b) in box_edges {
-            painter.line_segment([corners_2d[a], corners_2d[b]], Stroke::new(1.0_f32, box_color));
+            painter.line_segment(
+                [corners_2d[a], corners_2d[b]],
+                Stroke::new(1.0_f32, box_color),
+            );
         }
     }
 
@@ -2366,43 +3356,48 @@ impl Editor {
     }
 
     fn preview_model_state(editor: &mut Editor, ui: &mut egui::Ui, path: &Path) {
-        if let Ok(content) = std::fs::read_to_string(path) {
-            if let Some(mesh) = ObjMesh::parse(&content) {
-                // Show zoom control
-                ui.horizontal(|ui| {
-                    ui.label("Zoom:");
-                    ui.add(
-                        egui::DragValue::new(&mut editor.mesh_zoom)
-                            .speed(0.1)
-                            .range(0.1..=50.0)
-                            .suffix("x"),
-                    );
-                    if ui.button("Reset").clicked() {
-                        editor.mesh_zoom = 1.0;
-                        editor.preview_yaw = 0.0;
-                        editor.preview_pitch = 0.0;
-                    }
-                    ui.separator();
-                    ui.label(format!(
-                        "Vertices: {}  Triangles: {}",
-                        mesh.vertices.len(),
-                        mesh.indices.len() / 3
-                    ));
-                });
-                ui.add_space(4.0);
-                editor.preview_mesh_viewport(ui, &mesh);
-            } else {
-                ui.centered_and_justified(|ui| {
-                    ui.label(
-                        RichText::new("Failed to parse model (OBJ only)")
-                            .color(Color32::from_rgb(220, 100, 100)),
-                    );
-                });
-            }
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+
+        let mesh_opt = if ext == "gltf" || ext == "glb" {
+            ObjMesh::parse_gltf(path)
+        } else if let Ok(content) = std::fs::read_to_string(path) {
+            ObjMesh::parse(&content)
+        } else {
+            None
+        };
+
+        if let Some(mesh) = mesh_opt {
+            // Show zoom control
+            ui.horizontal(|ui| {
+                ui.label("Zoom:");
+                ui.add(
+                    egui::DragValue::new(&mut editor.mesh_zoom)
+                        .speed(0.1)
+                        .range(0.1..=50.0)
+                        .suffix("x"),
+                );
+                if ui.button("Reset").clicked() {
+                    editor.mesh_zoom = 1.0;
+                    editor.preview_yaw = 0.0;
+                    editor.preview_pitch = 0.0;
+                }
+                ui.separator();
+                ui.label(format!(
+                    "Vertices: {}  Triangles: {}",
+                    mesh.vertices.len(),
+                    mesh.indices.len() / 3
+                ));
+            });
+            ui.add_space(4.0);
+            editor.preview_mesh_viewport(ui, &mesh);
         } else {
             ui.centered_and_justified(|ui| {
                 ui.label(
-                    RichText::new("Failed to read model file")
+                    RichText::new("Failed to parse 3D model (supported: glTF, GLB, OBJ)")
                         .color(Color32::from_rgb(220, 100, 100)),
                 );
             });
@@ -2932,6 +3927,23 @@ impl Editor {
     }
 
     pub fn content_context_menu(&mut self, ui: &mut egui::Ui, path: &Path) {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let is_model = ext == "gltf" || ext == "glb" || ext == "obj";
+
+        if is_model && ui.button(format!("{} Add to Scene", Icons::ADD)).clicked() {
+            self.pending_instantiate_model = Some(path.to_path_buf());
+            ui.close();
+        }
+
+        if !path.is_dir() && ui.button(format!("{} Reimport", Icons::REFRESH)).clicked() {
+            self.pending_reimport_asset = Some(path.to_path_buf());
+            ui.close();
+        }
+
         if path.is_dir() && ui.button(format!("{} Open", Icons::FOLDER_OPEN)).clicked() {
             self.navigate_content(path.to_path_buf());
             ui.close();
@@ -2959,7 +3971,7 @@ impl Editor {
             ui.close();
         }
         if ui
-            .button(format!("{} Import Sample TextureвЂ¦", Icons::IMPORT))
+            .button(format!("{} Import File…", Icons::IMPORT))
             .clicked()
         {
             let target = if path.is_dir() {
@@ -3093,9 +4105,12 @@ impl Editor {
     }
     pub fn show_in_explorer(&mut self, path: &Path) {
         #[cfg(target_os = "windows")]
-        let result = Command::new("explorer").arg("/select,").arg(path).spawn();
+        let result = ProcessCommand::new("explorer")
+            .arg("/select,")
+            .arg(path)
+            .spawn();
         #[cfg(not(target_os = "windows"))]
-        let result = Command::new("xdg-open")
+        let result = ProcessCommand::new("xdg-open")
             .arg(path.parent().unwrap_or(path))
             .spawn();
         if let Err(e) = result {
@@ -3237,14 +4252,19 @@ impl Editor {
         });
 
         if let Some(target) = self.rename_entity {
-            if let Some(mut name) = world.get_mut::<Name>(target) {
+            let original_name = world.get::<Name>(target).map(|n| n.0.clone());
+            if let Some(original_name) = original_name {
                 ui.separator();
                 ui.horizontal(|ui| {
                     ui.label("Rename:");
                     let response = ui.text_edit_singleline(&mut self.rename_buffer);
                     if response.lost_focus() || ui.button("Apply").clicked() {
-                        if !self.rename_buffer.trim().is_empty() {
-                            name.0 = self.rename_buffer.trim().to_string();
+                        let new_name = self.rename_buffer.trim().to_string();
+                        if !new_name.is_empty() && new_name != original_name {
+                            use crate::commands::RenameEntityCommand;
+                            if let Some(cmd) = RenameEntityCommand::new(world, target, new_name) {
+                                self.history.push(Box::new(cmd), world);
+                            }
                             self.dirty = true;
                         }
                         self.rename_entity = None;
@@ -3503,6 +4523,23 @@ impl Editor {
                     }
                 });
 
+                // Track the transform at the start of a pointer/keyboard
+                // interaction so translation, rotation and scale edits commit
+                // as one command.
+                let is_pointer_down = ui.input(|i| i.pointer.any_down());
+                let pointer_pressed = ui.input(|i| i.pointer.primary_pressed());
+                let has_keyboard_focus = ui.ctx().memory(|m| m.focused().is_some());
+                let pointer_over_details = ui.rect_contains_pointer(ui.max_rect());
+                if pointer_pressed
+                    && pointer_over_details
+                    && self.transform_edit_start.is_none()
+                {
+                    if let Some(t) = world.get::<Transform>(entity) {
+                        self.transform_edit_start = Some(*t);
+                    }
+                }
+
+                let mut translation_changed = false;
                 if let Some(mut t) = world.get_mut::<Transform>(entity) {
                     ui.horizontal(|ui| {
                         ui.label("Location");
@@ -3520,107 +4557,192 @@ impl Editor {
                         }
                     });
                     ui.horizontal(|ui| {
-                        ui.add(
-                            egui::DragValue::new(&mut t.translation.x)
-                                .prefix("X ")
-                                .speed(0.1),
-                        );
-                        ui.add(
-                            egui::DragValue::new(&mut t.translation.y)
-                                .prefix("Y ")
-                                .speed(0.1),
-                        );
-                        ui.add(
-                            egui::DragValue::new(&mut t.translation.z)
-                                .prefix("Z ")
-                                .speed(0.1),
-                        );
+                        translation_changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut t.translation.x)
+                                    .prefix("X ")
+                                    .speed(0.1),
+                            )
+                            .changed();
+                        translation_changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut t.translation.y)
+                                    .prefix("Y ")
+                                    .speed(0.1),
+                            )
+                            .changed();
+                        translation_changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut t.translation.z)
+                                    .prefix("Z ")
+                                    .speed(0.1),
+                            )
+                            .changed();
+                    });
+                }
+                if translation_changed {
+                    self.dirty = true;
+                }
+
+                // Rotation editing. DragValues show degrees; convert back to
+                // radians so the edited values actually reach the transform.
+                let rotation_euler = world
+                    .get::<Transform>(entity)
+                    .map(|t| {
+                        let (rx, ry, rz) = t.rotation.to_euler(glam::EulerRot::XYZ);
+                        (
+                            rx.to_degrees(),
+                            ry.to_degrees(),
+                            rz.to_degrees(),
+                        )
                     });
 
-                    let (mut rx, mut ry, mut rz) = t.rotation.to_euler(glam::EulerRot::XYZ);
-                    ui.horizontal(|ui| {
-                        ui.label("Rotation");
-                        if ui
-                            .button(
-                                RichText::new(Icons::RESET)
-                                    .size(11.0)
-                                    .color(Color32::from_rgb(140, 145, 155)),
-                            )
-                            .engine_tooltip(
-                                "Reset Rotation",
-                                "Set rotation to identity (no rotation)",
-                                None,
-                            )
-                            .clicked()
-                        {
+                ui.horizontal(|ui| {
+                    ui.label("Rotation");
+                    if ui
+                        .button(
+                            RichText::new(Icons::RESET)
+                                .size(11.0)
+                                .color(Color32::from_rgb(140, 145, 155)),
+                        )
+                        .engine_tooltip(
+                            "Reset Rotation",
+                            "Set rotation to identity (no rotation)",
+                            None,
+                        )
+                        .clicked()
+                    {
+                        if let Some(mut t) = world.get_mut::<Transform>(entity) {
                             t.rotation = glam::Quat::IDENTITY;
                             self.dirty = true;
                         }
-                    });
-                    let rot_changed = ui
+                    }
+                });
+
+                if let Some((mut rx, mut ry, mut rz)) = rotation_euler {
+                    let edited = ui
                         .horizontal(|ui| {
                             let mut changed = false;
                             changed |= ui
-                                .add(egui::DragValue::new(&mut rx).prefix("X ").speed(0.02))
+                                .add(
+                                    egui::DragValue::new(&mut rx)
+                                        .prefix("X ")
+                                        .suffix("°")
+                                        .speed(0.5),
+                                )
                                 .changed();
                             changed |= ui
-                                .add(egui::DragValue::new(&mut ry).prefix("Y ").speed(0.02))
+                                .add(
+                                    egui::DragValue::new(&mut ry)
+                                        .prefix("Y ")
+                                        .suffix("°")
+                                        .speed(0.5),
+                                )
                                 .changed();
                             changed |= ui
-                                .add(egui::DragValue::new(&mut rz).prefix("Z ").speed(0.02))
+                                .add(
+                                    egui::DragValue::new(&mut rz)
+                                        .prefix("Z ")
+                                        .suffix("°")
+                                        .speed(0.5),
+                                )
                                 .changed();
                             changed
                         })
                         .inner;
-                    if rot_changed {
-                        t.rotation = glam::Quat::from_euler(glam::EulerRot::XYZ, rx, ry, rz);
-                        self.dirty = true;
+                    if edited {
+                        if let Some(mut t) = world.get_mut::<Transform>(entity) {
+                            t.rotation = glam::Quat::from_euler(
+                                glam::EulerRot::XYZ,
+                                rx.to_radians(),
+                                ry.to_radians(),
+                                rz.to_radians(),
+                            );
+                            self.dirty = true;
+                        }
                     }
+                }
 
-                    ui.horizontal(|ui| {
-                        ui.label("Scale");
-                        if ui
-                            .button(
-                                RichText::new(Icons::RESET)
-                                    .size(11.0)
-                                    .color(Color32::from_rgb(140, 145, 155)),
-                            )
-                            .engine_tooltip("Reset Scale", "Set scale to (1, 1, 1)", None)
-                            .clicked()
-                        {
+                // Scale editing - get values without holding mutable borrow
+                let mut scale_changed = false;
+                let mut scale_value = None;
+                if let Some(t) = world.get::<Transform>(entity) {
+                    scale_value = Some(t.scale);
+                }
+
+                ui.horizontal(|ui| {
+                    ui.label("Scale");
+                    if ui
+                        .button(
+                            RichText::new(Icons::RESET)
+                                .size(11.0)
+                                .color(Color32::from_rgb(140, 145, 155)),
+                        )
+                        .engine_tooltip("Reset Scale", "Set scale to (1, 1, 1)", None)
+                        .clicked()
+                    {
+                        if let Some(mut t) = world.get_mut::<Transform>(entity) {
                             t.scale = Vec3::ONE;
                             self.dirty = true;
                         }
-                    });
-                    let mut scale_changed = false;
-                    ui.horizontal(|ui| {
-                        scale_changed |= ui
-                            .add(
-                                egui::DragValue::new(&mut t.scale.x)
-                                    .prefix("X ")
-                                    .speed(0.02)
-                                    .range(0.001..=1000.0),
-                            )
-                            .changed();
-                        scale_changed |= ui
-                            .add(
-                                egui::DragValue::new(&mut t.scale.y)
-                                    .prefix("Y ")
-                                    .speed(0.02)
-                                    .range(0.001..=1000.0),
-                            )
-                            .changed();
-                        scale_changed |= ui
-                            .add(
-                                egui::DragValue::new(&mut t.scale.z)
-                                    .prefix("Z ")
-                                    .speed(0.02)
-                                    .range(0.001..=1000.0),
-                            )
-                            .changed();
-                    });
-                    if scale_changed {
+                    }
+                });
+
+                if let Some(mut scale) = scale_value {
+                    let changed = ui
+                        .horizontal(|ui| {
+                            let mut changed = false;
+                            changed |= ui
+                                .add(
+                                    egui::DragValue::new(&mut scale.x)
+                                        .prefix("X ")
+                                        .speed(0.02)
+                                        .range(0.001..=1000.0),
+                                )
+                                .changed();
+                            changed |= ui
+                                .add(
+                                    egui::DragValue::new(&mut scale.y)
+                                        .prefix("Y ")
+                                        .speed(0.02)
+                                        .range(0.001..=1000.0),
+                                )
+                                .changed();
+                            changed |= ui
+                                .add(
+                                    egui::DragValue::new(&mut scale.z)
+                                        .prefix("Z ")
+                                        .speed(0.02)
+                                        .range(0.001..=1000.0),
+                                )
+                                .changed();
+                            changed
+                        })
+                        .inner;
+                    scale_changed = changed;
+                }
+
+                if scale_changed {
+                    if let (Some(mut t), Some(scale)) = (world.get_mut::<Transform>(entity), scale_value) {
+                        t.scale = scale;
                         self.dirty = true;
+                    }
+                }
+
+                // Commit the whole Details edit once both the pointer is
+                // released and no DragValue is still in text-entry mode.
+                if !is_pointer_down && !has_keyboard_focus {
+                    if let Some(start) = self.transform_edit_start.take() {
+                        if let Some(current) = world.get::<Transform>(entity).copied() {
+                            if current != start {
+                                use crate::commands::SetTransformCommand;
+                                if let Some(cmd) =
+                                    SetTransformCommand::from_pair(entity, start, current)
+                                {
+                                    self.history.push(Box::new(cmd), world);
+                                }
+                            }
+                        }
                     }
                 }
             });
@@ -3633,16 +4755,70 @@ impl Editor {
                 ui.label(format!("{} Name ({entity_name})", Icons::ENTITY));
                 ui.label(format!("{} Transform", Icons::TRANSFORM));
                 if has_parent {
-                    ui.label(format!("{} Parent", Icons::ENTITY));
+                    ui.horizontal(|ui| {
+                        ui.label(format!("{} Parent", Icons::ENTITY));
+                        if ui.small_button("X").clicked() {
+                            use crate::commands::{AddableComponent, RemoveComponentCommand};
+                            if let Some(parent) = world.get::<Parent>(entity) {
+                                if let Some(cmd) = RemoveComponentCommand::new(
+                                    world,
+                                    entity,
+                                    AddableComponent::Parent(parent.0),
+                                ) {
+                                    self.history.push(Box::new(cmd), world);
+                                    self.dirty = true;
+                                }
+                            }
+                        }
+                    });
                 }
                 if has_group {
-                    ui.label(format!("{} FolderGroup", Icons::FOLDER));
+                    ui.horizontal(|ui| {
+                        ui.label(format!("{} FolderGroup", Icons::FOLDER));
+                        if ui.small_button("X").clicked() {
+                            use crate::commands::{AddableComponent, RemoveComponentCommand};
+                            if let Some(cmd) = RemoveComponentCommand::new(
+                                world,
+                                entity,
+                                AddableComponent::FolderGroup("".into()),
+                            ) {
+                                self.history.push(Box::new(cmd), world);
+                                self.dirty = true;
+                            }
+                        }
+                    });
                 }
                 if has_visible {
-                    ui.label(format!("{} Visible", Icons::VISIBLE));
+                    ui.horizontal(|ui| {
+                        ui.label(format!("{} Visible", Icons::VISIBLE));
+                        if ui.small_button("X").clicked() {
+                            use crate::commands::{AddableComponent, RemoveComponentCommand};
+                            if let Some(cmd) = RemoveComponentCommand::new(
+                                world,
+                                entity,
+                                AddableComponent::Visible(true),
+                            ) {
+                                self.history.push(Box::new(cmd), world);
+                                self.dirty = true;
+                            }
+                        }
+                    });
                 }
                 if has_locked {
-                    ui.label(format!("{} Locked", Icons::LOCKED));
+                    ui.horizontal(|ui| {
+                        ui.label(format!("{} Locked", Icons::LOCKED));
+                        if ui.small_button("X").clicked() {
+                            use crate::commands::{AddableComponent, RemoveComponentCommand};
+                            if let Some(cmd) = RemoveComponentCommand::new(
+                                world,
+                                entity,
+                                AddableComponent::Locked(false),
+                            ) {
+                                self.history.push(Box::new(cmd), world);
+                                self.dirty = true;
+                            }
+                        }
+                    });
                 }
                 ui.separator();
                 ui.menu_button(format!("{} Add Component", Icons::ADD), |ui| {
@@ -3651,19 +4827,26 @@ impl Editor {
                             .button(format!("{} FolderGroup", Icons::FOLDER))
                             .clicked()
                     {
-                        world
-                            .entity_mut(entity)
-                            .insert(FolderGroup("Folder".into()));
+                        use crate::commands::{AddComponentCommand, AddableComponent};
+                        let cmd = AddComponentCommand::new(
+                            entity,
+                            AddableComponent::FolderGroup("Folder".into()),
+                        );
+                        self.history.push(Box::new(cmd), world);
                         self.dirty = true;
                         ui.close();
                     }
                     if !has_visible && ui.button(format!("{} Visible", Icons::VISIBLE)).clicked() {
-                        world.entity_mut(entity).insert(Visible(true));
+                        use crate::commands::{AddComponentCommand, AddableComponent};
+                        let cmd = AddComponentCommand::new(entity, AddableComponent::Visible(true));
+                        self.history.push(Box::new(cmd), world);
                         self.dirty = true;
                         ui.close();
                     }
                     if !has_locked && ui.button(format!("{} Locked", Icons::LOCKED)).clicked() {
-                        world.entity_mut(entity).insert(Locked(false));
+                        use crate::commands::{AddComponentCommand, AddableComponent};
+                        let cmd = AddComponentCommand::new(entity, AddableComponent::Locked(false));
+                        self.history.push(Box::new(cmd), world);
                         self.dirty = true;
                         ui.close();
                     }
@@ -3688,15 +4871,32 @@ impl Editor {
         }
     }
     fn create_entity(&mut self, world: &mut World) {
-        let e = world
-            .spawn((
-                Name("New Actor".into()),
-                Transform::from_translation(Vec3::ZERO),
-            ))
-            .id();
-        self.set_selected_entity(Some(e), false);
+        use crate::commands::SpawnEntityCommand;
+        use crate::scene::SerializedComponents;
+
+        let cmd = SpawnEntityCommand::new(
+            "New Actor",
+            Transform::from_translation(Vec3::ZERO),
+            None,
+            SerializedComponents::default(),
+            true,
+            false,
+            None,
+        );
+
+        // Execute the command directly to get the entity
+        let mut cmd_box: Box<dyn EditorCommand> = Box::new(cmd);
+        cmd_box.execute(world);
+
+        if let Some(spawn_cmd) = cmd_box.as_any().downcast_ref::<SpawnEntityCommand>() {
+            if let Some(entity) = spawn_cmd.entity() {
+                self.set_selected_entity(Some(entity), false);
+            }
+        }
+
+        self.history.push(cmd_box, world);
+
         self.dirty = true;
-        self.log.push(("INFO".into(), "Created actor".into()));
         self.notifications
             .success("Actor Spawned", "Added 'New Actor' at scene origin");
     }
@@ -3754,6 +4954,8 @@ impl Editor {
         self.log.push(("INFO".into(), "Created empty scene".into()));
         self.notifications
             .success("New Scene", "Initialized new empty scene");
+        // Clear undo/redo history on new scene
+        self.history.clear();
     }
     pub fn import_dummy_resource(&mut self, target_dir: &Path) {
         // Pick a real file from disk and copy it into the content folder.
@@ -3765,7 +4967,35 @@ impl Editor {
             let dest = target_dir.join(&file_name);
             match std::fs::copy(&file, &dest) {
                 Ok(_) => {
-                    self.content_selected = Some(dest);
+                    self.content_selected = Some(dest.clone());
+                    // Register into asset database
+                    let ext = dest
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("")
+                        .to_lowercase();
+                    let asset_type = match ext.as_str() {
+                        "gltf" | "glb" | "obj" => crate::asset_database::AssetType::Mesh,
+                        "png" | "jpg" | "jpeg" => crate::asset_database::AssetType::Texture,
+                        "mat" | "ron" => crate::asset_database::AssetType::Material,
+                        _ => crate::asset_database::AssetType::Other,
+                    };
+                    let asset_id = crate::asset_database::AssetId::new();
+                    let mut metadata = crate::asset_database::AssetMetadata::new(
+                        asset_id,
+                        file_name.clone(),
+                        asset_type,
+                        dest.clone(),
+                        crate::asset_importer::ImportPipeline::generate_internal_path(
+                            asset_id, asset_type,
+                        ),
+                    );
+                    metadata.load_state = crate::asset_database::AssetLoadState::Loaded;
+                    self.asset_database.registry.register(metadata, None);
+                    let _ = self
+                        .asset_database
+                        .save_to_file(&PathBuf::from("assets/asset_database.ron"));
+
                     self.status = format!("Imported '{file_name}'");
                     self.log.push((
                         "INFO".into(),
@@ -3773,7 +5003,7 @@ impl Editor {
                     ));
                     self.notifications.success(
                         "Resource Imported",
-                        format!("Copied '{file_name}' into the content folder"),
+                        format!("Copied and registered '{file_name}' into asset database"),
                     );
                 }
                 Err(e) => {
@@ -3809,33 +5039,51 @@ impl Editor {
     }
     fn save_scene(&mut self, world: &mut World) {
         let mut scene = Scene::new();
-        for (entity, name, t) in world.query::<(Entity, &Name, &Transform)>().iter(world) {
+        let entities_list: Vec<(Entity, Name, Transform)> = world
+            .query::<(Entity, &Name, &Transform)>()
+            .iter(world)
+            .map(|(e, n, t)| (e, n.clone(), *t))
+            .collect();
+
+        let entity_to_index: std::collections::HashMap<Entity, usize> = entities_list
+            .iter()
+            .enumerate()
+            .map(|(idx, (e, _, _))| (*e, idx))
+            .collect();
+
+        for (entity, name, t) in &entities_list {
+            let parent_idx = world
+                .get::<crate::transform::Parent>(*entity)
+                .and_then(|p| entity_to_index.get(&p.0).copied());
+
             scene.entities.push(SceneEntity {
                 name: name.0.clone(),
-                uid: world.get::<crate::core::uid::Uid>(entity).copied(),
+                uid: world.get::<crate::core::uid::Uid>(*entity).copied(),
                 translation: t.translation.to_array(),
                 rotation: t.rotation.to_array(),
                 scale: t.scale.to_array(),
-                parent: None,
+                parent: parent_idx,
                 visible: world
-                    .get::<crate::core::components::Visible>(entity)
+                    .get::<crate::core::components::Visible>(*entity)
                     .is_none_or(|value| value.0),
                 locked: world
-                    .get::<crate::core::components::Locked>(entity)
+                    .get::<crate::core::components::Locked>(*entity)
                     .is_some_and(|value| value.0),
                 folder: world
-                    .get::<crate::core::components::FolderGroup>(entity)
+                    .get::<crate::core::components::FolderGroup>(*entity)
                     .map(|value| value.0.clone()),
                 components: crate::scene::SerializedComponents {
                     custom: Default::default(),
                     mesh_filter: world
-                        .get::<crate::core::components::MeshFilter>(entity)
+                        .get::<crate::core::components::MeshFilter>(*entity)
                         .cloned(),
                     mesh_renderer: world
-                        .get::<crate::core::components::MeshRenderer>(entity)
+                        .get::<crate::core::components::MeshRenderer>(*entity)
                         .cloned(),
-                    camera: world.get::<crate::camera::Camera3D>(entity).copied(),
-                    light: world.get::<crate::core::components::Light>(entity).copied(),
+                    camera: world.get::<crate::camera::Camera3D>(*entity).copied(),
+                    light: world
+                        .get::<crate::core::components::Light>(*entity)
+                        .copied(),
                 },
             });
         }
@@ -3899,7 +5147,12 @@ impl Editor {
             let _ = std::fs::write("editor-layout.ron", s);
         }
     }
-    fn draw_performance_monitor(&mut self, ui: &mut egui::Ui, world: &World, perf: &mut crate::performance::PerformanceMonitor) {
+    fn draw_performance_monitor(
+        &mut self,
+        ui: &mut egui::Ui,
+        world: &World,
+        perf: &mut crate::performance::PerformanceMonitor,
+    ) {
         // Read EngineMode from the world
         let mode = world
             .get_resource::<crate::core::resources::EngineMode>()
@@ -4613,6 +5866,176 @@ impl Editor {
         format!("{:.2} {}", size, UNITS[unit])
     }
 
+    fn draw_history_panel(&mut self, ui: &mut egui::Ui, world: &mut World) {
+        ui.horizontal(|ui| {
+            ui.heading("HISTORY");
+            ui.separator();
+
+            // Undo button
+            let can_undo = self.history.can_undo();
+            if ui
+                .add_enabled(
+                    can_undo,
+                    egui::Button::new(
+                        RichText::new(format!("{} Undo", Icons::UNDO))
+                            .size(12.0)
+                            .color(Color32::WHITE),
+                    )
+                    .fill(if can_undo {
+                        Color32::from_rgb(60, 80, 120)
+                    } else {
+                        Color32::from_rgb(40, 40, 40)
+                    }),
+                )
+                .engine_tooltip(
+                    "Undo",
+                    format!(
+                        "Undo last action ({})",
+                        self.history.undo_name().unwrap_or("none")
+                    ),
+                    Some("Ctrl+Z"),
+                )
+                .clicked()
+            {
+                if let Some(name) = self.history.undo(world) {
+                    self.dirty = true;
+                    self.log_info(&format!("Undo: {}", name));
+                }
+            }
+
+            // Redo button
+            let can_redo = self.history.can_redo();
+            if ui
+                .add_enabled(
+                    can_redo,
+                    egui::Button::new(
+                        RichText::new(format!("{} Redo", Icons::REDO))
+                            .size(12.0)
+                            .color(Color32::WHITE),
+                    )
+                    .fill(if can_redo {
+                        Color32::from_rgb(60, 100, 60)
+                    } else {
+                        Color32::from_rgb(40, 40, 40)
+                    }),
+                )
+                .engine_tooltip(
+                    "Redo",
+                    format!(
+                        "Redo last undone action ({})",
+                        self.history.redo_name().unwrap_or("none")
+                    ),
+                    Some("Ctrl+Y"),
+                )
+                .clicked()
+            {
+                if let Some(name) = self.history.redo(world) {
+                    self.dirty = true;
+                    self.log_info(&format!("Redo: {}", name));
+                }
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .button(
+                        RichText::new(format!("{} Clear", Icons::DELETE))
+                            .size(11.0)
+                            .color(Color32::WHITE),
+                    )
+                    .engine_tooltip("Clear History", "Clear all undo/redo history", None)
+                    .clicked()
+                {
+                    self.history.clear();
+                    self.log_info("History cleared");
+                }
+            });
+        });
+
+        ui.separator();
+
+        // History list
+        egui::ScrollArea::vertical()
+            .id_salt("history_scroll")
+            .show(ui, |ui| {
+                let undo_stack = self.history.undo_stack();
+                let redo_stack = self.history.redo_stack();
+
+                // Show redo stack (future actions - grayed out)
+                if !redo_stack.is_empty() {
+                    ui.label(
+                        RichText::new("Redo Stack")
+                            .strong()
+                            .color(Color32::from_rgb(120, 120, 120)),
+                    );
+                    ui.add_space(4.0);
+                    for (i, cmd) in redo_stack.iter().rev().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.add_space(16.0);
+                            ui.label(
+                                RichText::new(format!("  {}. {}", i + 1, cmd.name()))
+                                    .size(11.0)
+                                    .color(Color32::from_rgb(100, 100, 100))
+                                    .italics(),
+                            );
+                        });
+                    }
+                    ui.separator();
+                }
+
+                // Current position indicator
+                if !undo_stack.is_empty() || !redo_stack.is_empty() {
+                    ui.horizontal(|ui| {
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new("▼ Current")
+                                .size(10.0)
+                                .color(Color32::from_rgb(100, 200, 100))
+                                .strong(),
+                        );
+                    });
+                    ui.add_space(4.0);
+                }
+
+                // Show undo stack (past actions - most recent first)
+                if !undo_stack.is_empty() {
+                    ui.label(RichText::new("Undo Stack").strong());
+                    ui.add_space(4.0);
+                    for (i, cmd) in undo_stack.iter().rev().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.add_space(16.0);
+                            ui.label(
+                                RichText::new(format!("  {}. {}", i + 1, cmd.name()))
+                                    .size(11.0)
+                                    .color(Color32::WHITE),
+                            );
+                        });
+                    }
+                } else if redo_stack.is_empty() {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(20.0);
+                        Icons::show(
+                            ui,
+                            Icons::HISTORY,
+                            IconSize::Large,
+                            Some(Color32::from_rgb(80, 85, 95)),
+                        );
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new("No history yet")
+                                .size(12.0)
+                                .color(Color32::from_rgb(100, 105, 115)),
+                        );
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new("Perform actions to build history")
+                                .size(10.0)
+                                .color(Color32::from_rgb(80, 85, 95)),
+                        );
+                    });
+                }
+            });
+    }
+
     fn reset_layout(&mut self) {
         self.current_workspace = WorkspacePreset::Default;
         self.dock_state = Some(WorkspacePreset::Default.create_dock_state());
@@ -4624,6 +6047,7 @@ pub struct EditorTabViewer<'a> {
     pub world: &'a mut World,
     pub perf: &'a mut crate::performance::PerformanceMonitor,
     pub actions: &'a mut Vec<DockAction>,
+    pub viewport_state: Option<ViewportTextureState>,
 }
 
 impl<'a> egui_dock::TabViewer for EditorTabViewer<'a> {
@@ -4635,7 +6059,9 @@ impl<'a> egui_dock::TabViewer for EditorTabViewer<'a> {
 
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab) {
         match tab {
-            EditorTab::Viewport => self.editor.draw_viewport(ui, self.world),
+            EditorTab::Viewport => self
+                .editor
+                .draw_viewport(ui, self.world, self.viewport_state),
             EditorTab::WorldOutliner => self.editor.draw_world_outliner(ui, self.world),
             EditorTab::Details => self.editor.draw_details(ui, self.world),
             EditorTab::ContentBrowser => self.editor.draw_content_browser(ui, self.world),
@@ -4644,7 +6070,10 @@ impl<'a> egui_dock::TabViewer for EditorTabViewer<'a> {
             EditorTab::OutputLog => self.editor.draw_output_log(ui),
             EditorTab::ScriptEditor => self.editor.draw_script_editor(ui),
             EditorTab::GraphicsSettings => self.editor.draw_graphics_settings(ui),
-            EditorTab::PerformanceMonitor => self.editor.draw_performance_monitor(ui, self.world, self.perf),
+            EditorTab::PerformanceMonitor => self
+                .editor
+                .draw_performance_monitor(ui, self.world, self.perf),
+            EditorTab::History => self.editor.draw_history_panel(ui, self.world),
         }
     }
 

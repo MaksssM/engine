@@ -124,6 +124,7 @@ pub struct MeshAsset {
     pub(crate) index_buffer: wgpu::Buffer,
     pub(crate) index_count: u32,
     pub(crate) vertex_count: u32,
+    pub(crate) index_format: wgpu::IndexFormat,
     pub(crate) model_layout: wgpu::BindGroupLayout,
     pub(crate) model_buffers: HashMap<ModelKey, wgpu::Buffer>,
     pub(crate) model_bind_groups: HashMap<ModelKey, wgpu::BindGroup>,
@@ -137,6 +138,15 @@ pub struct MaterialAsset {
     pub color_buffer: wgpu::Buffer,
     pub color_bind_group: wgpu::BindGroup,
     pub color_bind_group_layout: wgpu::BindGroupLayout,
+}
+
+pub struct TextureAsset {
+    pub texture: wgpu::Texture,
+    pub view: wgpu::TextureView,
+    pub sampler: wgpu::Sampler,
+    pub bind_group: Option<wgpu::BindGroup>,
+    pub width: u32,
+    pub height: u32,
 }
 
 #[derive(Component, Clone, Copy)]
@@ -261,12 +271,15 @@ pub struct Renderer {
     pub shadow_quality: ShadowQuality,
     pub mesh_assets: AssetManager<MeshAsset>,
     pub material_assets: AssetManager<MaterialAsset>,
+    pub texture_assets: AssetManager<TextureAsset>,
+    pub gpu_registry: crate::assets::GpuResourceRegistry,
     pub cube_mesh: Handle<MeshAsset>,
     pub cube_material: Handle<MaterialAsset>,
     pub red_material: Handle<MaterialAsset>,
     pub green_material: Handle<MaterialAsset>,
     pub blue_material: Handle<MaterialAsset>,
     pub color_layout: wgpu::BindGroupLayout,
+    pub model_layout: wgpu::BindGroupLayout,
     pub camera_buffer: wgpu::Buffer,
     pub camera_bind_group: wgpu::BindGroup,
     pub camera_layout: wgpu::BindGroupLayout,
@@ -281,6 +294,16 @@ pub struct Renderer {
     pub depth_view: Option<wgpu::TextureView>,
     pub msaa_view: Option<wgpu::TextureView>,
     pub scene_view: Option<wgpu::TextureView>,
+    /// Offscreen target used to render the scene into the editor's Viewport panel.
+    pub viewport_texture: Option<wgpu::Texture>,
+    pub viewport_view: Option<wgpu::TextureView>,
+    pub viewport_depth: Option<wgpu::TextureView>,
+    pub viewport_size: (u32, u32),
+    /// Offscreen target used to render asset previews in the editor.
+    pub preview_texture: Option<wgpu::Texture>,
+    pub preview_view: Option<wgpu::TextureView>,
+    pub preview_depth: Option<wgpu::TextureView>,
+    pub preview_size: (u32, u32),
     pub scene_sampler: wgpu::Sampler,
     pub post_pipeline: Option<wgpu::RenderPipeline>,
     pub post_bind_group: Option<wgpu::BindGroup>,
@@ -662,7 +685,8 @@ impl Renderer {
                 index_buffer,
                 index_count: index_data.len() as u32,
                 vertex_count: vertex_data.len() as u32,
-                model_layout,
+                index_format: wgpu::IndexFormat::Uint16,
+                model_layout: model_layout.clone(),
                 model_buffers: HashMap::new(),
                 model_bind_groups: HashMap::new(),
             },
@@ -847,6 +871,8 @@ impl Renderer {
             shadow_quality: settings.shadow_quality,
             mesh_assets,
             material_assets,
+            texture_assets: AssetManager::default(),
+            gpu_registry: crate::assets::GpuResourceRegistry::default(),
             cube_mesh,
             cube_material,
             red_material,
@@ -866,6 +892,14 @@ impl Renderer {
             depth_view: None,
             msaa_view: None,
             scene_view: None,
+            viewport_texture: None,
+            viewport_view: None,
+            viewport_depth: None,
+            viewport_size: (1, 1),
+            preview_texture: None,
+            preview_view: None,
+            preview_depth: None,
+            preview_size: (1, 1),
             scene_sampler,
             post_pipeline,
             post_bind_group: None,
@@ -894,6 +928,7 @@ impl Renderer {
             frame_shadow_casters: 0,
             frame_passes: 0,
             color_layout,
+            model_layout,
             _shader_variant: PhantomData,
         };
         // Initialize render targets (depth, MSAA, scene texture for post-processing)
@@ -903,6 +938,21 @@ impl Renderer {
 
     pub fn cube_mesh(&self) -> Handle<MeshAsset> {
         self.cube_mesh
+    }
+
+    /// Current GPU resource counters. Cheap to read; no allocations.
+    pub fn gpu_resource_stats(&self) -> crate::assets::GpuResourceStats {
+        self.gpu_registry.stats()
+    }
+
+    /// Borrow the offscreen preview color target for egui registration.
+    pub fn preview_texture(&self) -> Option<&wgpu::Texture> {
+        self.preview_texture.as_ref()
+    }
+
+    /// Borrow the offscreen viewport color target for egui registration.
+    pub fn viewport_texture(&self) -> Option<&wgpu::Texture> {
+        self.viewport_texture.as_ref()
     }
 
     pub fn cube_material(&self) -> Handle<MaterialAsset> {
@@ -1048,58 +1098,712 @@ impl Renderer {
         self.queue
             .write_buffer(&self.light_buffer, 0, bytemuck::bytes_of(&light));
 
-        for instance in snapshot.renderables.iter().copied() {
-            let entity = instance.entity;
-            let renderable = instance.renderable;
-            let transform = instance.global_transform;
-            let key = (renderable.mesh.id(), entity.to_bits());
-            let needs_model_buffer = self
+        // Upload/update the per-entity model uniform for every renderable so the
+        // main surface pass can draw even before the editor viewport pass runs.
+        for instance in &snapshot.renderables {
+            self.sync_model_buffer(
+                instance.entity,
+                instance.renderable,
+                instance.global_transform,
+            );
+        }
+    }
+
+    /// Sync the model buffer for an arbitrary mesh and key ID with a given transform.
+    pub fn sync_mesh_transform(
+        &mut self,
+        mesh_handle: Handle<MeshAsset>,
+        key_id: u64,
+        transform: Mat4,
+    ) {
+        let key = (mesh_handle.id(), key_id);
+        let needs_model_buffer = self
+            .mesh_assets
+            .get_ref(mesh_handle)
+            .is_some_and(|mesh| !mesh.model_buffers.contains_key(&key));
+        if needs_model_buffer {
+            let Some(model_layout) = self
                 .mesh_assets
-                .get_ref(renderable.mesh)
-                .is_some_and(|mesh| !mesh.model_buffers.contains_key(&key));
-            if needs_model_buffer {
-                let Some(model_layout) = self
-                    .mesh_assets
-                    .get_ref(renderable.mesh)
-                    .map(|mesh| &mesh.model_layout)
-                else {
-                    continue;
-                };
-                let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("model"),
-                    size: std::mem::size_of::<ModelUniform>() as u64,
-                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
-                let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("model bind group"),
-                    layout: model_layout,
-                    entries: &[wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: buffer.as_entire_binding(),
-                    }],
-                });
-                if let Some(mesh_mut) = self.mesh_assets.get_mut(renderable.mesh) {
-                    mesh_mut.model_buffers.insert(key, buffer);
-                    mesh_mut.model_bind_groups.insert(key, bind_group);
-                }
-            }
-            let model = ModelUniform {
-                model: transform.to_cols_array_2d(),
-                normal_matrix: glam::Mat4::from_mat3(
-                    glam::Mat3::from_mat4(transform.inverse()).transpose(),
-                )
-                .to_cols_array_2d(),
+                .get_ref(mesh_handle)
+                .map(|mesh| &mesh.model_layout)
+            else {
+                return;
             };
-            let buffer = self
-                .mesh_assets
-                .get_ref(renderable.mesh)
-                .and_then(|mesh| mesh.model_buffers.get(&key).cloned());
-            if let Some(buffer) = buffer {
-                self.queue
-                    .write_buffer(&buffer, 0, bytemuck::bytes_of(&model));
+            let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("model"),
+                size: std::mem::size_of::<ModelUniform>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("model bind group"),
+                layout: model_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: buffer.as_entire_binding(),
+                }],
+            });
+            if let Some(mesh_mut) = self.mesh_assets.get_mut(mesh_handle) {
+                mesh_mut.model_buffers.insert(key, buffer);
+                mesh_mut.model_bind_groups.insert(key, bind_group);
             }
         }
+        let model = ModelUniform {
+            model: transform.to_cols_array_2d(),
+            normal_matrix: glam::Mat4::from_mat3(
+                glam::Mat3::from_mat4(transform.inverse()).transpose(),
+            )
+            .to_cols_array_2d(),
+        };
+        let buffer = self
+            .mesh_assets
+            .get_ref(mesh_handle)
+            .and_then(|mesh| mesh.model_buffers.get(&key).cloned());
+        if let Some(buffer) = buffer {
+            self.queue
+                .write_buffer(&buffer, 0, bytemuck::bytes_of(&model));
+        }
+    }
+
+    /// Sync the per-instance model buffer for one renderable.
+    fn sync_model_buffer(&mut self, entity: Entity, renderable: Renderable, transform: Mat4) {
+        self.sync_mesh_transform(renderable.mesh, entity.to_bits(), transform);
+    }
+
+    /// Dynamically upload or reuse a mesh asset on the GPU based on revision.
+    pub fn upload_mesh(
+        &mut self,
+        asset_id: crate::asset_database::AssetId,
+        revision: u64,
+        mesh_data: &crate::gltf_importer::MeshData,
+    ) -> Handle<MeshAsset> {
+        if self.gpu_registry.is_up_to_date(asset_id, revision) {
+            if let Some(handle) = self.mesh_assets.get_by_asset_id(asset_id) {
+                self.gpu_registry.record_cache_hit();
+                return handle;
+            }
+        }
+        self.gpu_registry.record_cache_miss();
+
+        let vertices: Vec<Vertex> = mesh_data
+            .vertices
+            .iter()
+            .map(|mv| Vertex {
+                position: mv.position,
+                color: [1.0, 1.0, 1.0],
+                normal: mv.normal,
+            })
+            .collect();
+        let vertex_bytes: &[u8] = bytemuck::cast_slice(&vertices);
+        let vertex_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(&format!("mesh vertices {}", asset_id)),
+                contents: vertex_bytes,
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+
+        let fits_u16 = mesh_data.indices.iter().all(|&idx| idx <= u16::MAX as u32);
+        let (index_buffer, index_format, index_bytes_len) = if fits_u16 {
+            let indices_u16: Vec<u16> = mesh_data.indices.iter().map(|&i| i as u16).collect();
+            let index_bytes: &[u8] = bytemuck::cast_slice(&indices_u16);
+            let buf = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some(&format!("mesh indices {}", asset_id)),
+                    contents: index_bytes,
+                    usage: wgpu::BufferUsages::INDEX,
+                });
+            (buf, wgpu::IndexFormat::Uint16, index_bytes.len())
+        } else {
+            let index_bytes: &[u8] = bytemuck::cast_slice(&mesh_data.indices);
+            let buf = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some(&format!("mesh indices {}", asset_id)),
+                    contents: index_bytes,
+                    usage: wgpu::BufferUsages::INDEX,
+                });
+            (buf, wgpu::IndexFormat::Uint32, index_bytes.len())
+        };
+
+        let mesh_asset = MeshAsset {
+            vertex_buffer,
+            index_buffer,
+            index_count: mesh_data.indices.len() as u32,
+            vertex_count: mesh_data.vertices.len() as u32,
+            index_format,
+            model_layout: self.model_layout.clone(),
+            model_buffers: HashMap::new(),
+            model_bind_groups: HashMap::new(),
+        };
+
+        let handle = self
+            .mesh_assets
+            .insert_with_id(asset_id.to_string(), asset_id, mesh_asset);
+        let gpu_bytes = vertex_bytes.len() + index_bytes_len;
+        self.gpu_registry.register_upload(
+            asset_id,
+            revision,
+            crate::assets::GpuResourceKind::Mesh,
+            handle.id(),
+            gpu_bytes,
+        );
+        self.gpu_registry.record_uploaded_mesh();
+        handle
+    }
+
+    /// Dynamically upload or reuse a material asset on the GPU based on revision.
+    pub fn upload_material(
+        &mut self,
+        asset_id: crate::asset_database::AssetId,
+        revision: u64,
+        material_data: &crate::gltf_importer::MaterialData,
+    ) -> Handle<MaterialAsset> {
+        if self.gpu_registry.is_up_to_date(asset_id, revision) {
+            if let Some(handle) = self.material_assets.get_by_asset_id(asset_id) {
+                self.gpu_registry.record_cache_hit();
+                return handle;
+            }
+        }
+        self.gpu_registry.record_cache_miss();
+
+        let (p1, wp1, p4, wp4) =
+            if let Some(cube_mat) = self.material_assets.get(self.cube_material) {
+                (
+                    cube_mat.pipeline_1x.clone(),
+                    cube_mat.wireframe_pipeline_1x.clone(),
+                    cube_mat.pipeline_4x.clone(),
+                    cube_mat.wireframe_pipeline_4x.clone(),
+                )
+            } else {
+                panic!("Cube material missing in Renderer");
+            };
+
+        let color_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(&format!("material color {}", asset_id)),
+            size: std::mem::size_of::<MaterialUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue.write_buffer(
+            &color_buffer,
+            0,
+            bytemuck::bytes_of(&MaterialUniform {
+                color: material_data.base_color_factor,
+            }),
+        );
+        let color_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(&format!("material bind group {}", asset_id)),
+            layout: &self.color_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: color_buffer.as_entire_binding(),
+            }],
+        });
+
+        let material_asset = MaterialAsset {
+            pipeline_1x: p1,
+            wireframe_pipeline_1x: wp1,
+            pipeline_4x: p4,
+            wireframe_pipeline_4x: wp4,
+            color_buffer,
+            color_bind_group,
+            color_bind_group_layout: self.color_layout.clone(),
+        };
+
+        let handle =
+            self.material_assets
+                .insert_with_id(asset_id.to_string(), asset_id, material_asset);
+        let gpu_bytes = std::mem::size_of::<MaterialUniform>();
+        self.gpu_registry.register_upload(
+            asset_id,
+            revision,
+            crate::assets::GpuResourceKind::Material,
+            handle.id(),
+            gpu_bytes,
+        );
+        self.gpu_registry.record_uploaded_material();
+        handle
+    }
+
+    /// Dynamically upload or reuse a texture asset on the GPU based on revision.
+    pub fn upload_texture(
+        &mut self,
+        asset_id: crate::asset_database::AssetId,
+        revision: u64,
+        texture_data: &crate::gltf_importer::TextureData,
+    ) -> Result<Handle<TextureAsset>, String> {
+        if self.gpu_registry.is_up_to_date(asset_id, revision) {
+            if let Some(handle) = self.texture_assets.get_by_asset_id(asset_id) {
+                self.gpu_registry.record_cache_hit();
+                return Ok(handle);
+            }
+        }
+        self.gpu_registry.record_cache_miss();
+
+        let width = texture_data.width.max(1);
+        let height = texture_data.height.max(1);
+        let size = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(&format!("texture {}", asset_id)),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &texture_data.data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * width),
+                rows_per_image: Some(height),
+            },
+            size,
+        );
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            address_mode_w: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        let texture_asset = TextureAsset {
+            texture,
+            view,
+            sampler,
+            bind_group: None,
+            width,
+            height,
+        };
+        let handle =
+            self.texture_assets
+                .insert_with_id(asset_id.to_string(), asset_id, texture_asset);
+        let gpu_bytes = (width * height * 4) as usize;
+        self.gpu_registry.register_upload(
+            asset_id,
+            revision,
+            crate::assets::GpuResourceKind::Texture,
+            handle.id(),
+            gpu_bytes,
+        );
+        self.gpu_registry.record_uploaded_texture();
+        Ok(handle)
+    }
+
+    /// Drop a mesh that was registered under a source-path key so the next
+    /// `sync_world_renderables` re-reads the file. The GPU buffers are released
+    /// when the last `Arc` drops.
+    pub fn forget_mesh_path(&mut self, key: &str) {
+        if let Some(handle) = self.mesh_assets.remove_key(&key.to_string()) {
+            self.mesh_assets.remove(handle);
+            self.gpu_registry.mark_stale(handle.asset_id());
+        }
+    }
+
+    /// Forget every path-keyed mesh whose key references `source` (the reimported
+    /// file), so the next sync re-reads the updated geometry.
+    pub fn forget_meshes_for_source(&mut self, source: &std::path::Path) {
+        let prefix = source.to_string_lossy();
+        let keys: Vec<String> = self
+            .mesh_assets
+            .keys()
+            .filter(|k| k.starts_with(prefix.as_ref()))
+            .cloned()
+            .collect();
+        for key in keys {
+            self.forget_mesh_path(&key);
+        }
+    }
+
+    /// Mark an asset's GPU representation as stale upon reimport or modification.
+    /// The previous wgpu buffers stay alive until the next upload replaces the
+    /// `MeshAsset`/`TextureAsset` entry (drop then releases the GPU object).
+    pub fn invalidate_asset(&mut self, asset_id: crate::asset_database::AssetId) {
+        self.gpu_registry.mark_stale(asset_id);
+        self.gpu_registry.record_reimport();
+    }
+
+    /// Completely unload an asset from GPU buffers, texture views, and asset managers.
+    pub fn unload_asset(&mut self, asset_id: crate::asset_database::AssetId) {
+        self.mesh_assets.remove_by_asset_id(asset_id);
+        self.material_assets.remove_by_asset_id(asset_id);
+        self.texture_assets.remove_by_asset_id(asset_id);
+        self.gpu_registry.mark_unloaded(asset_id);
+    }
+
+    /// Render a hardware-accelerated preview of a mesh with a material into an offscreen texture.
+    pub fn render_preview_mesh(
+        &mut self,
+        mesh_handle: Handle<MeshAsset>,
+        material_handle: Handle<MaterialAsset>,
+        width: u32,
+        height: u32,
+        camera_yaw: f32,
+        camera_pitch: f32,
+        camera_distance: f32,
+    ) -> Option<wgpu::TextureView> {
+        let width = width.max(1);
+        let height = height.max(1);
+        if self.preview_texture.is_none() || self.preview_size != (width, height) {
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("preview texture"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: self.config.format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let depth = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("preview depth"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Depth32Float,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
+            self.preview_view = Some(texture.create_view(&wgpu::TextureViewDescriptor::default()));
+            self.preview_depth = Some(depth.create_view(&wgpu::TextureViewDescriptor::default()));
+            self.preview_texture = Some(texture);
+            self.preview_size = (width, height);
+        }
+
+        let eye = Vec3::new(
+            camera_distance * camera_pitch.cos() * camera_yaw.sin(),
+            camera_distance * camera_pitch.sin(),
+            camera_distance * camera_pitch.cos() * camera_yaw.cos(),
+        );
+        let view_mat = Mat4::look_at_rh(eye, Vec3::ZERO, Vec3::Y);
+        let proj_mat = Mat4::perspective_rh(
+            std::f32::consts::FRAC_PI_4,
+            width as f32 / height.max(1) as f32,
+            0.01,
+            100.0,
+        );
+        let cam = CameraUniform {
+            view_proj: (proj_mat * view_mat).to_cols_array_2d(),
+        };
+        self.queue
+            .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&cam));
+
+        let light_direction = Vec3::new(-1.0, -2.0, -1.0).normalize();
+        let light_view = Mat4::look_at_rh(-light_direction * 10.0, Vec3::ZERO, Vec3::Y);
+        let light_projection = Mat4::orthographic_rh(-8.0, 8.0, -8.0, 8.0, 0.1, 40.0);
+        let light = LightUniform {
+            view_proj: (light_projection * light_view).to_cols_array_2d(),
+            params: [1.0, 1.0, 1.0, 0.0],
+            direction: light_direction.extend(0.0).into(),
+        };
+        self.queue
+            .write_buffer(&self.light_buffer, 0, bytemuck::bytes_of(&light));
+
+        self.sync_mesh_transform(mesh_handle, 0, Mat4::IDENTITY);
+
+        let color_view = self.preview_view.as_ref()?.clone();
+        let depth_view = self.preview_depth.as_ref()?.clone();
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("preview pass"),
+            });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("preview scene pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &color_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.12,
+                            g: 0.13,
+                            b: 0.16,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+
+            let key = (mesh_handle.id(), 0u64);
+            if let (Some(mesh), Some(material)) = (
+                self.mesh_assets.get(mesh_handle),
+                self.material_assets.get(material_handle),
+            ) {
+                if let Some(model_group) = mesh.model_bind_groups.get(&key) {
+                    pass.set_pipeline(&material.pipeline_1x);
+                    pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                    pass.set_bind_group(1, model_group, &[]);
+                    pass.set_bind_group(2, &self.light_bind_group, &[]);
+                    pass.set_bind_group(3, &material.color_bind_group, &[]);
+                    pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                    pass.set_index_buffer(mesh.index_buffer.slice(..), mesh.index_format);
+                    pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+                }
+            }
+        }
+        self.queue.submit([encoder.finish()]);
+        self.preview_view.clone()
+    }
+
+    /// Synchronize entities in the world that have `MeshFilter` and `MeshRenderer`
+    /// components with GPU-ready `Renderable` components. If a mesh hasn't been uploaded
+    /// yet or is stale, it will be uploaded to the GPU using its registered `AssetId`.
+    pub fn sync_world_renderables(&mut self, world: &mut World) {
+        let mut to_sync = Vec::new();
+        for (entity, mf, mr, renderable) in world
+            .query::<(
+                Entity,
+                &crate::core::components::MeshFilter,
+                &crate::core::components::MeshRenderer,
+                Option<&Renderable>,
+            )>()
+            .iter(world)
+        {
+            to_sync.push((entity, mf.clone(), mr.clone(), renderable.copied()));
+        }
+
+        for (entity, mf, mr, renderable) in to_sync {
+            let mut mesh_handle = renderable.map(|r| r.mesh);
+            let mut material_handle = renderable.map(|r| r.material);
+
+            let is_stale = mesh_handle
+                .and_then(|h| self.gpu_registry.get(h.asset_id()))
+                .is_some_and(|e| e.status == crate::assets::GpuResourceStatus::Stale);
+
+            if mesh_handle.is_none() || is_stale {
+                if let Some(existing) = self.mesh_assets.get_by_key(&mf.mesh_path) {
+                    mesh_handle = Some(existing);
+                } else {
+                    let clean_path = mf.mesh_path.split(':').next().unwrap_or(&mf.mesh_path);
+                    let path = std::path::Path::new(clean_path);
+                    if path.exists() {
+                        let parsed = if path
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .is_some_and(|e| {
+                                e.eq_ignore_ascii_case("gltf") || e.eq_ignore_ascii_case("glb")
+                            }) {
+                            crate::assets_ui::ObjMesh::parse_gltf(path)
+                        } else if path
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .is_some_and(|e| e.eq_ignore_ascii_case("obj"))
+                        {
+                            std::fs::read_to_string(path)
+                                .ok()
+                                .and_then(|t| crate::assets_ui::ObjMesh::parse(&t))
+                        } else {
+                            None
+                        };
+
+                        if let Some(mesh) = parsed {
+                            let mesh_data = mesh.to_mesh_data(clean_path.to_string());
+                            let asset_id = crate::asset_database::AssetId::new();
+                            let handle = self.upload_mesh(asset_id, 1, &mesh_data);
+                            self.mesh_assets.insert_key(mf.mesh_path.clone(), handle);
+                            mesh_handle = Some(handle);
+                        }
+                    }
+                }
+            }
+
+            if material_handle.is_none() {
+                material_handle = self.material_assets.get_by_key(&mr.material_path);
+            }
+
+            let final_mesh = mesh_handle.unwrap_or(self.cube_mesh);
+            let final_material = material_handle.unwrap_or(self.cube_material);
+
+            let need_insert = match renderable {
+                Some(r) => r.mesh != final_mesh || r.material != final_material,
+                None => true,
+            };
+
+            if need_insert {
+                world.entity_mut(entity).insert(Renderable {
+                    mesh: final_mesh,
+                    material: final_material,
+                });
+            }
+        }
+    }
+
+    /// Render the scene into an offscreen texture sized for the editor's
+    /// Viewport panel. Returns the texture view for egui to display.
+    pub fn render_scene_to_viewport(
+        &mut self,
+        snapshot: &RenderSnapshot,
+        width: u32,
+        height: u32,
+        camera: &crate::viewport::ViewportCamera,
+    ) -> Option<wgpu::TextureView> {
+        // Keep the offscreen target within the device limits on very large or
+        // high-DPI viewport panels.
+        let max_dimension = self.device.limits().max_texture_dimension_2d.max(1);
+        let width = width.max(1).min(max_dimension);
+        let height = height.max(1).min(max_dimension);
+        if self.viewport_size != (width, height) || self.viewport_view.is_none() {
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("viewport scene"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: self.config.format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let depth = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("viewport depth"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Depth32Float,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
+            self.viewport_view = Some(texture.create_view(&wgpu::TextureViewDescriptor::default()));
+            self.viewport_depth = Some(depth.create_view(&wgpu::TextureViewDescriptor::default()));
+            self.viewport_texture = Some(texture);
+            self.viewport_size = (width, height);
+        }
+
+        // Camera uniforms for this pass, built from the viewport camera so the
+        // projection matches what the editor shows and picks against.
+        let cam = CameraUniform {
+            view_proj: camera
+                .view_proj(width as f32 / height.max(1) as f32)
+                .to_cols_array_2d(),
+        };
+        self.queue
+            .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&cam));
+
+        let (light_color, light_direction) = snapshot
+            .directional_light
+            .unwrap_or(([1.0, 1.0, 1.0], Vec3::new(-4.0, -8.0, -4.0).normalize()));
+        let light_view = Mat4::look_at_rh(-light_direction * 10.0, Vec3::ZERO, Vec3::Y);
+        let light_projection = Mat4::orthographic_rh(-8.0, 8.0, -8.0, 8.0, 0.1, 40.0);
+        let light = LightUniform {
+            view_proj: (light_projection * light_view).to_cols_array_2d(),
+            params: [light_color[0], light_color[1], light_color[2], 0.0],
+            direction: light_direction.extend(0.0).into(),
+        };
+        self.queue
+            .write_buffer(&self.light_buffer, 0, bytemuck::bytes_of(&light));
+
+        for instance in &snapshot.renderables {
+            self.sync_model_buffer(
+                instance.entity,
+                instance.renderable,
+                instance.global_transform,
+            );
+        }
+
+        let color_view = self.viewport_view.as_ref()?.clone();
+        let depth_view = self.viewport_depth.as_ref()?.clone();
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("viewport pass"),
+            });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("viewport scene pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &color_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            for instance in &snapshot.renderables {
+                let renderable = instance.renderable;
+                let key = (renderable.mesh.id(), instance.entity.to_bits());
+                let (Some(mesh), Some(material)) = (
+                    self.mesh_assets.get(renderable.mesh),
+                    self.material_assets.get(renderable.material),
+                ) else {
+                    continue;
+                };
+                let Some(model_group) = mesh.model_bind_groups.get(&key) else {
+                    continue;
+                };
+                pass.set_pipeline(&material.pipeline_1x);
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                pass.set_bind_group(1, model_group, &[]);
+                pass.set_bind_group(2, &self.light_bind_group, &[]);
+                pass.set_bind_group(3, &material.color_bind_group, &[]);
+                pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                pass.set_index_buffer(mesh.index_buffer.slice(..), mesh.index_format);
+                pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+            }
+        }
+        self.queue.submit([encoder.finish()]);
+        self.viewport_view.clone()
     }
 
     pub fn render_scene(
@@ -1196,7 +1900,7 @@ impl Renderer {
             pass.set_bind_group(2, &self.light_bind_group, &[]);
             pass.set_bind_group(3, &material.color_bind_group, &[]);
             pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-            pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            pass.set_index_buffer(mesh.index_buffer.slice(..), mesh.index_format);
             pass.draw_indexed(0..mesh.index_count, 0, 0..1);
             draw_calls = draw_calls.saturating_add(1);
             triangles = triangles.saturating_add((mesh.index_count / 3) as u64);

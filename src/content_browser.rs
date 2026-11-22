@@ -1,8 +1,6 @@
 //! Content Browser panel: folder tree, asset list with search/filter,
 //! list/grid views, create/import actions and context menu.
 
-#![allow(deprecated)]
-
 use std::{fs, path::PathBuf};
 
 use bevy_ecs::world::World;
@@ -198,24 +196,24 @@ pub fn draw_content_browser(editor: &mut Editor, ui: &mut egui::Ui, world: &mut 
     let tree_width = 140.0_f32.min(tree_rect.width() * 0.35).max(80.0);
     let list_width = tree_rect.width() - tree_width;
 
-    let mut tree_ui = ui.child_ui(
-        egui::Rect::from_min_size(
-            ui.cursor().min,
-            Vec2::new(tree_width, ui.available_height()),
-        ),
-        *ui.layout(),
-        None,
+    let mut tree_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(egui::Rect::from_min_size(
+                ui.cursor().min,
+                Vec2::new(tree_width, ui.available_height()),
+            ))
+            .layout(*ui.layout()),
     );
     draw_folder_tree(editor, &mut tree_ui);
 
     let list_x = ui.cursor().min.x + tree_width;
-    let mut list_ui = ui.child_ui(
-        egui::Rect::from_min_size(
-            egui::pos2(list_x, ui.cursor().min.y),
-            Vec2::new(list_width, ui.available_height()),
-        ),
-        *ui.layout(),
-        None,
+    let mut list_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(egui::Rect::from_min_size(
+                egui::pos2(list_x, ui.cursor().min.y),
+                Vec2::new(list_width, ui.available_height()),
+            ))
+            .layout(*ui.layout()),
     );
     draw_asset_list(editor, &mut list_ui, world);
 
