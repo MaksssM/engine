@@ -4,13 +4,15 @@ use crate::{
     assets::{AssetManager, Handle},
     camera::Camera3D,
     core::components::{CameraMarker, Light, LightKind, Visible},
+    frustum::Frustum,
+    gltf_importer::MeshBounds,
     quality::{QualityPreset, ShaderVariant, ShadowQuality},
     transform::GlobalTransform,
     ui_new::{Rect, Ui, UiRenderer},
 };
 use bevy_ecs::{component::Component, entity::Entity, resource::Resource, world::World};
 use bytemuck::{Pod, Zeroable};
-use glam::{Mat4, Vec3};
+use glam::{Mat4, Vec3, Vec4Swizzles};
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
@@ -125,6 +127,7 @@ pub struct MeshAsset {
     pub(crate) index_count: u32,
     pub(crate) vertex_count: u32,
     pub(crate) index_format: wgpu::IndexFormat,
+    pub(crate) bounds: MeshBounds,
     pub(crate) model_layout: wgpu::BindGroupLayout,
     pub(crate) model_buffers: HashMap<ModelKey, wgpu::Buffer>,
     pub(crate) model_bind_groups: HashMap<ModelKey, wgpu::BindGroup>,
@@ -255,6 +258,118 @@ mod tests {
         let visible = collect_visible_renderables(&mut world);
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].renderable.mesh.id(), visible_mesh.id());
+    }
+
+    /// Frustum culling integration tests.
+    /// These verify that the world_space_sphere helper and frustum intersection
+    /// work correctly with various transforms.
+    #[cfg(test)]
+    mod frustum_culling {
+        use super::*;
+        use crate::{frustum::Frustum, gltf_importer::MeshBounds};
+        use glam::{Mat4, Vec3};
+
+        fn make_bounds(size: f32) -> MeshBounds {
+            MeshBounds {
+                min: [-size, -size, -size],
+                max: [size, size, size],
+            }
+        }
+
+        fn make_frustum(eye: Vec3, target: Vec3) -> Frustum {
+            let proj = Mat4::perspective_rh(1.0, 1.0, 0.1, 100.0);
+            let view = Mat4::look_at_rh(eye, target, Vec3::Y);
+            Frustum::from_view_proj(&(proj * view))
+        }
+
+        #[test]
+        fn world_space_sphere_translation() {
+            let bounds = make_bounds(1.0);
+            let transform = Mat4::from_translation(Vec3::new(5.0, 0.0, 0.0));
+            let (center, radius) = Renderer::world_space_sphere(&bounds, transform);
+            assert!((center - Vec3::new(5.0, 0.0, 0.0)).length() < 1e-4);
+            // Radius should be sqrt(3) ≈ 1.732 for 1x1x1 cube
+            assert!((radius - 3.0_f32.sqrt()).abs() < 1e-4);
+        }
+
+        #[test]
+        fn world_space_sphere_uniform_scale() {
+            let bounds = make_bounds(1.0);
+            let transform = Mat4::from_scale(Vec3::splat(2.0));
+            let (center, radius) = Renderer::world_space_sphere(&bounds, transform);
+            assert!((center - Vec3::ZERO).length() < 1e-4);
+            // Radius should be 2 * sqrt(3)
+            assert!((radius - 2.0 * 3.0_f32.sqrt()).abs() < 1e-4);
+        }
+
+        #[test]
+        fn world_space_sphere_non_uniform_scale() {
+            let bounds = make_bounds(1.0);
+            // Scale 3x on X, 1x on Y, 1x on Z
+            let transform = Mat4::from_scale(Vec3::new(3.0, 1.0, 1.0));
+            let (center, radius) = Renderer::world_space_sphere(&bounds, transform);
+            assert!((center - Vec3::ZERO).length() < 1e-4);
+            // Radius uses max scale (3.0) * local extents length (sqrt(3))
+            assert!((radius - 3.0 * 3.0_f32.sqrt()).abs() < 1e-4);
+        }
+
+        #[test]
+        fn world_space_sphere_negative_scale() {
+            let bounds = make_bounds(1.0);
+            // Negative scale on X should not reduce radius
+            let transform = Mat4::from_scale(Vec3::new(-2.0, 1.0, 1.0));
+            let (center, radius) = Renderer::world_space_sphere(&bounds, transform);
+            assert!((center - Vec3::ZERO).length() < 1e-4);
+            // Radius uses absolute scale (2.0) * sqrt(3)
+            assert!((radius - 2.0 * 3.0_f32.sqrt()).abs() < 1e-4);
+        }
+
+        #[test]
+        fn visible_sphere_intersects_frustum() {
+            let bounds = make_bounds(1.0);
+            let transform = Mat4::from_translation(Vec3::new(0.0, 0.0, -5.0));
+            let (center, radius) = Renderer::world_space_sphere(&bounds, transform);
+            let frustum = make_frustum(Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, -5.0));
+            assert!(frustum.intersects_sphere(center, radius));
+        }
+
+        #[test]
+        fn culled_sphere_behind_camera() {
+            let bounds = make_bounds(1.0);
+            let transform = Mat4::from_translation(Vec3::new(0.0, 0.0, 5.0));
+            let (center, radius) = Renderer::world_space_sphere(&bounds, transform);
+            let frustum = make_frustum(Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, -5.0));
+            assert!(!frustum.intersects_sphere(center, radius));
+        }
+
+        #[test]
+        fn culled_sphere_off_axis() {
+            let bounds = make_bounds(1.0);
+            let transform = Mat4::from_translation(Vec3::new(100.0, 0.0, -5.0));
+            let (center, radius) = Renderer::world_space_sphere(&bounds, transform);
+            let frustum = make_frustum(Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, -5.0));
+            assert!(!frustum.intersects_sphere(center, radius));
+        }
+
+        #[test]
+        fn large_sphere_straddling_plane_is_kept() {
+            let bounds = make_bounds(50.0); // Very large bounds
+            let transform = Mat4::from_translation(Vec3::new(50.0, 0.0, -5.0));
+            let (center, radius) = Renderer::world_space_sphere(&bounds, transform);
+            let frustum = make_frustum(Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, -5.0));
+            assert!(frustum.intersects_sphere(center, radius));
+        }
+
+        #[test]
+        fn rotation_preserves_radius() {
+            let bounds = make_bounds(1.0);
+            // 45 degree rotation around Y
+            let transform = Mat4::from_rotation_y(std::f32::consts::FRAC_PI_4);
+            let (center, radius) = Renderer::world_space_sphere(&bounds, transform);
+            assert!((center - Vec3::ZERO).length() < 1e-4);
+            // Rotation should not change radius (it's a sphere bound)
+            assert!((radius - 3.0_f32.sqrt()).abs() < 1e-4);
+        }
     }
 }
 
@@ -1086,6 +1201,7 @@ pub struct Renderer {
     pub camera_near: f32,
     pub camera_far: f32,
     pub camera_angle: f32,
+    pub frustum: Frustum,
     pub wireframe_mode: bool,
     pub ui: Option<Ui>,
     pub ui_renderer: Option<UiRenderer>,
@@ -1454,6 +1570,10 @@ impl Renderer {
 
         let mut mesh_assets: AssetManager<MeshAsset> = AssetManager::default();
         let mut material_assets: AssetManager<MaterialAsset> = AssetManager::default();
+        let cube_bounds = MeshBounds {
+            min: [-1.0, -1.0, -1.0],
+            max: [1.0, 1.0, 1.0],
+        };
         let cube_mesh = mesh_assets.insert(
             "builtin/cube".into(),
             MeshAsset {
@@ -1462,6 +1582,7 @@ impl Renderer {
                 index_count: index_data.len() as u32,
                 vertex_count: vertex_data.len() as u32,
                 index_format: wgpu::IndexFormat::Uint16,
+                bounds: cube_bounds,
                 model_layout: model_layout.clone(),
                 model_buffers: HashMap::new(),
                 model_bind_groups: HashMap::new(),
@@ -1688,6 +1809,7 @@ impl Renderer {
             camera_near: 0.1,
             camera_far: 100.0,
             camera_angle: 0.0,
+            frustum: Frustum::from_view_proj(&Mat4::IDENTITY),
             wireframe_mode: false,
             ui: Some(ui),
             ui_renderer: Some(ui_renderer),
@@ -1839,6 +1961,10 @@ impl Renderer {
         self.camera_fov = camera.fov;
         self.camera_near = camera.near;
         self.camera_far = camera.far;
+        let aspect = self.window_size.width as f32 / self.window_size.height.max(1) as f32;
+        let projection = camera.projection_matrix(aspect);
+        let view = camera.view_matrix(self.camera_position, self.camera_target);
+        self.frustum = Frustum::from_view_proj(&(projection * view));
     }
 
     pub fn update_ui(
@@ -1856,7 +1982,46 @@ impl Renderer {
         self.frame_time_ms = frame_time_ms;
     }
 
+    /// Compute a conservative world-space sphere bound for a mesh's local AABB
+    /// transformed by `GlobalTransform`.
+    ///
+    /// Handles translation, rotation, uniform and non-uniform scale, and
+    /// negative scale. The radius is never underestimated: for non-uniform
+    /// scaling we use the maximum axis scale so the sphere always encloses
+    /// the transformed box.
+    fn world_space_sphere(bounds: &MeshBounds, transform: Mat4) -> (Vec3, f32) {
+        let min = Vec3::from_array(bounds.min);
+        let max = Vec3::from_array(bounds.max);
+        let center_local = (min + max) * 0.5;
+        let extents_local = (max - min) * 0.5;
+
+        let center_world = transform.transform_point3(center_local);
+
+        // Decompose scale magnitude per axis (absolute values to handle negative
+        // scale). For non-uniform scale, the sphere radius uses the largest axis
+        // scale so the sphere conservatively encloses the transformed box.
+        let scale_x = transform.x_axis.xyz().length();
+        let scale_y = transform.y_axis.xyz().length();
+        let scale_z = transform.z_axis.xyz().length();
+        let max_scale = scale_x.max(scale_y).max(scale_z);
+
+        let radius = extents_local.length() * max_scale;
+        (center_world, radius)
+    }
+
     pub fn update(&mut self, snapshot: &RenderSnapshot, delta_seconds: f32) {
+        // Reset per-frame culling / render counters before this frame's passes run.
+        self.frame_candidates = 0;
+        self.frame_culled = 0;
+        self.frame_visible = 0;
+        self.frame_draw_calls = 0;
+        self.frame_triangles = 0;
+        self.frame_vertices = 0;
+        self.frame_shadow_casters = 0;
+        self.frame_passes = 0;
+        self.frame_instanced_batches = 0;
+        self.frame_instanced_objects = 0;
+
         let aspect = self.window_size.width as f32 / self.window_size.height.max(1) as f32;
         let projection =
             Mat4::perspective_rh(self.camera_fov, aspect, self.camera_near, self.camera_far);
@@ -2015,6 +2180,7 @@ impl Renderer {
             index_count: mesh_data.indices.len() as u32,
             vertex_count: mesh_data.vertices.len() as u32,
             index_format,
+            bounds: mesh_data.bounds,
             model_layout: self.model_layout.clone(),
             model_buffers: HashMap::new(),
             model_bind_groups: HashMap::new(),
@@ -2500,13 +2666,15 @@ impl Renderer {
 
         // Camera uniforms for this pass, built from the viewport camera so the
         // projection matches what the editor shows and picks against.
+        let view_proj = camera.view_proj(width as f32 / height.max(1) as f32);
         let cam = CameraUniform {
-            view_proj: camera
-                .view_proj(width as f32 / height.max(1) as f32)
-                .to_cols_array_2d(),
+            view_proj: view_proj.to_cols_array_2d(),
         };
         self.queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&cam));
+
+        // Extract frustum for culling.
+        let frustum = Frustum::from_view_proj(&view_proj);
 
         let (light_color, light_direction) = snapshot
             .directional_light
@@ -2521,6 +2689,8 @@ impl Renderer {
         self.queue
             .write_buffer(&self.light_buffer, 0, bytemuck::bytes_of(&light));
 
+        // Sync model buffers for every renderable (needed even for culled ones so
+        // their uniform data stays current for shadow/other passes).
         for instance in &snapshot.renderables {
             self.sync_model_buffer(
                 instance.entity,
@@ -2559,18 +2729,25 @@ impl Renderer {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
+            let mut viewport_draw_calls = 0u32;
             for instance in &snapshot.renderables {
                 let renderable = instance.renderable;
-                let key = (renderable.mesh.id(), instance.entity.to_bits());
                 let (Some(mesh), Some(material)) = (
                     self.mesh_assets.get(renderable.mesh),
                     self.material_assets.get(renderable.material),
                 ) else {
                     continue;
                 };
+                let key = (renderable.mesh.id(), instance.entity.to_bits());
                 let Some(model_group) = mesh.model_bind_groups.get(&key) else {
                     continue;
                 };
+                // Frustum culling: skip renderables completely outside the frustum.
+                let (sphere_center, sphere_radius) =
+                    Self::world_space_sphere(&mesh.bounds, instance.global_transform);
+                if !frustum.intersects_sphere(sphere_center, sphere_radius) {
+                    continue;
+                }
                 pass.set_pipeline(&material.pipeline_1x);
                 pass.set_bind_group(0, &self.camera_bind_group, &[]);
                 pass.set_bind_group(1, model_group, &[]);
@@ -2579,6 +2756,7 @@ impl Renderer {
                 pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                 pass.set_index_buffer(mesh.index_buffer.slice(..), mesh.index_format);
                 pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+                viewport_draw_calls = viewport_draw_calls.saturating_add(1);
             }
         }
         self.queue.submit([encoder.finish()]);
@@ -2655,6 +2833,10 @@ impl Renderer {
         let mut shadow_casters = 0u64;
         let mut passes = 1u32;
 
+        let mut frame_candidates = 0u32;
+        let mut frame_culled = 0u32;
+        let mut frame_visible = 0u32;
+
         for instance in renderables {
             let entity = instance.entity;
             let renderable = instance.renderable;
@@ -2668,6 +2850,15 @@ impl Renderer {
             let Some(bind_group) = mesh.model_bind_groups.get(&key) else {
                 continue;
             };
+            // Frustum culling: skip renderables completely outside the camera frustum.
+            frame_candidates = frame_candidates.saturating_add(1);
+            let (sphere_center, sphere_radius) =
+                Self::world_space_sphere(&mesh.bounds, instance.global_transform);
+            if !self.frustum.intersects_sphere(sphere_center, sphere_radius) {
+                frame_culled = frame_culled.saturating_add(1);
+                continue;
+            }
+            frame_visible = frame_visible.saturating_add(1);
             pass.set_pipeline(match (self.msaa_samples, self.wireframe_mode) {
                 (1, true) => &material.wireframe_pipeline_1x,
                 (1, false) => &material.pipeline_1x,
@@ -2682,10 +2873,14 @@ impl Renderer {
             pass.set_index_buffer(mesh.index_buffer.slice(..), mesh.index_format);
             pass.draw_indexed(0..mesh.index_count, 0, 0..1);
             draw_calls = draw_calls.saturating_add(1);
-            triangles = triangles.saturating_add((mesh.index_count / 3) as u64);
+            triangles = triangles.saturating_add((mesh.index_count / 3) as u32 as u64);
             vertices = vertices.saturating_add(mesh.vertex_count as u64);
             shadow_casters = shadow_casters.saturating_add(1);
         }
+
+        self.frame_candidates = self.frame_candidates.saturating_add(frame_candidates);
+        self.frame_culled = self.frame_culled.saturating_add(frame_culled);
+        self.frame_visible = self.frame_visible.saturating_add(frame_visible);
         drop(pass);
 
         if use_post_processing
