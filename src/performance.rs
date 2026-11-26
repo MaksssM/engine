@@ -10,8 +10,100 @@ use std::{
 };
 
 use bevy_ecs::world::World;
+use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_HISTORY: usize = 240;
+
+/// What the engine was doing when a frame was recorded.
+///
+/// Editor and Play are independent of the monitor window. Benchmark is set
+/// only while a benchmark run is capturing samples.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExecutionMode {
+    Editor,
+    Playing,
+    Paused,
+    Benchmark,
+}
+
+impl ExecutionMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Editor => "Editor",
+            Self::Playing => "Play",
+            Self::Paused => "Paused",
+            Self::Benchmark => "Benchmark",
+        }
+    }
+}
+
+impl Default for ExecutionMode {
+    fn default() -> Self {
+        Self::Editor
+    }
+}
+
+/// Stable identifier for a CPU stage. Stored by index so scopes do not
+/// allocate a `String` every frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum CpuStage {
+    Input = 0,
+    EditorUpdate = 1,
+    FixedUpdate = 2,
+    SimulationUpdate = 3,
+    PostUpdate = 4,
+    TransformPropagation = 5,
+    SceneExtraction = 6,
+    RenderPreparation = 7,
+    RenderEncoding = 8,
+    RenderSubmission = 9,
+    EditorUi = 10,
+}
+
+impl CpuStage {
+    pub const ALL: [Self; 11] = [
+        Self::Input,
+        Self::EditorUpdate,
+        Self::FixedUpdate,
+        Self::SimulationUpdate,
+        Self::PostUpdate,
+        Self::TransformPropagation,
+        Self::SceneExtraction,
+        Self::RenderPreparation,
+        Self::RenderEncoding,
+        Self::RenderSubmission,
+        Self::EditorUi,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Input => "Input",
+            Self::EditorUpdate => "Editor Update",
+            Self::FixedUpdate => "Fixed Update",
+            Self::SimulationUpdate => "Simulation Update",
+            Self::PostUpdate => "Post Update",
+            Self::TransformPropagation => "Transform Propagation",
+            Self::SceneExtraction => "Scene Extraction",
+            Self::RenderPreparation => "Render Preparation",
+            Self::RenderEncoding => "Render Encoding",
+            Self::RenderSubmission => "Render Submission",
+            Self::EditorUi => "Editor UI",
+        }
+    }
+}
+
+/// GPU pass timestamps, when the adapter supports timestamp queries.
+/// `None` means the pass was not timed, not that it took zero time.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct GpuPassTimings {
+    pub shadow_ms: Option<f64>,
+    pub opaque_ms: Option<f64>,
+    pub transparent_ms: Option<f64>,
+    pub post_ms: Option<f64>,
+    pub preview_ms: Option<f64>,
+    pub total_ms: Option<f64>,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PerformanceCategory {
@@ -258,9 +350,16 @@ impl PerformanceHistory {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FrameStatistics {
+    pub frame_index: u64,
+    pub mode: ExecutionMode,
     pub fps: f64,
     pub frame_time_ms: f64,
     pub avg_frame_time_ms: f64,
+    pub min_frame_time_ms: f64,
+    pub max_frame_time_ms: f64,
+    pub p50_frame_time_ms: f64,
+    pub p95_frame_time_ms: f64,
+    pub p99_frame_time_ms: f64,
     pub min_fps: f64,
     pub max_fps: f64,
     pub one_percent_low_fps: f64,
@@ -270,6 +369,26 @@ pub struct FrameStatistics {
     pub delta_time_ms: f64,
     pub fixed_delta_time_ms: f64,
     pub fixed_updates_count: u32,
+}
+
+/// One recorded frame. Stage times are wall-clock milliseconds for that stage
+/// only; nested scopes are not summed into a second total.
+#[derive(Clone, Debug)]
+pub struct FrameSnapshot {
+    pub index: u64,
+    pub time_seconds: f64,
+    pub mode: ExecutionMode,
+    pub fps: f64,
+    pub frame_time_ms: f64,
+    pub cpu_frame_time_ms: f64,
+    pub gpu_frame_time_ms: Option<f64>,
+    pub cpu_stages_ms: [f64; CpuStage::ALL.len()],
+    pub gpu_passes: GpuPassTimings,
+    pub draw_calls: u32,
+    pub passes: u32,
+    pub visible_objects: u32,
+    pub triangles: u64,
+    pub vertices: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -286,6 +405,14 @@ pub struct RendererStatistics {
     pub shadow_casters: u32,
     pub passes: u32,
     pub gpu_frame_time_ms: Option<f64>,
+    /// Renderable candidates considered this frame (after visibility filter).
+    pub candidates: u32,
+    /// Candidates rejected by frustum culling.
+    pub culled: u32,
+    /// Instanced draw batches submitted this frame.
+    pub instanced_batches: u32,
+    /// Objects drawn through the instanced batching path.
+    pub instanced_objects: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -338,6 +465,22 @@ pub struct PerformanceMonitor {
     /// When true, `end_frame` still computes stats but does not append samples,
     /// so the graph freezes until resumed.
     pub paused: bool,
+    /// Current execution mode (Editor, Playing, Paused, Benchmark).
+    pub mode: ExecutionMode,
+    /// Monotonically increasing frame counter.
+    pub frame_index: u64,
+    /// CPU stage times for the active frame.
+    pub current_cpu_stages: [f64; CpuStage::ALL.len()],
+    /// GPU pass timings for the active frame.
+    pub current_gpu_passes: GpuPassTimings,
+    /// Last measured GPU total frame time (ms).
+    pub last_gpu_frame_ms: Option<f64>,
+    /// Ring buffer of historical frame snapshots.
+    pub snapshots: VecDeque<FrameSnapshot>,
+    /// Capacity of the snapshot ring buffer.
+    pub snapshot_capacity: usize,
+    /// Selected snapshot frame index for UI detail inspection.
+    pub selected_snapshot_index: Option<u64>,
     /// Timestamped samples used by the time-windowed graphs.
     samples: Vec<GraphSample>,
     /// Monotonic seconds at the last recorded frame.
@@ -418,6 +561,14 @@ impl PerformanceMonitor {
             gpu_timestamp_supported: false,
             target_fps: 60.0,
             paused: false,
+            mode: ExecutionMode::Editor,
+            frame_index: 0,
+            current_cpu_stages: [0.0; CpuStage::ALL.len()],
+            current_gpu_passes: GpuPassTimings::default(),
+            last_gpu_frame_ms: None,
+            snapshots: VecDeque::with_capacity(300),
+            snapshot_capacity: 300,
+            selected_snapshot_index: None,
             samples: Vec::new(),
             last_sample_time: 0.0,
             sample_capacity: (60.0f64 * 60.0).ceil() as usize + 64,
@@ -468,14 +619,51 @@ impl PerformanceMonitor {
         self.target_fps = target_fps.max(1.0);
     }
 
+    pub fn set_execution_mode(&mut self, mode: ExecutionMode) {
+        self.mode = mode;
+    }
+
+    pub fn execution_mode(&self) -> ExecutionMode {
+        self.mode
+    }
+
+    pub fn record_stage(&mut self, stage: CpuStage, milliseconds: f64) {
+        if self.enabled {
+            self.current_cpu_stages[stage as usize] += milliseconds;
+        }
+    }
+
+    pub fn set_gpu_pass_timings(&mut self, timings: GpuPassTimings) {
+        self.current_gpu_passes = timings;
+        self.last_gpu_frame_ms = timings.total_ms;
+        self.renderer_stats.gpu_frame_time_ms = timings.total_ms;
+    }
+
+    pub fn snapshots(&self) -> &VecDeque<FrameSnapshot> {
+        &self.snapshots
+    }
+
+    pub fn snapshot_by_index(&self, index: u64) -> Option<&FrameSnapshot> {
+        self.snapshots.iter().find(|s| s.index == index)
+    }
+
+    pub fn latest_snapshot(&self) -> Option<&FrameSnapshot> {
+        self.snapshots.back()
+    }
+
     pub fn reset(&mut self) {
         self.fps_history.clear();
         self.frame_time_history.clear();
         self.samples.clear();
+        self.snapshots.clear();
+        self.selected_snapshot_index = None;
         self.last_sample_time = 0.0;
         self.frame_stats = FrameStatistics::default();
         self.fixed_updates_count = 0;
         self.cpu_frame_ms = 0.0;
+        self.current_cpu_stages = [0.0; CpuStage::ALL.len()];
+        self.current_gpu_passes = GpuPassTimings::default();
+        self.last_gpu_frame_ms = None;
         for m in self.metrics.values_mut() {
             m.last_duration_ms = 0.0;
             m.total_duration_ms = 0.0;
@@ -490,6 +678,8 @@ impl PerformanceMonitor {
         self.fps_history.clear();
         self.frame_time_history.clear();
         self.samples.clear();
+        self.snapshots.clear();
+        self.selected_snapshot_index = None;
         self.last_sample_time = 0.0;
     }
 
@@ -498,6 +688,7 @@ impl PerformanceMonitor {
             self.frame_start = Some(Instant::now());
             self.fixed_updates_count = 0;
             self.cpu_frame_ms = 0.0;
+            self.current_cpu_stages = [0.0; CpuStage::ALL.len()];
         }
     }
 
@@ -505,6 +696,8 @@ impl PerformanceMonitor {
         if !self.enabled {
             return;
         }
+        self.frame_index = self.frame_index.saturating_add(1);
+
         let cpu_ms = self
             .frame_start
             .take()
@@ -539,10 +732,30 @@ impl PerformanceMonitor {
         self.record(Metric::Fps, fps);
 
         let times = self.frame_time_history.raw_values().collect::<Vec<_>>();
+        let mut sorted_times = times
+            .iter()
+            .copied()
+            .filter(|t| t.is_finite() && *t > 0.0)
+            .collect::<Vec<_>>();
+        sorted_times.sort_by(|a, b| a.total_cmp(b));
+
+        let min_frame_time_ms = sorted_times.first().copied().unwrap_or(0.0);
+        let max_frame_time_ms = sorted_times.last().copied().unwrap_or(0.0);
+        let p50_frame_time_ms = calculate_percentile(&sorted_times, 0.50);
+        let p95_frame_time_ms = calculate_percentile(&sorted_times, 0.95);
+        let p99_frame_time_ms = calculate_percentile(&sorted_times, 0.99);
+
         self.frame_stats = FrameStatistics {
+            frame_index: self.frame_index,
+            mode: self.mode,
             fps,
             frame_time_ms: frame_ms,
             avg_frame_time_ms: self.frame_time_history.average(),
+            min_frame_time_ms,
+            max_frame_time_ms,
+            p50_frame_time_ms,
+            p95_frame_time_ms,
+            p99_frame_time_ms,
             min_fps: percentile_low_fps(&times, 1.0),
             max_fps: times
                 .iter()
@@ -553,7 +766,7 @@ impl PerformanceMonitor {
             one_percent_low_fps: percentile_low_fps(&times, 0.01),
             zero_one_percent_low_fps: percentile_low_fps(&times, 0.001),
             cpu_frame_time_ms: cpu_ms,
-            gpu_frame_time_ms: None,
+            gpu_frame_time_ms: self.last_gpu_frame_ms,
             delta_time_ms: frame_ms,
             fixed_delta_time_ms: self
                 .metrics
@@ -562,6 +775,27 @@ impl PerformanceMonitor {
                 .unwrap_or(0.0),
             fixed_updates_count: self.fixed_updates_count,
         };
+
+        let snapshot = FrameSnapshot {
+            index: self.frame_index,
+            time_seconds: self.last_sample_time,
+            mode: self.mode,
+            fps,
+            frame_time_ms: frame_ms,
+            cpu_frame_time_ms: cpu_ms,
+            gpu_frame_time_ms: self.last_gpu_frame_ms,
+            cpu_stages_ms: self.current_cpu_stages,
+            gpu_passes: self.current_gpu_passes,
+            draw_calls: self.renderer_stats.draw_calls,
+            passes: self.renderer_stats.passes,
+            visible_objects: self.renderer_stats.visible_entities,
+            triangles: self.renderer_stats.triangles,
+            vertices: self.renderer_stats.vertices,
+        };
+        if self.snapshots.len() >= self.snapshot_capacity {
+            self.snapshots.pop_front();
+        }
+        self.snapshots.push_back(snapshot);
     }
 
     pub fn record(&mut self, metric: Metric, milliseconds: f64) {
@@ -734,6 +968,47 @@ impl Drop for Scope<'_> {
             monitor.record(self.metric, self.started.elapsed().as_secs_f64() * 1000.0);
         }
     }
+}
+
+pub struct CpuStageScope<'a> {
+    monitor: Option<&'a mut PerformanceMonitor>,
+    stage: CpuStage,
+    started: Instant,
+}
+
+impl<'a> CpuStageScope<'a> {
+    pub fn new(monitor: &'a mut PerformanceMonitor, stage: CpuStage) -> Self {
+        let active = monitor.enabled;
+        Self {
+            monitor: active.then_some(monitor),
+            stage,
+            started: Instant::now(),
+        }
+    }
+}
+
+impl Drop for CpuStageScope<'_> {
+    fn drop(&mut self) {
+        if let Some(monitor) = self.monitor.as_mut() {
+            monitor.record_stage(self.stage, self.started.elapsed().as_secs_f64() * 1000.0);
+        }
+    }
+}
+
+/// Calculate percentile with linear interpolation from sorted ascending values.
+pub fn calculate_percentile(sorted_ascending: &[f64], percentile: f64) -> f64 {
+    if sorted_ascending.is_empty() {
+        return 0.0;
+    }
+    if sorted_ascending.len() == 1 {
+        return sorted_ascending[0];
+    }
+    let p = percentile.clamp(0.0, 1.0);
+    let rank = (sorted_ascending.len() - 1) as f64 * p;
+    let low_idx = rank.floor() as usize;
+    let high_idx = rank.ceil() as usize;
+    let frac = rank - rank.floor();
+    sorted_ascending[low_idx] * (1.0 - frac) + sorted_ascending[high_idx] * frac
 }
 
 pub fn percentile_low_fps(frame_times_ms: &[f64], fraction: f64) -> f64 {
@@ -998,12 +1273,18 @@ mod tests {
             shadow_casters: 3,
             passes: 2,
             gpu_frame_time_ms: None,
+            candidates: 12,
+            culled: 4,
+            instanced_batches: 2,
+            instanced_objects: 6,
         };
         assert_eq!(stats.draw_calls, 8);
         assert_eq!(stats.vertices, 24);
         assert_eq!(stats.shadow_casters, 3);
         assert_eq!(stats.textures, None);
         assert_eq!(stats.gpu_frame_time_ms, None);
+        assert_eq!(stats.instanced_batches, 2);
+        assert_eq!(stats.instanced_objects, 6);
     }
 
     #[test]

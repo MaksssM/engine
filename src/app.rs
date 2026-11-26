@@ -326,10 +326,10 @@ impl EngineApp {
         }
         let input_started = std::time::Instant::now();
         self.process_events();
-        self.performance.record(
-            Metric::InputProcessingMs,
-            input_started.elapsed().as_secs_f64() * 1000.0,
-        );
+        let input_ms = input_started.elapsed().as_secs_f64() * 1000.0;
+        self.performance.record(Metric::InputProcessingMs, input_ms);
+        self.performance
+            .record_stage(crate::performance::CpuStage::Input, input_ms);
         self.sync_play_mode();
 
         let step_seconds = self.game_loop.fixed_step as f32;
@@ -344,6 +344,22 @@ impl EngineApp {
             .record(Metric::SimulationUpdateMs, loop_timings.update_ms);
         self.performance
             .record(Metric::PostUpdateMs, loop_timings.post_ms);
+        self.performance.record_stage(
+            crate::performance::CpuStage::EditorUpdate,
+            loop_timings.editor_ms,
+        );
+        self.performance.record_stage(
+            crate::performance::CpuStage::FixedUpdate,
+            loop_timings.fixed_ms,
+        );
+        self.performance.record_stage(
+            crate::performance::CpuStage::SimulationUpdate,
+            loop_timings.update_ms,
+        );
+        self.performance.record_stage(
+            crate::performance::CpuStage::PostUpdate,
+            loop_timings.post_ms,
+        );
         self.performance.add_fixed_updates(loop_timings.steps);
 
         // Rendering resource preparation is once per frame; simulation timing is
@@ -356,10 +372,12 @@ impl EngineApp {
         }
         let extraction_started = std::time::Instant::now();
         let render_snapshot = collect_render_snapshot(&mut self.ecs.world);
-        self.performance.record(
-            Metric::RendererExtractionMs,
-            extraction_started.elapsed().as_secs_f64() * 1000.0,
-        );
+        let extraction_ms = extraction_started.elapsed().as_secs_f64() * 1000.0;
+        self.performance
+            .record(Metric::RendererExtractionMs, extraction_ms);
+        self.performance
+            .record_stage(crate::performance::CpuStage::SceneExtraction, extraction_ms);
+        let prep_started = std::time::Instant::now();
         if let Some(renderer) = self.renderer.as_mut() {
             // Apply the current camera before building this frame's uniforms,
             // otherwise the surface render lags the editor camera by a frame.
@@ -367,6 +385,15 @@ impl EngineApp {
                 renderer.set_camera(&camera, &transform);
             }
             renderer.update(&render_snapshot, step_seconds);
+        }
+        if let Some(renderer) = self.renderer.as_ref() {
+            self.performance.record_stage(
+                crate::performance::CpuStage::RenderPreparation,
+                prep_started.elapsed().as_secs_f64() * 1000.0,
+            );
+            if let Some(timings) = renderer.gpu_pass_timings {
+                self.performance.set_gpu_pass_timings(timings);
+            }
         }
         let entity_count = self
             .ecs
@@ -387,10 +414,14 @@ impl EngineApp {
         self.process_ui();
 
         if let Some(renderer) = self.renderer.as_mut() {
+            let encode_started = std::time::Instant::now();
             let result = renderer.render_scene(&render_snapshot);
+            let encode_ms = encode_started.elapsed().as_secs_f64() * 1000.0;
+            self.performance
+                .record_stage(crate::performance::CpuStage::RenderEncoding, encode_ms);
             let renderer_stats = crate::performance::RendererStatistics {
                 renderable_entities: render_snapshot.renderables.len() as u32,
-                visible_entities: render_snapshot.renderables.len() as u32,
+                visible_entities: renderer.frame_visible,
                 draw_calls: renderer.frame_draw_calls,
                 triangles: renderer.frame_triangles,
                 vertices: renderer.frame_vertices,
@@ -401,6 +432,10 @@ impl EngineApp {
                 shadow_casters: renderer.frame_shadow_casters as u32,
                 passes: renderer.frame_passes,
                 gpu_frame_time_ms: None,
+                candidates: renderer.frame_candidates,
+                culled: renderer.frame_culled,
+                instanced_batches: renderer.frame_instanced_batches,
+                instanced_objects: renderer.frame_instanced_objects,
             };
             self.performance.set_renderer(renderer_stats);
 

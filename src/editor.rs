@@ -490,10 +490,8 @@ impl Editor {
             // Match the perspective framing at the current orbit distance so
             // switching between projections keeps the subject roughly the
             // same size; scrolling changes orbit_distance and thus zoom.
-            ortho_scale: (2.0
-                * self.orbit_distance
-                * (self.camera_fov.to_radians() * 0.5).tan())
-            .max(0.1),
+            ortho_scale: (2.0 * self.orbit_distance * (self.camera_fov.to_radians() * 0.5).tan())
+                .max(0.1),
         }
     }
 
@@ -526,9 +524,7 @@ impl Editor {
         {
             // The editor camera sits at the ray origin; picking its AABB would
             // always win. Hidden and locked actors are not selectable either.
-            if controller.is_some()
-                || visible.is_some_and(|v| !v.0)
-                || locked.is_some_and(|l| l.0)
+            if controller.is_some() || visible.is_some_and(|v| !v.0) || locked.is_some_and(|l| l.0)
             {
                 continue;
             }
@@ -537,8 +533,7 @@ impl Editor {
             let world_transform = if parent.is_some() {
                 global
                     .map(|g| {
-                        let (scale, rotation, translation) =
-                            g.0.to_scale_rotation_translation();
+                        let (scale, rotation, translation) = g.0.to_scale_rotation_translation();
                         Transform {
                             translation,
                             rotation,
@@ -638,9 +633,7 @@ impl Editor {
         let mut best: Option<(f32, GizmoAxis)> = None;
         for axis in candidates {
             let dir = crate::viewport::axis_vector(axis, basis);
-            let Some(tip) =
-                crate::viewport::gizmo_screen_handle(camera, rect, origin, dir)
-            else {
+            let Some(tip) = crate::viewport::gizmo_screen_handle(camera, rect, origin, dir) else {
                 continue;
             };
             let t = glam::Vec2::new(tip.x, tip.y);
@@ -792,11 +785,13 @@ impl Editor {
         // frame's input instead of lagging one frame behind. The texture id is
         // stable, so re-rendering before the UI pass is submitted updates the
         // image the UI already queued.
-        let viewport_state = self.viewport_texture_id.map(|texture_id| ViewportTextureState {
-            texture_id,
-            width: self.viewport_texture_size.0,
-            height: self.viewport_texture_size.1,
-        });
+        let viewport_state = self
+            .viewport_texture_id
+            .map(|texture_id| ViewportTextureState {
+                texture_id,
+                width: self.viewport_texture_size.0,
+                height: self.viewport_texture_size.1,
+            });
         self.process_pending_reimport(renderer);
 
         self.viewport_panel_drawn = false;
@@ -1068,6 +1063,31 @@ impl Editor {
                                         .clicked()
                                     {
                                         self.prompt_reload_scene(world);
+                                        ui.close();
+                                    }
+                                    if ui
+                                        .button(format!(
+                                            "{} Load PBR Validation Scene",
+                                            Icons::PLAY
+                                        ))
+                                        .clicked()
+                                    {
+                                        let pbr_path = std::path::Path::new(
+                                            "assets/scenes/pbr_validation.ron",
+                                        );
+                                        if !pbr_path.exists() {
+                                            // If the file does not exist on disk yet, write the default validation scene
+                                            if let Ok(ron_str) =
+                                                crate::scene::Scene::pbr_validation_scene().to_ron()
+                                            {
+                                                if let Some(parent) = pbr_path.parent() {
+                                                    let _ = std::fs::create_dir_all(parent);
+                                                }
+                                                let _ = std::fs::write(pbr_path, ron_str);
+                                            }
+                                        }
+                                        self.load_scene_from_path(world, pbr_path);
+                                        self.log_info("Loaded PBR Validation Scene");
                                         ui.close();
                                     }
                                     ui.separator();
@@ -2283,9 +2303,7 @@ impl Editor {
             // `drag_delta()` is cumulative for the whole gesture; applying it
             // every frame accelerates the camera. `pointer.delta()` is per-frame.
             let pointer_delta = ui.input(|i| i.pointer.delta());
-            if response.dragged_by(egui::PointerButton::Secondary)
-                && pointer_delta != Vec2::ZERO
-            {
+            if response.dragged_by(egui::PointerButton::Secondary) && pointer_delta != Vec2::ZERO {
                 if let Some((mut t, mut c)) = world
                     .query::<(&mut Transform, &mut CameraController)>()
                     .iter_mut(world)
@@ -2300,9 +2318,7 @@ impl Editor {
                     t.translation = self.orbit_target - c.forward() * self.orbit_distance;
                 }
             }
-            if response.dragged_by(egui::PointerButton::Middle)
-                && pointer_delta != Vec2::ZERO
-            {
+            if response.dragged_by(egui::PointerButton::Middle) && pointer_delta != Vec2::ZERO {
                 // Pan in the camera's screen plane rather than world X/Y, and
                 // scale the speed with distance so it feels consistent at any
                 // zoom level.
@@ -2313,8 +2329,8 @@ impl Editor {
                     .map(|c| (c.right(), c.up()));
                 if let Some((right, up)) = basis {
                     let scale = (self.orbit_distance * 0.0015).max(0.0001);
-                    self.orbit_target += right * (-pointer_delta.x * scale)
-                        + up * (pointer_delta.y * scale);
+                    self.orbit_target +=
+                        right * (-pointer_delta.x * scale) + up * (pointer_delta.y * scale);
                     self.update_camera(world);
                 }
             }
@@ -2368,8 +2384,7 @@ impl Editor {
                             self.gizmo_drag_start = Some(pos);
                             self.gizmo_drag_start_transform =
                                 world.get::<Transform>(entity).copied();
-                            self.gizmo_drag_start_world =
-                                Self::world_transform_of(world, entity);
+                            self.gizmo_drag_start_world = Self::world_transform_of(world, entity);
                             self.gizmo_drag_parent_inverse = world.get::<Parent>(entity).map(|p| {
                                 world
                                     .get::<GlobalTransform>(p.0)
@@ -2439,18 +2454,14 @@ impl Editor {
                             current_d,
                             start_hit - origin,
                         );
-                        let angle =
-                            crate::viewport::snap_angle(angle, self.gizmo_snap_rotation);
+                        let angle = crate::viewport::snap_angle(angle, self.gizmo_snap_rotation);
                         new_world.rotation =
                             Quat::from_axis_angle(axis_dir, angle) * start_world.rotation;
                     }
                     GizmoTool::Scale => {
                         let uniform = matches!(
                             axis,
-                            GizmoAxis::Uniform
-                                | GizmoAxis::Xy
-                                | GizmoAxis::Xz
-                                | GizmoAxis::Yz
+                            GizmoAxis::Uniform | GizmoAxis::Xy | GizmoAxis::Xz | GizmoAxis::Yz
                         );
                         let factor = crate::viewport::snap_scale(
                             crate::viewport::drag_scale_factor(
@@ -2486,8 +2497,7 @@ impl Editor {
                 // local space when it has a parent.
                 let new_local = if let Some(inverse) = parent_inverse {
                     let matrix = inverse * new_world.matrix();
-                    let (scale, rotation, translation) =
-                        matrix.to_scale_rotation_translation();
+                    let (scale, rotation, translation) = matrix.to_scale_rotation_translation();
                     Transform {
                         translation,
                         rotation,
@@ -4530,10 +4540,7 @@ impl Editor {
                 let pointer_pressed = ui.input(|i| i.pointer.primary_pressed());
                 let has_keyboard_focus = ui.ctx().memory(|m| m.focused().is_some());
                 let pointer_over_details = ui.rect_contains_pointer(ui.max_rect());
-                if pointer_pressed
-                    && pointer_over_details
-                    && self.transform_edit_start.is_none()
-                {
+                if pointer_pressed && pointer_over_details && self.transform_edit_start.is_none() {
                     if let Some(t) = world.get::<Transform>(entity) {
                         self.transform_edit_start = Some(*t);
                     }
@@ -4586,16 +4593,10 @@ impl Editor {
 
                 // Rotation editing. DragValues show degrees; convert back to
                 // radians so the edited values actually reach the transform.
-                let rotation_euler = world
-                    .get::<Transform>(entity)
-                    .map(|t| {
-                        let (rx, ry, rz) = t.rotation.to_euler(glam::EulerRot::XYZ);
-                        (
-                            rx.to_degrees(),
-                            ry.to_degrees(),
-                            rz.to_degrees(),
-                        )
-                    });
+                let rotation_euler = world.get::<Transform>(entity).map(|t| {
+                    let (rx, ry, rz) = t.rotation.to_euler(glam::EulerRot::XYZ);
+                    (rx.to_degrees(), ry.to_degrees(), rz.to_degrees())
+                });
 
                 ui.horizontal(|ui| {
                     ui.label("Rotation");
@@ -4723,7 +4724,9 @@ impl Editor {
                 }
 
                 if scale_changed {
-                    if let (Some(mut t), Some(scale)) = (world.get_mut::<Transform>(entity), scale_value) {
+                    if let (Some(mut t), Some(scale)) =
+                        (world.get_mut::<Transform>(entity), scale_value)
+                    {
                         t.scale = scale;
                         self.dirty = true;
                     }
@@ -5207,6 +5210,7 @@ impl Editor {
             "CPU Profiler",
             "Renderer",
             "Memory",
+            "Snapshots",
             "ECS Inspector",
         ];
 
@@ -5228,7 +5232,8 @@ impl Editor {
             1 => Self::draw_perf_cpu_profiler(ui, perf),
             2 => Self::draw_perf_renderer(ui, &perf),
             3 => Self::draw_perf_memory(ui, &perf),
-            4 => Self::draw_perf_ecs_inspector(ui, &perf),
+            4 => Self::draw_perf_snapshot_inspector(ui, perf),
+            5 => Self::draw_perf_ecs_inspector(ui, &perf),
             _ => {}
         }
     }
@@ -5524,87 +5529,136 @@ impl Editor {
         ui.separator();
         ui.add_space(4.0);
 
-        // GameLoop stage timings
-        ui.label(RichText::new("GameLoop Stage Timings (Last Frame)").strong());
+        // Frame stage scopes
+        ui.label(RichText::new("Frame Stages (Current Frame)").strong());
         ui.add_space(4.0);
 
-        egui::Grid::new("gameloop_stages_grid")
-            .num_columns(4)
+        let latest = &perf.current_cpu_stages;
+        let cpu_total = perf.frame_stats.cpu_frame_time_ms.max(0.001);
+
+        egui::Grid::new("frame_stages_grid")
+            .num_columns(3)
             .striped(true)
             .show(ui, |ui| {
                 ui.strong("Stage");
                 ui.strong("Time (ms)");
-                ui.strong("% of Frame");
-                ui.strong("Fixed Steps");
+                ui.strong("% of CPU Frame");
                 ui.end_row();
 
-                let total = perf.frame_stats.cpu_frame_time_ms.max(0.001);
-
-                // These would come from GameLoop timings if available
-                ui.label("Editor Update");
-                ui.label("N/A");
-                ui.label("N/A");
-                ui.label("-");
-                ui.end_row();
-
-                ui.label("Fixed Update");
-                ui.label(format!(
-                    "{:.2}",
-                    perf.frame_stats.fixed_delta_time_ms
-                        * perf.frame_stats.fixed_updates_count as f64
-                ));
-                ui.label(format!(
-                    "{:.1}%",
-                    (perf.frame_stats.fixed_delta_time_ms
-                        * perf.frame_stats.fixed_updates_count as f64)
-                        / total
-                        * 100.0
-                ));
-                ui.label(format!("{}", perf.frame_stats.fixed_updates_count));
-                ui.end_row();
-
-                ui.label("Update");
-                ui.label("N/A");
-                ui.label("N/A");
-                ui.label("-");
-                ui.end_row();
-
-                ui.label("Post Update");
-                ui.label("N/A");
-                ui.label("N/A");
-                ui.label("-");
-                ui.end_row();
-
-                ui.label("Transform Propagation");
-                ui.label("N/A");
-                ui.label("N/A");
-                ui.label("-");
-                ui.end_row();
-
-                ui.label("Renderer Extraction");
-                ui.label("N/A");
-                ui.label("N/A");
-                ui.label("-");
-                ui.end_row();
-
-                ui.label("Shadow Pass");
-                ui.label("N/A");
-                ui.label("N/A");
-                ui.label("-");
-                ui.end_row();
-
-                ui.label("Main Render Pass");
-                ui.label("N/A");
-                ui.label("N/A");
-                ui.label("-");
-                ui.end_row();
-
-                ui.label("Post Processing");
-                ui.label("N/A");
-                ui.label("N/A");
-                ui.label("-");
-                ui.end_row();
+                for (i, stage) in crate::performance::CpuStage::ALL.iter().enumerate() {
+                    let ms = latest[i];
+                    if ms <= 0.0 && *stage == crate::performance::CpuStage::TransformPropagation {
+                        continue;
+                    }
+                    ui.label(stage.name());
+                    ui.label(format!("{:.3}", ms));
+                    ui.label(format!("{:.1}%", ms / cpu_total * 100.0));
+                    ui.end_row();
+                }
             });
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(4.0);
+
+        ui.label(RichText::new("GPU Passes (Current Frame)").strong());
+        let gpu = &perf.current_gpu_passes;
+        egui::Grid::new("gpu_passes_grid")
+            .num_columns(2)
+            .striped(true)
+            .show(ui, |ui| {
+                ui.strong("Pass");
+                ui.strong("Time (ms)");
+                ui.end_row();
+                let rows = [
+                    ("Total", gpu.total_ms),
+                    ("Shadow", gpu.shadow_ms),
+                    ("Opaque", gpu.opaque_ms),
+                    ("Transparent", gpu.transparent_ms),
+                    ("Post", gpu.post_ms),
+                    ("Preview", gpu.preview_ms),
+                ];
+                for (label, value) in rows {
+                    ui.label(label);
+                    ui.label(value.map_or("—".into(), |v| format!("{:.3}", v)));
+                    ui.end_row();
+                }
+            });
+
+        if gpu.total_ms.is_none() {
+            ui.label(
+                egui::RichText::new(
+                    "GPU timestamps unavailable: adapter or backend did not expose timestamp queries.",
+                )
+                .weak(),
+            );
+        }
+    }
+
+    fn draw_perf_snapshot_inspector(ui: &mut egui::Ui, perf: &mut PerformanceMonitor) {
+        use crate::performance::{CpuStage, GpuPassTimings};
+        ui.label(RichText::new("Frame Snapshots").strong());
+        ui.label(format!("Buffered: {}", perf.snapshots().len()));
+        let latest = perf.latest_snapshot().cloned();
+        let Some(latest) = latest else {
+            ui.label("No snapshots yet.");
+            return;
+        };
+        let selected = perf.selected_snapshot_index.unwrap_or(latest.index);
+        let snap = perf.snapshot_by_index(selected).cloned().unwrap_or(latest);
+        ui.horizontal(|ui| {
+            ui.label(format!("Showing frame {}", snap.index));
+            if ui.button("Latest").clicked() {
+                perf.selected_snapshot_index = None;
+            }
+            if snap.index > 0 && ui.button("◀ Older").clicked() {
+                let prev = perf
+                    .snapshots()
+                    .iter()
+                    .rev()
+                    .find(|s| s.index < snap.index)
+                    .map(|s| s.index);
+                if let Some(i) = prev {
+                    perf.selected_snapshot_index = Some(i);
+                }
+            }
+            let has_newer = perf.snapshots().iter().any(|s| s.index > snap.index);
+            if has_newer && ui.button("Newer ▶").clicked() {
+                let next = perf
+                    .snapshots()
+                    .iter()
+                    .find(|s| s.index > snap.index)
+                    .map(|s| s.index);
+                if let Some(i) = next {
+                    perf.selected_snapshot_index = Some(i);
+                }
+            }
+        });
+        ui.label(format!(
+            "{} · {:.2} ms · CPU {:.2} ms · GPU {}",
+            snap.mode.label(),
+            snap.frame_time_ms,
+            snap.cpu_frame_time_ms,
+            snap.gpu_frame_time_ms
+                .map_or("—".into(), |v| format!("{:.2} ms", v)),
+        ));
+        egui::Grid::new("snapshot_stages")
+            .num_columns(2)
+            .striped(true)
+            .show(ui, |ui| {
+                ui.strong("CPU Stage");
+                ui.strong("ms");
+                ui.end_row();
+                for (i, stage) in CpuStage::ALL.iter().enumerate() {
+                    if snap.cpu_stages_ms[i] <= 0.0 {
+                        continue;
+                    }
+                    ui.label(stage.name());
+                    ui.label(format!("{:.3}", snap.cpu_stages_ms[i]));
+                    ui.end_row();
+                }
+            });
+        let _ = GpuPassTimings::default();
     }
 
     fn draw_perf_renderer(ui: &mut egui::Ui, perf: &PerformanceMonitor) {

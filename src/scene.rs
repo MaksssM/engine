@@ -201,6 +201,134 @@ impl Scene {
         });
         index
     }
+
+    /// Construct a deterministic PBR validation scene with 9 distinct material types
+    /// arranged in a 3x3 grid, plus a directional key light and a fill light.
+    pub fn pbr_validation_scene() -> Self {
+        let mut scene = Self::new();
+
+        // Key light
+        let key_light_entity = SceneEntity {
+            name: "Key Directional Light".into(),
+            uid: Some(Uid::new()),
+            translation: [5.0, 10.0, 7.0],
+            rotation: default_rotation(),
+            scale: default_scale(),
+            parent: None,
+            visible: true,
+            locked: false,
+            folder: Some("Lighting".into()),
+            components: SerializedComponents {
+                light: Some(Light {
+                    kind: crate::core::components::LightKind::Directional,
+                    color: [1.0, 0.98, 0.95],
+                    intensity: 2.5,
+                    range: 50.0,
+                    cast_shadows: true,
+                }),
+                ..Default::default()
+            },
+        };
+        scene.entities.push(key_light_entity);
+
+        // Fill light
+        let fill_light_entity = SceneEntity {
+            name: "Fill Directional Light".into(),
+            uid: Some(Uid::new()),
+            translation: [-5.0, 5.0, -5.0],
+            rotation: default_rotation(),
+            scale: default_scale(),
+            parent: None,
+            visible: true,
+            locked: false,
+            folder: Some("Lighting".into()),
+            components: SerializedComponents {
+                light: Some(Light {
+                    kind: crate::core::components::LightKind::Directional,
+                    color: [0.6, 0.7, 0.85],
+                    intensity: 0.8,
+                    range: 50.0,
+                    cast_shadows: false,
+                }),
+                ..Default::default()
+            },
+        };
+        scene.entities.push(fill_light_entity);
+
+        // 9 PBR Materials
+        let pbr_configs = [
+            (
+                "PBR Red Plastic",
+                "builtin/pbr_red_plastic",
+                [-3.0, 3.0, 0.0],
+            ),
+            (
+                "PBR Polished Metal",
+                "builtin/pbr_polished_metal",
+                [0.0, 3.0, 0.0],
+            ),
+            (
+                "PBR Rough Metal",
+                "builtin/pbr_rough_metal",
+                [3.0, 3.0, 0.0],
+            ),
+            (
+                "PBR Matte Dielectric",
+                "builtin/pbr_matte_dielectric",
+                [-3.0, 0.0, 0.0],
+            ),
+            (
+                "PBR Normal Mapped",
+                "builtin/pbr_normal_mapped",
+                [0.0, 0.0, 0.0],
+            ),
+            ("PBR Emissive", "builtin/pbr_emissive", [3.0, 0.0, 0.0]),
+            (
+                "PBR Alpha Mask",
+                "builtin/pbr_alpha_mask",
+                [-3.0, -3.0, 0.0],
+            ),
+            (
+                "PBR Alpha Blend",
+                "builtin/pbr_alpha_blend",
+                [0.0, -3.0, 0.0],
+            ),
+            (
+                "PBR Double Sided",
+                "builtin/pbr_double_sided",
+                [3.0, -3.0, 0.0],
+            ),
+        ];
+
+        for (name, mat_path, pos) in pbr_configs {
+            let entity = SceneEntity {
+                name: name.into(),
+                uid: Some(Uid::new()),
+                translation: pos,
+                rotation: default_rotation(),
+                scale: default_scale(),
+                parent: None,
+                visible: true,
+                locked: false,
+                folder: Some("Validation Objects".into()),
+                components: SerializedComponents {
+                    mesh_filter: Some(MeshFilter {
+                        mesh_path: "builtin/sphere".into(),
+                    }),
+                    mesh_renderer: Some(MeshRenderer {
+                        material_path: mat_path.into(),
+                        cast_shadows: true,
+                        receive_shadows: true,
+                    }),
+                    ..Default::default()
+                },
+            };
+            scene.entities.push(entity);
+        }
+
+        scene
+    }
+
     pub fn to_ron(&self) -> Result<String, ron::Error> {
         ron::ser::to_string_pretty(self, ron::ser::PrettyConfig::default())
     }
@@ -503,5 +631,55 @@ mod tests {
                     .is_some()
             );
         }
+    }
+
+    #[test]
+    fn pbr_validation_scene_has_9_distinct_materials_and_lighting() {
+        let scene = Scene::pbr_validation_scene();
+        assert!(scene.validate().is_ok());
+
+        // 2 lights + 9 validation spheres = 11 entities
+        assert_eq!(scene.entities.len(), 11);
+
+        let lights: Vec<_> = scene
+            .entities
+            .iter()
+            .filter(|e| e.components.light.is_some())
+            .collect();
+        assert_eq!(lights.len(), 2, "must have key and fill lights");
+
+        let pbr_objects: Vec<_> = scene
+            .entities
+            .iter()
+            .filter(|e| e.components.mesh_renderer.is_some())
+            .collect();
+        assert_eq!(pbr_objects.len(), 9, "must have 9 PBR validation spheres");
+
+        let mut material_paths = std::collections::HashSet::new();
+        for obj in &pbr_objects {
+            let mr = obj.components.mesh_renderer.as_ref().unwrap();
+            material_paths.insert(mr.material_path.clone());
+            assert_eq!(
+                obj.components.mesh_filter.as_ref().unwrap().mesh_path,
+                "builtin/sphere"
+            );
+        }
+        assert_eq!(
+            material_paths.len(),
+            9,
+            "all 9 objects must have distinct material assets"
+        );
+
+        // Serialize and deserialize roundtrip
+        let ron_str = scene.to_ron().expect("serialize pbr validation scene");
+        let deserialized = Scene::from_ron(&ron_str).expect("deserialize pbr validation scene");
+        assert_eq!(deserialized.entities.len(), 11);
+
+        // Ensure directory and file can be written to assets/scenes/pbr_validation.ron
+        let pbr_path = std::path::Path::new("assets/scenes/pbr_validation.ron");
+        if let Some(parent) = pbr_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(pbr_path, &ron_str).expect("write assets/scenes/pbr_validation.ron");
     }
 }

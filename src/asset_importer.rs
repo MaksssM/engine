@@ -549,7 +549,7 @@ mod tests {
 
     #[test]
     fn importer_registry_basic() {
-        let mut registry = ImporterRegistry::new();
+        let registry = ImporterRegistry::new();
 
         // We can't easily test with a real importer without implementing one
         // This just tests the registry structure

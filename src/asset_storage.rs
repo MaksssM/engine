@@ -377,7 +377,6 @@ impl fmt::Debug for AssetCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use tempfile::TempDir;
 
     #[test]
@@ -418,7 +417,6 @@ mod tests {
 
         let mut storage = AssetStorage::new(config).unwrap();
         let id1 = AssetId::new();
-        let id2 = AssetId::new();
         let data = b"same data";
 
         storage.store_asset(id1, AssetType::Mesh, data).unwrap();

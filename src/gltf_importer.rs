@@ -77,6 +77,127 @@ pub struct TextureRef {
     pub tex_coord: u32,
 }
 
+/// glTF wrapping mode (maps 1:1 onto wgpu address modes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum TextureWrapMode {
+    ClampToEdge,
+    #[default]
+    Repeat,
+    MirroredRepeat,
+}
+
+/// glTF filter mode. `Nearest` covers the NEAREST family, `Linear` the LINEAR family.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum TextureFilterMode {
+    Nearest,
+    #[default]
+    Linear,
+}
+
+/// glTF minification filter modes (glTF 2.0 constants 9728, 9729, 9984, 9985, 9986, 9987)
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum TextureMinFilter {
+    Nearest,
+    Linear,
+    NearestMipmapNearest,
+    LinearMipmapNearest,
+    NearestMipmapLinear,
+    #[default]
+    LinearMipmapLinear,
+}
+
+impl TextureMinFilter {
+    /// Returns (min_filter, mipmap_filter, lod_max_clamp) for wgpu sampler creation.
+    pub fn to_wgpu(&self) -> (wgpu::FilterMode, wgpu::FilterMode, f32) {
+        match self {
+            TextureMinFilter::Nearest => {
+                (wgpu::FilterMode::Nearest, wgpu::FilterMode::Nearest, 0.0)
+            }
+            TextureMinFilter::Linear => (wgpu::FilterMode::Linear, wgpu::FilterMode::Nearest, 0.0),
+            TextureMinFilter::NearestMipmapNearest => {
+                (wgpu::FilterMode::Nearest, wgpu::FilterMode::Nearest, 32.0)
+            }
+            TextureMinFilter::LinearMipmapNearest => {
+                (wgpu::FilterMode::Linear, wgpu::FilterMode::Nearest, 32.0)
+            }
+            TextureMinFilter::NearestMipmapLinear => {
+                (wgpu::FilterMode::Nearest, wgpu::FilterMode::Linear, 32.0)
+            }
+            TextureMinFilter::LinearMipmapLinear => {
+                (wgpu::FilterMode::Linear, wgpu::FilterMode::Linear, 32.0)
+            }
+        }
+    }
+
+    /// Whether this filter samples mip levels > 0.
+    pub fn is_mipmapped(&self) -> bool {
+        !matches!(self, TextureMinFilter::Nearest | TextureMinFilter::Linear)
+    }
+}
+
+/// Semantic role of a texture, used to guide mipmap filtering downsampling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum TextureSemantic {
+    #[default]
+    Color,
+    Emissive,
+    LinearData,
+    NormalMap,
+}
+
+/// Sampler settings taken from the glTF texture. Defaults match the glTF spec
+/// (repeat + linear) so assets serialized before sampler support still load.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TextureSamplerSettings {
+    pub wrap_s: TextureWrapMode,
+    pub wrap_t: TextureWrapMode,
+    pub mag_filter: TextureFilterMode,
+    pub min_filter: TextureFilterMode,
+    pub mipmap_filter: TextureFilterMode,
+    #[serde(default)]
+    pub min_filter_complete: Option<TextureMinFilter>,
+}
+
+impl Default for TextureSamplerSettings {
+    fn default() -> Self {
+        Self {
+            wrap_s: TextureWrapMode::Repeat,
+            wrap_t: TextureWrapMode::Repeat,
+            mag_filter: TextureFilterMode::Linear,
+            min_filter: TextureFilterMode::Linear,
+            mipmap_filter: TextureFilterMode::Linear,
+            min_filter_complete: Some(TextureMinFilter::LinearMipmapLinear),
+        }
+    }
+}
+
+impl TextureSamplerSettings {
+    pub fn resolved_min_filter(&self) -> TextureMinFilter {
+        if let Some(complete) = self.min_filter_complete {
+            complete
+        } else {
+            match (self.min_filter, self.mipmap_filter) {
+                (TextureFilterMode::Nearest, TextureFilterMode::Nearest) => {
+                    TextureMinFilter::NearestMipmapNearest
+                }
+                (TextureFilterMode::Nearest, TextureFilterMode::Linear) => {
+                    TextureMinFilter::NearestMipmapLinear
+                }
+                (TextureFilterMode::Linear, TextureFilterMode::Nearest) => {
+                    TextureMinFilter::LinearMipmapNearest
+                }
+                (TextureFilterMode::Linear, TextureFilterMode::Linear) => {
+                    TextureMinFilter::LinearMipmapLinear
+                }
+            }
+        }
+    }
+
+    pub fn lod_max_clamp(&self) -> f32 {
+        self.resolved_min_filter().to_wgpu().2
+    }
+}
+
 /// CPU-side texture data
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TextureData {
@@ -86,6 +207,12 @@ pub struct TextureData {
     pub format: TextureFormat,
     pub data: Vec<u8>,
     pub is_srgb: bool,
+    /// glTF sampler. Absent in assets written before sampler support.
+    #[serde(default)]
+    pub sampler: TextureSamplerSettings,
+    /// Texture semantic role hint for mipmap downsampling
+    #[serde(default)]
+    pub semantic: Option<TextureSemantic>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -185,9 +312,33 @@ impl AssetImporter for GltfImporter {
         let mut mesh_ids = HashMap::new();
         let mut node_ids = HashMap::new();
 
+        // Scan materials to determine texture semantic roles
+        let mut normal_texture_indices = std::collections::HashSet::new();
+        let mut data_texture_indices = std::collections::HashSet::new();
+        for material in document.materials() {
+            if let Some(tex) = material.normal_texture() {
+                normal_texture_indices.insert(tex.texture().index());
+            }
+            let pbr = material.pbr_metallic_roughness();
+            if let Some(tex) = pbr.metallic_roughness_texture() {
+                data_texture_indices.insert(tex.texture().index());
+            }
+            if let Some(tex) = material.occlusion_texture() {
+                data_texture_indices.insert(tex.texture().index());
+            }
+        }
+
         // 1. Import textures first (dependencies)
         for (index, texture) in document.textures().enumerate() {
-            let texture_id = self.import_texture(&document, &texture, context, index, &images)?;
+            let semantic = if normal_texture_indices.contains(&index) {
+                Some(TextureSemantic::NormalMap)
+            } else if data_texture_indices.contains(&index) {
+                Some(TextureSemantic::LinearData)
+            } else {
+                Some(TextureSemantic::Color)
+            };
+            let texture_id =
+                self.import_texture(&document, &texture, context, index, &images, semantic)?;
             texture_ids.insert(index, texture_id);
         }
 
@@ -267,6 +418,7 @@ impl GltfImporter {
         context: &mut ImportContext,
         index: usize,
         images: &[gltf::image::Data],
+        semantic: Option<TextureSemantic>,
     ) -> Result<AssetId, ImportError> {
         let source = texture.source();
         let image_index = source.index();
@@ -280,6 +432,45 @@ impl GltfImporter {
 
         let (width, height, format, data, is_srgb) = self.load_image_data(image)?;
 
+        let sampler = texture.sampler();
+        let wrap = |mode: gltf::texture::WrappingMode| match mode {
+            gltf::texture::WrappingMode::ClampToEdge => TextureWrapMode::ClampToEdge,
+            gltf::texture::WrappingMode::MirroredRepeat => TextureWrapMode::MirroredRepeat,
+            gltf::texture::WrappingMode::Repeat => TextureWrapMode::Repeat,
+        };
+        let min_filter_complete = match sampler.min_filter() {
+            Some(gltf::texture::MinFilter::Nearest) => TextureMinFilter::Nearest,
+            Some(gltf::texture::MinFilter::Linear) => TextureMinFilter::Linear,
+            Some(gltf::texture::MinFilter::NearestMipmapNearest) => {
+                TextureMinFilter::NearestMipmapNearest
+            }
+            Some(gltf::texture::MinFilter::LinearMipmapNearest) => {
+                TextureMinFilter::LinearMipmapNearest
+            }
+            Some(gltf::texture::MinFilter::NearestMipmapLinear) => {
+                TextureMinFilter::NearestMipmapLinear
+            }
+            Some(gltf::texture::MinFilter::LinearMipmapLinear) => {
+                TextureMinFilter::LinearMipmapLinear
+            }
+            None => TextureMinFilter::LinearMipmapLinear,
+        };
+        let min_filter = match sampler.min_filter() {
+            Some(gltf::texture::MinFilter::Nearest)
+            | Some(gltf::texture::MinFilter::NearestMipmapNearest)
+            | Some(gltf::texture::MinFilter::NearestMipmapLinear) => TextureFilterMode::Nearest,
+            _ => TextureFilterMode::Linear,
+        };
+        let mipmap_filter = match sampler.min_filter() {
+            Some(gltf::texture::MinFilter::NearestMipmapNearest)
+            | Some(gltf::texture::MinFilter::LinearMipmapNearest) => TextureFilterMode::Nearest,
+            _ => TextureFilterMode::Linear,
+        };
+        let mag_filter = match sampler.mag_filter() {
+            Some(gltf::texture::MagFilter::Nearest) => TextureFilterMode::Nearest,
+            _ => TextureFilterMode::Linear,
+        };
+
         let texture_data = TextureData {
             name: name.clone(),
             width,
@@ -287,6 +478,15 @@ impl GltfImporter {
             format,
             data,
             is_srgb,
+            sampler: TextureSamplerSettings {
+                wrap_s: wrap(sampler.wrap_s()),
+                wrap_t: wrap(sampler.wrap_t()),
+                mag_filter,
+                min_filter,
+                mipmap_filter,
+                min_filter_complete: Some(min_filter_complete),
+            },
+            semantic,
         };
 
         // Serialize and store
@@ -820,5 +1020,85 @@ mod tests {
             import.dependencies.iter().any(|d| d != &import.asset_id),
             "imported model should register dependencies for meshes"
         );
+    }
+
+    #[test]
+    fn texture_sampler_filter_modes_map_correctly() {
+        let filters = [
+            (
+                TextureMinFilter::Nearest,
+                wgpu::FilterMode::Nearest,
+                wgpu::FilterMode::Nearest,
+                false,
+            ),
+            (
+                TextureMinFilter::Linear,
+                wgpu::FilterMode::Linear,
+                wgpu::FilterMode::Nearest,
+                false,
+            ),
+            (
+                TextureMinFilter::NearestMipmapNearest,
+                wgpu::FilterMode::Nearest,
+                wgpu::FilterMode::Nearest,
+                true,
+            ),
+            (
+                TextureMinFilter::LinearMipmapNearest,
+                wgpu::FilterMode::Linear,
+                wgpu::FilterMode::Nearest,
+                true,
+            ),
+            (
+                TextureMinFilter::NearestMipmapLinear,
+                wgpu::FilterMode::Nearest,
+                wgpu::FilterMode::Linear,
+                true,
+            ),
+            (
+                TextureMinFilter::LinearMipmapLinear,
+                wgpu::FilterMode::Linear,
+                wgpu::FilterMode::Linear,
+                true,
+            ),
+        ];
+
+        for (filter, expected_min, expected_mip, expected_is_mipmapped) in filters {
+            let (min_f, mip_f, _) = filter.to_wgpu();
+            assert_eq!(min_f, expected_min);
+            assert_eq!(mip_f, expected_mip);
+            assert_eq!(filter.is_mipmapped(), expected_is_mipmapped);
+        }
+    }
+
+    #[test]
+    fn texture_sampler_settings_resolves_min_filter_and_lod() {
+        let sampler_no_mips = TextureSamplerSettings {
+            wrap_s: TextureWrapMode::Repeat,
+            wrap_t: TextureWrapMode::Repeat,
+            mag_filter: TextureFilterMode::Linear,
+            min_filter: TextureFilterMode::Linear,
+            mipmap_filter: TextureFilterMode::Nearest,
+            min_filter_complete: Some(TextureMinFilter::Linear),
+        };
+        assert_eq!(
+            sampler_no_mips.resolved_min_filter(),
+            TextureMinFilter::Linear
+        );
+        assert_eq!(sampler_no_mips.lod_max_clamp(), 0.0);
+
+        let sampler_with_mips = TextureSamplerSettings {
+            wrap_s: TextureWrapMode::ClampToEdge,
+            wrap_t: TextureWrapMode::ClampToEdge,
+            mag_filter: TextureFilterMode::Linear,
+            min_filter: TextureFilterMode::Linear,
+            mipmap_filter: TextureFilterMode::Linear,
+            min_filter_complete: Some(TextureMinFilter::LinearMipmapLinear),
+        };
+        assert_eq!(
+            sampler_with_mips.resolved_min_filter(),
+            TextureMinFilter::LinearMipmapLinear
+        );
+        assert_eq!(sampler_with_mips.lod_max_clamp(), 32.0);
     }
 }
