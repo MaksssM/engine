@@ -50,3 +50,45 @@ Scenarios: 100 / 1000 / 10000 objects. Distribution: all visible, mostly outside
 - GPU tests, manual editor checks, and visual checks are not considered done until actually performed.
 - If impossible, state the reason.
 - Current HEAD: cf3e25d + Phase 6.3 changes. Shadow pass disabled. PBR integrated into production.
+
+## Automated verification
+
+Primary way to run checks:
+
+```powershell
+.\scripts\verify.ps1
+```
+
+Full check with release build:
+
+```powershell
+.\scripts\verify.ps1 -Release
+```
+
+Commands executed:
+- `cargo fmt --all -- --check`
+- `cargo check --all-targets`
+- `cargo test --all-targets`
+- `cargo clippy --all-targets`
+- (with -Release) `cargo build --release`
+
+The script stops at the first failure and returns a non-zero exit code.
+
+## GitHub Actions
+
+CI runs on `windows-latest` for:
+- push to any branch
+- pull request to `master`
+- manual `workflow_dispatch`
+
+CI uses the same script: `.\scripts\verify.ps1 -Release`. Cargo registry and target are cached. Permissions limited to `contents: read`. Timeout: 60 minutes.
+
+## Automated vs manual
+
+CI validates compilation, formatting, tests, and clippy. It does NOT replace:
+- Visual inspection of the Editor.
+- Real GPU rendering verification.
+- Manual PBR scene inspection.
+- Benchmark measurement.
+
+GPU-dependent tests requiring a physical adapter may skip explicitly with a clear message; CPU/logic/structure tests must still run.

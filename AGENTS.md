@@ -49,6 +49,70 @@ Concrete Rust Engine architecture:
 - `sync_world_renderables` uploads meshes/materials on demand.
 - Frustum culling integrated in `render_scene` and `render_scene_to_viewport`.
 
+## 4. Standard Development Workflow
+
+Every non-trivial task must pass these stages.
+
+### Stage A — Audit
+Before changing code:
+- Check current branch, SHA, git status.
+- Study existing implementation.
+- Find real production code entry points.
+- Trace data flow between subsystems.
+- Find existing tests.
+- Determine what is missing or broken.
+- Ensure new implementation does not duplicate existing one.
+No code changes at this stage.
+
+### Stage B — Plan
+- Concrete implementation plan.
+- Split large task into independently verifiable parts.
+- List affected files and subsystems.
+- Define completion criteria per stage.
+- List risks and integration issues.
+Avoid excessive documentation and artificial splitting of trivial tasks.
+
+### Stage C — Implementation
+- Implement functionality, not scaffolding.
+- Work in small completed functional increments.
+- Do not touch unrelated subsystems.
+- Do not create a second implementation of an existing system.
+- Preserve backward compatibility when possible.
+- Do not delete tests to make new ones pass.
+- Do not replace production code with test implementations.
+
+### Stage D — Verification
+After implementation:
+1. Run `.\scripts\verify.ps1`.
+2. Fix issues.
+3. Check `git diff`.
+4. Check `git diff --check`.
+5. Ensure functionality is actually invoked from the application runtime path.
+6. Verify documentation matches implementation.
+7. Explicitly list manual checks not performed.
+For large changes also run:
+```
+.\scripts\verify.ps1 -Release
+```
+Do not declare task complete if acceptance criteria are unmet.
+
+## 4b. Safe Parallel Development
+
+- Prefer separate Git branches or worktrees for independent subsystems.
+- Avoid simultaneous edits to shared files by multiple agents.
+- Define responsibility boundaries before parallel work.
+- Agree on public interfaces between subsystems.
+- Integrate changes sequentially.
+- Run full verification after merging.
+- Do not parallelize tasks depending on unfinished architecture of another task.
+
+Potential independent directions (examples only):
+- Renderer and graphics.
+- Editor UI.
+- Asset Pipeline.
+- Documentation and test infrastructure.
+These are examples, not permission to change shared interfaces without coordination.
+
 ## 4. Implementation rules
 
 - Plan before implementing complex tasks.
