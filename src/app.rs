@@ -19,7 +19,7 @@ use crate::{
     input::{MouseButton as EngineMouseButton, UiInput},
     performance::{Metric, PerformanceMonitor},
     quality::QualityPreset,
-    renderer::{Renderable, Renderer, collect_render_snapshot},
+    renderer::{Renderable, Renderer, collect_render_snapshot, collect_renderable_gpu_keys},
     time::{Clock, FixedTimestep, FpsMeter},
     transform::Transform,
 };
@@ -384,6 +384,11 @@ impl EngineApp {
             if let Some((camera, transform)) = render_snapshot.camera {
                 renderer.set_camera(&camera, &transform);
             }
+
+            // Keep GPU resources for every living Renderable, including entities that are
+            // hidden or later frustum-culled. Visibility only controls drawing.
+            let living_keys = collect_renderable_gpu_keys(&mut self.ecs.world);
+            renderer.process_gpu_cleanup(&living_keys);
             renderer.update(&render_snapshot, step_seconds);
         }
         if let Some(renderer) = self.renderer.as_ref() {

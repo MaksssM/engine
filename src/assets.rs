@@ -186,6 +186,13 @@ impl<T, K: Eq + std::hash::Hash> AssetManager<T, K> {
         self.paths.keys()
     }
 
+    /// Iterate over all asset handles and values (used by GPU resource cleanup).
+    pub fn iter(&self) -> impl Iterator<Item = (&Handle<T>, &T)> {
+        self.assets
+            .iter()
+            .map(|(handle, arc)| (handle, Arc::as_ref(arc)))
+    }
+
     pub fn load_cached<F>(&mut self, key: K, loader: F) -> Handle<T>
     where
         F: FnOnce() -> T,
