@@ -4,7 +4,7 @@
         (
             name: "Key Directional Light",
             uid: Some((
-                hi: 1795778366494659500,
+                hi: 1795778479048558600,
                 lo: 9,
             )),
             translation: (5.0, 10.0, 7.0),
@@ -31,7 +31,7 @@
         (
             name: "Fill Directional Light",
             uid: Some((
-                hi: 1795778366494664200,
+                hi: 1795778479048560500,
                 lo: 10,
             )),
             translation: (-5.0, 5.0, -5.0),
@@ -58,7 +58,7 @@
         (
             name: "PBR Red Plastic",
             uid: Some((
-                hi: 1795778366494668500,
+                hi: 1795778479048566900,
                 lo: 11,
             )),
             translation: (-3.0, 3.0, 0.0),
@@ -85,7 +85,7 @@
         (
             name: "PBR Polished Metal",
             uid: Some((
-                hi: 1795778366494669900,
+                hi: 1795778479048568400,
                 lo: 12,
             )),
             translation: (0.0, 3.0, 0.0),
@@ -112,7 +112,7 @@
         (
             name: "PBR Rough Metal",
             uid: Some((
-                hi: 1795778366494673500,
+                hi: 1795778479048569100,
                 lo: 13,
             )),
             translation: (3.0, 3.0, 0.0),
@@ -139,7 +139,7 @@
         (
             name: "PBR Matte Dielectric",
             uid: Some((
-                hi: 1795778366494676000,
+                hi: 1795778479048572200,
                 lo: 14,
             )),
             translation: (-3.0, 0.0, 0.0),
@@ -166,7 +166,7 @@
         (
             name: "PBR Normal Mapped",
             uid: Some((
-                hi: 1795778366494676700,
+                hi: 1795778479048573000,
                 lo: 15,
             )),
             translation: (0.0, 0.0, 0.0),
@@ -193,7 +193,7 @@
         (
             name: "PBR Emissive",
             uid: Some((
-                hi: 1795778366494677300,
+                hi: 1795778479048573600,
                 lo: 16,
             )),
             translation: (3.0, 0.0, 0.0),
@@ -220,7 +220,7 @@
         (
             name: "PBR Alpha Mask",
             uid: Some((
-                hi: 1795778366494678000,
+                hi: 1795778479048574100,
                 lo: 17,
             )),
             translation: (-3.0, -3.0, 0.0),
@@ -247,7 +247,7 @@
         (
             name: "PBR Alpha Blend",
             uid: Some((
-                hi: 1795778366494680700,
+                hi: 1795778479048580400,
                 lo: 18,
             )),
             translation: (0.0, -3.0, 0.0),
@@ -274,7 +274,7 @@
         (
             name: "PBR Double Sided",
             uid: Some((
-                hi: 1795778366494681500,
+                hi: 1795778479048581200,
                 lo: 19,
             )),
             translation: (3.0, -3.0, 0.0),
