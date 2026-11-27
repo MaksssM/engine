@@ -1,4 +1,4 @@
-# AGENTS.md — Rust Engine
+﻿# AGENTS.md — Rust Engine
 
 Persistent instructions for any coding agent working on Rust Engine.
 Read this file, `docs/ARCHITECTURE.md`, `docs/ROADMAP.md`, and `docs/VERIFICATION.md`

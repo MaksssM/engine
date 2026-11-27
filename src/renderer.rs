@@ -22,8 +22,9 @@ const CUBE_INDEX_COUNT: u32 = 36;
 
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
 #[repr(C)]
-struct CameraUniform {
-    view_proj: [[f32; 4]; 4],
+pub struct CameraUniform {
+    pub view_proj: [[f32; 4]; 4],
+    pub camera_pos: [f32; 4],
 }
 
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
@@ -47,19 +48,40 @@ struct MaterialUniform {
     color: [f32; 4],
 }
 
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+#[repr(C)]
+pub struct PbrMaterialUniform {
+    pub base_color_factor: [f32; 4],
+    pub emissive_and_cutoff: [f32; 4],
+    pub pbr_factors: [f32; 4],
+    pub flags: [u32; 4],
+}
+
+impl Default for PbrMaterialUniform {
+    fn default() -> Self {
+        Self {
+            base_color_factor: [1.0, 1.0, 1.0, 1.0],
+            emissive_and_cutoff: [0.0, 0.0, 0.0, 0.5],
+            pbr_factors: [0.0, 0.5, 0.0, 0.0],
+            flags: [0, 0, 0, 0],
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
 #[repr(C)]
-struct Vertex {
-    position: [f32; 3],
-    color: [f32; 3],
-    normal: [f32; 3],
+pub struct Vertex {
+    pub position: [f32; 3],
+    pub color: [f32; 3],
+    pub normal: [f32; 3],
+    pub uv: [f32; 2],
+    pub tangent: [f32; 4],
 }
 
 impl Vertex {
-    const ATTRIBUTES: [wgpu::VertexAttribute; 3] =
-        wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x3];
+    pub const ATTRIBUTES: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x3, 3 => Float32x2, 4 => Float32x4];
 
-    fn layout() -> wgpu::VertexBufferLayout<'static> {
+    pub fn layout() -> wgpu::VertexBufferLayout<'static> {
         wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<Self>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
@@ -97,6 +119,8 @@ fn cube_vertices() -> [Vertex; CUBE_VERTEX_COUNT] {
                 ],
                 color: colors[face_index],
                 normal,
+                uv: [(corner[0] * 0.5 + 0.5), (corner[1] * 0.5 + 0.5)],
+                tangent: [tangent[0], tangent[1], tangent[2], 1.0],
             };
         }
     }
@@ -138,9 +162,9 @@ pub struct MaterialAsset {
     pub wireframe_pipeline_1x: wgpu::RenderPipeline,
     pub pipeline_4x: wgpu::RenderPipeline,
     pub wireframe_pipeline_4x: wgpu::RenderPipeline,
-    pub color_buffer: wgpu::Buffer,
-    pub color_bind_group: wgpu::BindGroup,
-    pub color_bind_group_layout: wgpu::BindGroupLayout,
+    pub material_buffer: wgpu::Buffer,
+    pub material_bind_group: wgpu::BindGroup,
+    pub material_bind_group_layout: wgpu::BindGroupLayout,
 }
 
 pub struct TextureAsset {
@@ -150,6 +174,9 @@ pub struct TextureAsset {
     pub bind_group: Option<wgpu::BindGroup>,
     pub width: u32,
     pub height: u32,
+    pub is_srgb: bool,
+    pub is_normal_map: bool,
+    pub mip_levels: u32,
 }
 
 #[derive(Component, Clone, Copy)]
@@ -1163,7 +1190,10 @@ pub struct Renderer {
     pub red_material: Handle<MaterialAsset>,
     pub green_material: Handle<MaterialAsset>,
     pub blue_material: Handle<MaterialAsset>,
-    pub color_layout: wgpu::BindGroupLayout,
+    pub fallback_white_view: wgpu::TextureView,
+    pub fallback_normal_view: wgpu::TextureView,
+    pub fallback_black_view: wgpu::TextureView,
+    pub material_layout: wgpu::BindGroupLayout,
     pub model_layout: wgpu::BindGroupLayout,
     pub camera_buffer: wgpu::Buffer,
     pub camera_bind_group: wgpu::BindGroup,
@@ -1436,22 +1466,114 @@ impl Renderer {
                 count: None,
             }],
         });
-        let color_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("material color layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
+        let material_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("material pbr layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                // base_color texture + sampler
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                // metallic_roughness texture + sampler
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                // normal texture + sampler
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                // occlusion texture + sampler
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 8,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                // emissive texture + sampler
+                wgpu::BindGroupLayoutEntry {
+                    binding: 9,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 10,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("scene pipeline layout"),
-            bind_group_layouts: &[&camera_layout, &model_layout, &light_layout, &color_layout],
+            bind_group_layouts: &[
+                &camera_layout,
+                &model_layout,
+                &light_layout,
+                &material_layout,
+            ],
             push_constant_ranges: &[],
         });
 
@@ -1589,7 +1711,7 @@ impl Renderer {
             },
         );
 
-        let material_color_layout = color_layout.clone();
+        let material_color_layout = material_layout.clone();
 
         let create_material = |device: &wgpu::Device,
                                queue: &wgpu::Queue,
@@ -1600,25 +1722,182 @@ impl Renderer {
                                wireframe_pipeline_4x: &wgpu::RenderPipeline,
                                layout: &wgpu::BindGroupLayout|
          -> MaterialAsset {
-            let color_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("material color"),
-                size: std::mem::size_of::<MaterialUniform>() as u64,
+            let material_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("material pbr"),
+                size: std::mem::size_of::<PbrMaterialUniform>() as u64,
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-            queue.write_buffer(
-                &color_buffer,
-                0,
-                bytemuck::bytes_of(&MaterialUniform { color }),
-            );
+            let mut uniform = PbrMaterialUniform::default();
+            uniform.base_color_factor = color;
+            queue.write_buffer(&material_buffer, 0, bytemuck::bytes_of(&uniform));
 
-            let color_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("material color bind group"),
+            // Create fallback textures for missing material bindings
+            let white_tex = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("builtin white"),
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &white_tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &[255u8, 255, 255, 255],
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4),
+                    rows_per_image: Some(1),
+                },
+                wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+            );
+            let white_view = white_tex.create_view(&wgpu::TextureViewDescriptor::default());
+
+            let flat_normal_tex = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("builtin flat normal"),
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &flat_normal_tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &[128u8, 128, 255, 255],
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4),
+                    rows_per_image: Some(1),
+                },
+                wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+            );
+            let normal_view = flat_normal_tex.create_view(&wgpu::TextureViewDescriptor::default());
+
+            let black_tex = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("builtin black"),
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &black_tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &[0u8, 0, 0, 255],
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4),
+                    rows_per_image: Some(1),
+                },
+                wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+            );
+            let black_view = black_tex.create_view(&wgpu::TextureViewDescriptor::default());
+
+            let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some("builtin sampler"),
+                address_mode_u: wgpu::AddressMode::Repeat,
+                address_mode_v: wgpu::AddressMode::Repeat,
+                address_mode_w: wgpu::AddressMode::Repeat,
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                mipmap_filter: wgpu::FilterMode::Linear,
+                ..Default::default()
+            });
+
+            let material_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("material pbr bind group"),
                 layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: color_buffer.as_entire_binding(),
-                }],
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: material_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&white_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(&white_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::Sampler(&sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::TextureView(&normal_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: wgpu::BindingResource::Sampler(&sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: wgpu::BindingResource::TextureView(&black_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 8,
+                        resource: wgpu::BindingResource::Sampler(&sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 9,
+                        resource: wgpu::BindingResource::TextureView(&black_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 10,
+                        resource: wgpu::BindingResource::Sampler(&sampler),
+                    },
+                ],
             });
 
             MaterialAsset {
@@ -1626,9 +1905,9 @@ impl Renderer {
                 wireframe_pipeline_1x: wireframe_pipeline_1x.clone(),
                 pipeline_4x: pipeline_4x.clone(),
                 wireframe_pipeline_4x: wireframe_pipeline_4x.clone(),
-                color_buffer,
-                color_bind_group,
-                color_bind_group_layout: layout.clone(),
+                material_buffer,
+                material_bind_group,
+                material_bind_group_layout: layout.clone(),
             }
         };
 
@@ -1684,6 +1963,115 @@ impl Renderer {
                 &material_color_layout,
             ),
         );
+
+        // Create standalone fallback texture views for material texture lookups.
+        let fallback_white_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("fallback white"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &fallback_white_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &[255u8, 255, 255, 255],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        let fallback_white_view =
+            fallback_white_tex.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let fallback_normal_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("fallback normal"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &fallback_normal_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &[128u8, 128, 255, 255],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        let fallback_normal_view =
+            fallback_normal_tex.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let fallback_black_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("fallback black"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &fallback_black_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &[0u8, 0, 0, 255],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        let fallback_black_view =
+            fallback_black_tex.create_view(&wgpu::TextureViewDescriptor::default());
 
         let scene_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("scene sampler"),
@@ -1775,6 +2163,9 @@ impl Renderer {
             red_material,
             green_material,
             blue_material,
+            fallback_white_view,
+            fallback_normal_view,
+            fallback_black_view,
             camera_buffer,
             camera_bind_group,
             camera_layout,
@@ -1825,7 +2216,7 @@ impl Renderer {
             frame_vertices: 0,
             frame_shadow_casters: 0,
             frame_passes: 0,
-            color_layout,
+            material_layout,
             model_layout,
             frame_candidates: 0,
             frame_culled: 0,
@@ -2028,6 +2419,7 @@ impl Renderer {
         let view = Mat4::look_at_rh(self.camera_position, self.camera_target, Vec3::Y);
         let camera = CameraUniform {
             view_proj: (projection * view).to_cols_array_2d(),
+            camera_pos: self.camera_position.extend(1.0).into(),
         };
         self.queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&camera));
@@ -2139,6 +2531,8 @@ impl Renderer {
                 position: mv.position,
                 color: [1.0, 1.0, 1.0],
                 normal: mv.normal,
+                uv: mv.tex_coords,
+                tangent: mv.tangent,
             })
             .collect();
         let vertex_bytes: &[u8] = bytemuck::cast_slice(&vertices);
@@ -2228,42 +2622,150 @@ impl Renderer {
                 panic!("Cube material missing in Renderer");
             };
 
-        let color_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some(&format!("material color {}", asset_id)),
-            size: std::mem::size_of::<MaterialUniform>() as u64,
+        // Build PBR material uniform
+        let mut uniform = PbrMaterialUniform::default();
+        uniform.base_color_factor = material_data.base_color_factor;
+        uniform.emissive_and_cutoff = [
+            material_data.emissive_factor[0],
+            material_data.emissive_factor[1],
+            material_data.emissive_factor[2],
+            material_data.alpha_cutoff,
+        ];
+        uniform.pbr_factors = [
+            material_data.metallic_factor,
+            material_data.roughness_factor,
+            0.0,
+            0.0,
+        ];
+        // Derive flags
+        let mut flags = 0u32;
+        if material_data.base_color_texture.is_some() {
+            flags |= 1 << 0;
+        }
+        if material_data.metallic_roughness_texture.is_some() {
+            flags |= 1 << 1;
+        }
+        if material_data.normal_texture.is_some() {
+            flags |= 1 << 2;
+        }
+        if material_data.occlusion_texture.is_some() {
+            flags |= 1 << 3;
+        }
+        if material_data.emissive_texture.is_some() {
+            flags |= 1 << 4;
+        }
+        match material_data.alpha_mode {
+            crate::gltf_importer::AlphaMode::Opaque => {}
+            crate::gltf_importer::AlphaMode::Mask => flags |= 1 << 16,
+            crate::gltf_importer::AlphaMode::Blend => flags |= 1 << 17,
+        }
+        if material_data.double_sided {
+            flags |= 1 << 18;
+        }
+        uniform.flags = [flags, 0, 0, 0];
+
+        let material_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(&format!("material pbr {}", asset_id)),
+            size: std::mem::size_of::<PbrMaterialUniform>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        self.queue.write_buffer(
-            &color_buffer,
-            0,
-            bytemuck::bytes_of(&MaterialUniform {
-                color: material_data.base_color_factor,
-            }),
+        self.queue
+            .write_buffer(&material_buffer, 0, bytemuck::bytes_of(&uniform));
+
+        let resolve_view = |tex_ref: &Option<crate::gltf_importer::TextureRef>,
+                            fallback: &wgpu::TextureView|
+         -> wgpu::TextureView {
+            if let Some(tr) = tex_ref {
+                if let Some(h) = self.texture_assets.get_by_asset_id(tr.texture_id) {
+                    if let Some(t) = self.texture_assets.get(h) {
+                        return t.view.clone();
+                    }
+                }
+            }
+            fallback.clone()
+        };
+        let base_color_view =
+            resolve_view(&material_data.base_color_texture, &self.fallback_white_view);
+        let mr_view = resolve_view(
+            &material_data.metallic_roughness_texture,
+            &self.fallback_white_view,
         );
-        let color_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let normal_view = resolve_view(&material_data.normal_texture, &self.fallback_normal_view);
+        let occlusion_view =
+            resolve_view(&material_data.occlusion_texture, &self.fallback_white_view);
+        let emissive_view =
+            resolve_view(&material_data.emissive_texture, &self.fallback_black_view);
+
+        let material_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some(&format!("material bind group {}", asset_id)),
-            layout: &self.color_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: color_buffer.as_entire_binding(),
-            }],
+            layout: &self.material_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &material_buffer,
+                        offset: 0,
+                        size: None,
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&base_color_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.scene_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&mr_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(&self.scene_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(&normal_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::Sampler(&self.scene_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::TextureView(&occlusion_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: wgpu::BindingResource::Sampler(&self.scene_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: wgpu::BindingResource::TextureView(&emissive_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: wgpu::BindingResource::Sampler(&self.scene_sampler),
+                },
+            ],
         });
 
+        // (fallback handling now done via resolve_view closures above)
         let material_asset = MaterialAsset {
-            pipeline_1x: p1,
-            wireframe_pipeline_1x: wp1,
-            pipeline_4x: p4,
-            wireframe_pipeline_4x: wp4,
-            color_buffer,
-            color_bind_group,
-            color_bind_group_layout: self.color_layout.clone(),
+            material_buffer,
+            material_bind_group,
+            material_bind_group_layout: self.material_layout.clone(),
+            pipeline_1x: p1.clone(),
+            pipeline_4x: p4.clone(),
+            wireframe_pipeline_1x: wp1.clone(),
+            wireframe_pipeline_4x: wp4.clone(),
         };
-
         let handle =
             self.material_assets
                 .insert_with_id(asset_id.to_string(), asset_id, material_asset);
-        let gpu_bytes = std::mem::size_of::<MaterialUniform>();
+        let gpu_bytes = std::mem::size_of::<PbrMaterialUniform>();
         self.gpu_registry.register_upload(
             asset_id,
             revision,
@@ -2340,6 +2842,9 @@ impl Renderer {
             bind_group: None,
             width,
             height,
+            is_srgb: true,
+            is_normal_map: false,
+            mip_levels: 1,
         };
         let handle =
             self.texture_assets
@@ -2460,6 +2965,7 @@ impl Renderer {
         );
         let cam = CameraUniform {
             view_proj: (proj_mat * view_mat).to_cols_array_2d(),
+            camera_pos: eye.extend(1.0).into(),
         };
         self.queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&cam));
@@ -2523,7 +3029,7 @@ impl Renderer {
                     pass.set_bind_group(0, &self.camera_bind_group, &[]);
                     pass.set_bind_group(1, model_group, &[]);
                     pass.set_bind_group(2, &self.light_bind_group, &[]);
-                    pass.set_bind_group(3, &material.color_bind_group, &[]);
+                    pass.set_bind_group(3, &material.material_bind_group, &[]);
                     pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                     pass.set_index_buffer(mesh.index_buffer.slice(..), mesh.index_format);
                     pass.draw_indexed(0..mesh.index_count, 0, 0..1);
@@ -2669,6 +3175,7 @@ impl Renderer {
         let view_proj = camera.view_proj(width as f32 / height.max(1) as f32);
         let cam = CameraUniform {
             view_proj: view_proj.to_cols_array_2d(),
+            camera_pos: camera.position.extend(1.0).into(),
         };
         self.queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&cam));
@@ -2752,7 +3259,7 @@ impl Renderer {
                 pass.set_bind_group(0, &self.camera_bind_group, &[]);
                 pass.set_bind_group(1, model_group, &[]);
                 pass.set_bind_group(2, &self.light_bind_group, &[]);
-                pass.set_bind_group(3, &material.color_bind_group, &[]);
+                pass.set_bind_group(3, &material.material_bind_group, &[]);
                 pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                 pass.set_index_buffer(mesh.index_buffer.slice(..), mesh.index_format);
                 pass.draw_indexed(0..mesh.index_count, 0, 0..1);
@@ -2868,7 +3375,7 @@ impl Renderer {
             pass.set_bind_group(0, &self.camera_bind_group, &[]);
             pass.set_bind_group(1, bind_group, &[]);
             pass.set_bind_group(2, &self.light_bind_group, &[]);
-            pass.set_bind_group(3, &material.color_bind_group, &[]);
+            pass.set_bind_group(3, &material.material_bind_group, &[]);
             pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
             pass.set_index_buffer(mesh.index_buffer.slice(..), mesh.index_format);
             pass.draw_indexed(0..mesh.index_count, 0, 0..1);
