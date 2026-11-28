@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     marker::PhantomData,
     sync::Arc,
 };
@@ -402,22 +402,42 @@ mod tests {
             .insert(key, buffer);
     }
 
+    type PendingMap = HashMap<(Handle<MeshAsset>, ModelKey), (wgpu::Buffer, wgpu::BindGroup)>;
+
+    /// Lifecycle tests exercise the exact production reconciliation algorithm by
+    /// calling `reconcile_pending_model_uploads` directly. There is no separate copy
+    /// of the lifecycle logic to drift out of sync with `Renderer`.
     fn retry_pending_for_lifecycle(
         manager: &mut AssetManager<MeshAsset>,
-        pending: &mut VecDeque<(Handle<MeshAsset>, ModelKey, wgpu::Buffer, wgpu::BindGroup)>,
+        pending: &mut PendingMap,
+        active_keys: &[(u64, u64)],
     ) {
-        let queue: Vec<_> = pending.drain(..).collect();
-        for (mesh_handle, key, buffer, bind_group) in queue {
-            if manager.get_ref(mesh_handle).is_none() {
-                continue;
-            }
-            let Some(mesh_mut) = manager.get_mut(mesh_handle) else {
-                pending.push_back((mesh_handle, key, buffer, bind_group));
-                continue;
-            };
-            mesh_mut.model_buffers.insert(key, buffer);
-            mesh_mut.model_bind_groups.insert(key, bind_group);
-        }
+        reconcile_pending_model_uploads(manager, pending, active_keys);
+    }
+
+    /// Build a pending buffer/bind group pair for `mesh` at `key`.
+    fn pending_entry(
+        device: &wgpu::Device,
+        manager: &AssetManager<MeshAsset>,
+        mesh: Handle<MeshAsset>,
+        key: ModelKey,
+        label: &str,
+    ) -> (wgpu::Buffer, wgpu::BindGroup) {
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: 64,
+            usage: wgpu::BufferUsages::UNIFORM,
+            mapped_at_creation: false,
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &manager.get_ref(mesh).unwrap().model_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: buffer.as_entire_binding(),
+            }],
+        });
+        (buffer, bind_group)
     }
 
     #[test]
@@ -537,25 +557,14 @@ mod tests {
     #[test]
     fn pending_model_uploads_retry_drop_and_self_heal() {
         let (device, mut manager, mesh) = lifecycle_manager();
-        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("pending"),
-            size: 64,
-            usage: wgpu::BufferUsages::UNIFORM,
-            mapped_at_creation: false,
-        });
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &manager.get_ref(mesh).unwrap().model_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: buffer.as_entire_binding(),
-            }],
-        });
-        let mut pending: VecDeque<_> = VecDeque::new();
-        pending.push_back((mesh, (mesh.id(), 7), buffer, bind_group));
+        let mut pending: PendingMap = HashMap::new();
+        pending.insert(
+            (mesh, (mesh.id(), 7)),
+            pending_entry(&device, &manager, mesh, (mesh.id(), 7), "pending"),
+        );
 
         // Retry succeeds once the Arc is unique again.
-        retry_pending_for_lifecycle(&mut manager, &mut pending);
+        retry_pending_for_lifecycle(&mut manager, &mut pending, &[(mesh.id(), 7)]);
         assert!(pending.is_empty());
         assert!(
             manager
@@ -566,24 +575,278 @@ mod tests {
         );
 
         // Pending entry for a removed mesh is dropped, not re-queued.
-        let buffer2 = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("pending2"),
-            size: 64,
-            usage: wgpu::BufferUsages::UNIFORM,
-            mapped_at_creation: false,
-        });
-        let bg2 = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &manager.get_ref(mesh).unwrap().model_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: buffer2.as_entire_binding(),
-            }],
-        });
         let removed_mesh = Handle::<MeshAsset>::from_id(999);
-        pending.push_back((removed_mesh, (999, 1), buffer2, bg2));
-        retry_pending_for_lifecycle(&mut manager, &mut pending);
+        pending.insert(
+            (removed_mesh, (999, 1)),
+            pending_entry(&device, &manager, mesh, (999, 1), "pending2"),
+        );
+        retry_pending_for_lifecycle(&mut manager, &mut pending, &[(999, 1)]);
         assert!(pending.is_empty());
+    }
+
+    /// 1. Repeated sync attempts for the same mesh/entity while the asset is shared
+    /// do not create duplicate pending entries. Exercises the production allocation
+    /// guard `create_and_queue_pending_upload` (used by `sync_mesh_transform`) to
+    /// verify that the closure (resource creation) is invoked exactly once for a new
+    /// key and never for an already-pending key.
+    #[test]
+    fn pending_uploads_are_deduplicated_per_key() {
+        let (device, mut manager, mesh) = lifecycle_manager();
+        let mut pending: PendingMap = HashMap::new();
+        let key = (mesh.id(), 7);
+        let mut alloc_count: u32 = 0;
+
+        // First call: the closure must be invoked (allocation happens).
+        let queued = create_and_queue_pending_upload(&mut pending, mesh, key, || {
+            alloc_count += 1;
+            pending_entry(&device, &manager, mesh, key, "dup")
+        });
+        assert!(queued, "first upload for {key:?} must be queued");
+        assert_eq!(alloc_count, 1, "closure must be invoked exactly once");
+        assert_eq!(pending.len(), 1);
+
+        // Subsequent attempts for the same key: the closure must NOT be called.
+        for _ in 0..3 {
+            let queued = create_and_queue_pending_upload(&mut pending, mesh, key, || {
+                alloc_count += 1;
+                pending_entry(&device, &manager, mesh, key, "dup")
+            });
+            assert!(!queued, "duplicate upload for {key:?} must be rejected");
+        }
+        assert_eq!(alloc_count, 1, "closure must not be called for duplicates");
+        assert_eq!(pending.len(), 1, "still exactly one pending entry");
+
+        // A different key must invoke the closure.
+        let key2 = (mesh.id(), 42);
+        let queued = create_and_queue_pending_upload(&mut pending, mesh, key2, || {
+            alloc_count += 1;
+            pending_entry(&device, &manager, mesh, key2, "dup2")
+        });
+        assert!(queued, "new key {key2:?} must be queued");
+        assert_eq!(alloc_count, 2, "closure must be invoked for a new key");
+        assert_eq!(pending.len(), 2);
+
+        // Both entries are still applied once the Arc becomes unique.
+        retry_pending_for_lifecycle(&mut manager, &mut pending, &[key, key2]);
+        assert!(pending.is_empty());
+        assert!(
+            manager
+                .get_ref(mesh)
+                .unwrap()
+                .model_buffers
+                .contains_key(&key)
+        );
+        assert!(
+            manager
+                .get_ref(mesh)
+                .unwrap()
+                .model_buffers
+                .contains_key(&key2)
+        );
+    }
+
+    /// 2. Once the extra `Arc` is dropped, the pending upload is applied.
+    #[test]
+    fn pending_upload_applies_after_arc_dropped() {
+        let (device, mut manager, mesh) = lifecycle_manager();
+        let key = (mesh.id(), 9);
+        // Hold an extra Arc clone so get_mut would fail.
+        let shared = manager.get(mesh).unwrap();
+        let mut pending: PendingMap = HashMap::new();
+        pending.insert(
+            (mesh, key),
+            pending_entry(&device, &manager, mesh, key, "arc"),
+        );
+
+        // While shared, retry keeps the entry pending.
+        retry_pending_for_lifecycle(&mut manager, &mut pending, &[key]);
+        assert_eq!(pending.len(), 1);
+        assert!(
+            !manager
+                .get_ref(mesh)
+                .unwrap()
+                .model_buffers
+                .contains_key(&key)
+        );
+
+        // Drop the extra Arc; next retry applies it.
+        drop(shared);
+        retry_pending_for_lifecycle(&mut manager, &mut pending, &[key]);
+        assert!(pending.is_empty());
+        assert!(
+            manager
+                .get_ref(mesh)
+                .unwrap()
+                .model_buffers
+                .contains_key(&key)
+        );
+    }
+
+    /// 3. Despawning an entity removes its pending upload.
+    #[test]
+    fn despawn_removes_pending_upload() {
+        let (device, mut manager, mesh) = lifecycle_manager();
+        let key = (mesh.id(), 11);
+        let mut pending: PendingMap = HashMap::new();
+        pending.insert(
+            (mesh, key),
+            pending_entry(&device, &manager, mesh, key, "despawn"),
+        );
+
+        // Entity no longer in the living key set (despawned).
+        retry_pending_for_lifecycle(&mut manager, &mut pending, &[]);
+        assert!(pending.is_empty());
+        assert!(
+            !manager
+                .get_ref(mesh)
+                .unwrap()
+                .model_buffers
+                .contains_key(&key)
+        );
+        assert!(
+            !manager
+                .get_ref(mesh)
+                .unwrap()
+                .model_bind_groups
+                .contains_key(&key)
+        );
+    }
+
+    /// 4. Replacing an entity's mesh removes the old pending upload but preserves
+    /// the new valid one, eventually applying it once the asset becomes unique.
+    #[test]
+    fn mesh_swap_drops_old_pending_keeps_new() {
+        let (device, mut manager, mesh_a) = lifecycle_manager();
+        let mesh_b = manager.insert("lifecycle-b".to_string(), lifecycle_mesh_for_test(&device));
+        let key_a = (mesh_a.id(), 13);
+        let key_b = (mesh_b.id(), 13);
+        let mut pending: PendingMap = HashMap::new();
+        pending.insert(
+            (mesh_a, key_a),
+            pending_entry(&device, &manager, mesh_a, key_a, "a"),
+        );
+        // Hold an extra Arc so mesh_b's pending entry cannot be applied yet.
+        let shared_b = manager.get(mesh_b).unwrap();
+        pending.insert(
+            (mesh_b, key_b),
+            pending_entry(&device, &manager, mesh_b, key_b, "b"),
+        );
+
+        // Entity now references mesh_b only.
+        retry_pending_for_lifecycle(&mut manager, &mut pending, &[key_b]);
+        assert!(!pending.contains_key(&(mesh_a, key_a)));
+        assert!(pending.contains_key(&(mesh_b, key_b)));
+        // The old pending entry produced no GPU objects on mesh_a.
+        assert!(
+            !manager
+                .get_ref(mesh_a)
+                .unwrap()
+                .model_buffers
+                .contains_key(&key_a)
+        );
+        assert!(
+            !manager
+                .get_ref(mesh_a)
+                .unwrap()
+                .model_bind_groups
+                .contains_key(&key_a)
+        );
+
+        // Drop the extra Arc; next retry applies mesh_b's pending upload.
+        drop(shared_b);
+        retry_pending_for_lifecycle(&mut manager, &mut pending, &[key_b]);
+        assert!(pending.is_empty());
+        let mesh_b_ref = manager.get_ref(mesh_b).unwrap();
+        assert!(mesh_b_ref.model_buffers.contains_key(&key_b));
+        assert!(mesh_b_ref.model_bind_groups.contains_key(&key_b));
+    }
+
+    /// 5. Removing a mesh asset discards its pending upload so the GPU buffer and
+    /// bind group are dropped (the map no longer retains them) rather than leaked.
+    #[test]
+    fn removed_mesh_asset_discards_pending_upload() {
+        let (device, mut manager, mesh) = lifecycle_manager();
+        let key = (mesh.id(), 15);
+        let mut pending: PendingMap = HashMap::new();
+        pending.insert(
+            (mesh, key),
+            pending_entry(&device, &manager, mesh, key, "removed"),
+        );
+        assert_eq!(pending.len(), 1);
+
+        // Drop the mesh asset, then retry: entry is discarded even if key is "live".
+        manager.remove(mesh);
+        retry_pending_for_lifecycle(&mut manager, &mut pending, &[key]);
+        // The pending map no longer owns the buffer/bind group: they are dropped.
+        assert!(pending.is_empty());
+        assert!(manager.get_ref(mesh).is_none());
+    }
+
+    /// 6. Entity index/generation reuse does not let an old pending upload attach
+    /// to a new entity (full `to_bits()` key includes generation).
+    #[test]
+    fn generation_reuse_does_not_attach_old_pending() {
+        let (device, mut manager, mesh) = lifecycle_manager();
+        let material = Handle::<MaterialAsset>::default();
+        let mut world = World::new();
+        let old = world.spawn((Renderable { mesh, material },)).id();
+        let old_key = (mesh.id(), old.to_bits());
+        let mut pending: PendingMap = HashMap::new();
+        pending.insert(
+            (mesh, old_key),
+            pending_entry(&device, &manager, mesh, old_key, "gen"),
+        );
+
+        world.despawn(old);
+        let new = world.spawn((Renderable { mesh, material },)).id();
+        assert_eq!(old.index(), new.index());
+        assert_ne!(old.to_bits(), new.to_bits());
+        let new_key = (mesh.id(), new.to_bits());
+
+        // Only the new entity's key is live; old pending must be dropped.
+        retry_pending_for_lifecycle(&mut manager, &mut pending, &[new_key]);
+        assert!(pending.is_empty());
+        assert!(
+            !manager
+                .get_ref(mesh)
+                .unwrap()
+                .model_buffers
+                .contains_key(&old_key)
+        );
+    }
+
+    /// 7. Preview sentinel `(mesh_id, 0)` pending upload is preserved while the mesh
+    /// asset is shared, even with no living entities, and applied once it is unique.
+    #[test]
+    fn preview_sentinel_pending_is_preserved() {
+        let (device, mut manager, mesh) = lifecycle_manager();
+        let sentinel = (mesh.id(), 0);
+        let mut pending: PendingMap = HashMap::new();
+        // Hold an extra Arc so the sentinel cannot be applied on the first retry.
+        let shared = manager.get(mesh).unwrap();
+        pending.insert(
+            (mesh, sentinel),
+            pending_entry(&device, &manager, mesh, sentinel, "sentinel"),
+        );
+
+        // No living entities, but the sentinel survives (kept pending while shared).
+        retry_pending_for_lifecycle(&mut manager, &mut pending, &[]);
+        assert_eq!(pending.len(), 1, "sentinel must stay pending while shared");
+        assert!(
+            !manager
+                .get_ref(mesh)
+                .unwrap()
+                .model_buffers
+                .contains_key(&sentinel)
+        );
+
+        // Drop the extra Arc; next retry applies the sentinel.
+        drop(shared);
+        retry_pending_for_lifecycle(&mut manager, &mut pending, &[]);
+        assert!(pending.is_empty());
+        let mesh_ref = manager.get_ref(mesh).unwrap();
+        assert!(mesh_ref.model_buffers.contains_key(&sentinel));
+        assert!(mesh_ref.model_bind_groups.contains_key(&sentinel));
     }
 
     /// Frustum culling integration tests.
@@ -1925,10 +2188,11 @@ pub struct Renderer {
     pub frame_instanced_objects: u64,
     pub frame_visible: u32,
     pub gpu_pass_timings: Option<crate::performance::GpuPassTimings>,
-    /// Model GPU objects created while `Arc<MeshAsset>` was shared. Retried by
-    /// `process_gpu_cleanup` once the extra Arc is dropped.
+    /// Model GPU objects created while `Arc<MeshAsset>` was shared. Keyed by
+    /// `(mesh_handle, ModelKey)` so at most one pending upload exists per resource.
+    /// Reconciled against living entity keys and retried by `process_gpu_cleanup`.
     pub(crate) pending_model_uploads:
-        VecDeque<(Handle<MeshAsset>, ModelKey, wgpu::Buffer, wgpu::BindGroup)>,
+        HashMap<(Handle<MeshAsset>, ModelKey), (wgpu::Buffer, wgpu::BindGroup)>,
     pub _shader_variant: PhantomData<ShaderVariant>,
 }
 
@@ -1967,6 +2231,67 @@ pub(crate) fn cleanup_stale_model_resources(
         }
     }
     removed
+}
+
+/// Reconcile a pending-upload map against the living renderable key set and apply
+/// any entry whose mesh asset is now uniquely mutable. This is the single source of
+/// truth for pending-upload lifecycle; both `Renderer::retry_pending_model_uploads`
+/// and the lifecycle tests call it so the tested algorithm is the one used at runtime.
+///
+/// A pending entry is kept only if its `(mesh_id, entity_bits)` is still live (or is
+/// the preview sentinel `entity_bits == 0`) AND the mesh asset still exists. Entries
+/// that fail either check are dropped (their buffer + bind group are freed together).
+/// While the asset is still shared (`Arc::get_mut` returns `None`) the single entry is
+/// re-queued for a later frame instead of being duplicated or discarded.
+pub(crate) fn reconcile_pending_model_uploads(
+    mesh_assets: &mut AssetManager<MeshAsset>,
+    pending: &mut HashMap<(Handle<MeshAsset>, ModelKey), (wgpu::Buffer, wgpu::BindGroup)>,
+    active_keys: &[(u64, u64)],
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let active: HashSet<(u64, u64)> = HashSet::from_iter(active_keys.iter().copied());
+    let drained: Vec<_> = pending.drain().collect();
+    for ((mesh_handle, key), (buffer, bind_group)) in drained {
+        // Drop pending uploads for unloaded meshes, despawned entities, or entities
+        // that switched to another mesh. The sentinel (key.1 == 0) is always kept.
+        let still_relevant = key.1 == 0 || active.contains(&key);
+        if !still_relevant || mesh_assets.get_ref(mesh_handle).is_none() {
+            continue;
+        }
+        let Some(mesh_mut) = mesh_assets.get_mut(mesh_handle) else {
+            // Asset still shared; keep the single pending entry for a later frame.
+            pending.insert((mesh_handle, key), (buffer, bind_group));
+            continue;
+        };
+        mesh_mut.model_buffers.insert(key, buffer);
+        mesh_mut.model_bind_groups.insert(key, bind_group);
+    }
+}
+
+/// Check whether `(mesh_handle, key)` is already pending; if not, invoke `create_fn`
+/// to produce the GPU resources and insert them. Returns `true` when the closure was
+/// invoked and a new entry was queued; `false` when the key was already pending and
+/// the closure was NOT called (no GPU allocation).
+///
+/// This is the single allocation-guard used by `sync_mesh_transform` at runtime and
+/// by the deduplication test, ensuring the tested path is the one used in production.
+pub(crate) fn create_and_queue_pending_upload<F>(
+    pending: &mut HashMap<(Handle<MeshAsset>, ModelKey), (wgpu::Buffer, wgpu::BindGroup)>,
+    mesh_handle: Handle<MeshAsset>,
+    key: ModelKey,
+    create_fn: F,
+) -> bool
+where
+    F: FnOnce() -> (wgpu::Buffer, wgpu::BindGroup),
+{
+    if pending.contains_key(&(mesh_handle, key)) {
+        return false;
+    }
+    let (buffer, bind_group) = create_fn();
+    pending.insert((mesh_handle, key), (buffer, bind_group));
+    true
 }
 
 impl Renderer {
@@ -2937,7 +3262,7 @@ impl Renderer {
             frame_instanced_objects: 0,
             frame_visible: 0,
             gpu_pass_timings: None,
-            pending_model_uploads: VecDeque::new(),
+            pending_model_uploads: HashMap::new(),
             _shader_variant: PhantomData,
         };
         // Initialize render targets (depth, MSAA, scene texture for post-processing)
@@ -3170,45 +3495,72 @@ impl Renderer {
         transform: Mat4,
     ) {
         let key = (mesh_handle.id(), key_id);
+        // Already deferred for this exact resource? Do not allocate a duplicate
+        // buffer/bind group every frame while the asset stays shared.
+        if self.pending_model_uploads.contains_key(&(mesh_handle, key)) {
+            return;
+        }
         let needs_model_buffer = self
             .mesh_assets
             .get_ref(mesh_handle)
             .is_some_and(|mesh| !mesh.model_buffers.contains_key(&key));
         if needs_model_buffer {
-            let Some(model_layout) = self
-                .mesh_assets
-                .get_ref(mesh_handle)
-                .map(|mesh| &mesh.model_layout)
-            else {
-                return;
-            };
-            let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("model"),
-                size: std::mem::size_of::<ModelUniform>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("model bind group"),
-                layout: model_layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: buffer.as_entire_binding(),
-                }],
-            });
-            match self.mesh_assets.get_mut(mesh_handle) {
-                Some(mesh_mut) => {
-                    mesh_mut.model_buffers.insert(key, buffer);
-                    mesh_mut.model_bind_groups.insert(key, bind_group);
-                }
+            if let Some(mesh_mut) = self.mesh_assets.get_mut(mesh_handle) {
+                // Asset uniquely owned: create GPU resources and insert directly.
+                let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("model"),
+                    size: std::mem::size_of::<ModelUniform>() as u64,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("model bind group"),
+                    layout: &mesh_mut.model_layout,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: buffer.as_entire_binding(),
+                    }],
+                });
+                mesh_mut.model_buffers.insert(key, buffer);
+                mesh_mut.model_bind_groups.insert(key, bind_group);
+            } else {
                 // Another subsystem temporarily holds an `Arc<MeshAsset>` clone, so
                 // `Arc::get_mut` cannot hand out `&mut`. Keep ownership in the renderer
-                // and retry on a later frame instead of dropping the new GPU objects.
-                None => {
-                    self.pending_model_uploads
-                        .push_back((mesh_handle, key, buffer, bind_group));
-                    return;
-                }
+                // (at most one entry per key) and retry on a later frame instead of
+                // dropping or duplicating the new GPU objects.
+                //
+                // `create_and_queue_pending_upload` is the single allocation guard:
+                // the closure that creates GPU resources is invoked only when the key
+                // is not already pending, preventing duplicate allocations.
+                let device = &self.device;
+                let mesh_assets = &self.mesh_assets;
+                create_and_queue_pending_upload(
+                    &mut self.pending_model_uploads,
+                    mesh_handle,
+                    key,
+                    || {
+                        let model_layout = &mesh_assets
+                            .get_ref(mesh_handle)
+                            .expect("mesh asset exists for pending upload")
+                            .model_layout;
+                        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                            label: Some("model"),
+                            size: std::mem::size_of::<ModelUniform>() as u64,
+                            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                            mapped_at_creation: false,
+                        });
+                        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("model bind group"),
+                            layout: model_layout,
+                            entries: &[wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: buffer.as_entire_binding(),
+                            }],
+                        });
+                        (buffer, bind_group)
+                    },
+                );
+                return;
             }
         }
         let model = ModelUniform {
@@ -3236,31 +3588,27 @@ impl Renderer {
     /// Drop per-entity GPU resources whose entity no longer has a `Renderable`.
     /// `active_keys` must come from living ECS entities, not the visible-frame snapshot.
     /// The preview sentinel key `(mesh_id, 0)` is preserved.
-    /// Also retries model uploads deferred because an external `Arc<MeshAsset>` was alive.
+    /// Also reconciles and retries deferred model uploads: pending entries for
+    /// despawned entities, swapped meshes, or unloaded mesh assets are dropped;
+    /// valid entries are inserted once the asset becomes uniquely mutable.
     pub fn process_gpu_cleanup(&mut self, active_keys: &[(u64, u64)]) {
-        self.retry_pending_model_uploads();
+        self.retry_pending_model_uploads(active_keys);
         cleanup_stale_model_resources(&mut self.mesh_assets, active_keys);
     }
 
-    fn retry_pending_model_uploads(&mut self) {
-        if self.pending_model_uploads.is_empty() {
-            return;
-        }
-        let pending: Vec<_> = self.pending_model_uploads.drain(..).collect();
-        for (mesh_handle, key, buffer, bind_group) in pending {
-            if self.mesh_assets.get_ref(mesh_handle).is_none() {
-                // The mesh asset was unloaded while an upload was pending. Drop the
-                // GPU objects instead of re-queueing them forever.
-                continue;
-            }
-            let Some(mesh_mut) = self.mesh_assets.get_mut(mesh_handle) else {
-                self.pending_model_uploads
-                    .push_back((mesh_handle, key, buffer, bind_group));
-                continue;
-            };
-            mesh_mut.model_buffers.insert(key, buffer);
-            mesh_mut.model_bind_groups.insert(key, bind_group);
-        }
+    /// Reconcile `pending_model_uploads` against the living renderable key set and
+    /// apply any entry whose mesh asset is now uniquely mutable.
+    ///
+    /// A pending entry is kept only if its `(mesh_id, entity_bits)` is still live
+    /// (or is the preview sentinel `entity_bits == 0`) AND the mesh asset exists.
+    /// Because the key embeds the full `entity.to_bits()` (index + generation), a
+    /// reused index with a bumped generation never matches an old pending entry.
+    fn retry_pending_model_uploads(&mut self, active_keys: &[(u64, u64)]) {
+        reconcile_pending_model_uploads(
+            &mut self.mesh_assets,
+            &mut self.pending_model_uploads,
+            active_keys,
+        );
     }
 
     /// Dynamically upload or reuse a mesh asset on the GPU based on revision.
