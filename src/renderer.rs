@@ -1,4 +1,8 @@
-use std::{collections::HashMap, marker::PhantomData, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    marker::PhantomData,
+    sync::Arc,
+};
 
 use crate::{
     assets::{AssetManager, Handle},
@@ -251,6 +255,19 @@ pub fn collect_visible_renderables(world: &mut World) -> Vec<RenderableInstance>
         .collect()
 }
 
+/// Keys for every living `Renderable`, including entities hidden this frame.
+///
+/// Visibility and frustum culling decide what is drawn, not whether the entity still
+/// owns its per-instance GPU resources. Cleanup must use this set so a temporarily
+/// hidden object is not treated as despawned.
+pub fn collect_renderable_gpu_keys(world: &mut World) -> Vec<(u64, u64)> {
+    let mut query = world.query::<(Entity, &Renderable)>();
+    query
+        .iter(world)
+        .map(|(entity, renderable)| (renderable.mesh.id(), entity.to_bits()))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,6 +302,551 @@ mod tests {
         let visible = collect_visible_renderables(&mut world);
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].renderable.mesh.id(), visible_mesh.id());
+    }
+
+    #[test]
+    fn hidden_living_entity_is_absent_from_snapshot_but_keeps_gpu_key() {
+        let mut world = World::new();
+        let mesh = Handle::<MeshAsset>::from_id(42);
+        let material = Handle::<MaterialAsset>::from_id(7);
+        let hidden = world
+            .spawn((
+                Renderable { mesh, material },
+                Transform::default(),
+                GlobalTransform::default(),
+                Visible(false),
+            ))
+            .id();
+
+        assert!(collect_visible_renderables(&mut world).is_empty());
+        assert_eq!(
+            collect_renderable_gpu_keys(&mut world),
+            vec![(mesh.id(), hidden.to_bits())]
+        );
+    }
+
+    /// End-to-end ownership test without rendering: ECS keys drive cleanup of
+    /// a synthetic `MeshAsset` whose `model_buffers` act as the per-entity GPU cache.
+    fn lifecycle_manager() -> (wgpu::Device, AssetManager<MeshAsset>, Handle<MeshAsset>) {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::LowPower,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .unwrap();
+        let (device, _queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).unwrap();
+        let mesh = lifecycle_mesh_for_test(&device);
+        let mut manager = AssetManager::<MeshAsset>::default();
+        let handle = manager.insert("lifecycle".to_string(), mesh);
+        (device, manager, handle)
+    }
+
+    fn lifecycle_mesh_for_test(device: &wgpu::Device) -> MeshAsset {
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        MeshAsset {
+            vertex_buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("lc-vb"),
+                size: 64,
+                usage: wgpu::BufferUsages::VERTEX,
+                mapped_at_creation: false,
+            }),
+            index_buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("lc-ib"),
+                size: 64,
+                usage: wgpu::BufferUsages::INDEX,
+                mapped_at_creation: false,
+            }),
+            index_count: 0,
+            vertex_count: 0,
+            index_format: wgpu::IndexFormat::Uint16,
+            bounds: MeshBounds {
+                min: [0.0; 3],
+                max: [0.0; 3],
+            },
+            model_layout: layout,
+            model_buffers: HashMap::new(),
+            model_bind_groups: HashMap::new(),
+        }
+    }
+
+    fn cache_buffer(
+        device: &wgpu::Device,
+        manager: &mut AssetManager<MeshAsset>,
+        mesh: Handle<MeshAsset>,
+        key: (u64, u64),
+    ) {
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("lc-model"),
+            size: 64,
+            usage: wgpu::BufferUsages::UNIFORM,
+            mapped_at_creation: false,
+        });
+        manager
+            .get_mut(mesh)
+            .expect("lifecycle mesh is uniquely owned")
+            .model_buffers
+            .insert(key, buffer);
+    }
+
+    type PendingMap = HashMap<(Handle<MeshAsset>, ModelKey), (wgpu::Buffer, wgpu::BindGroup)>;
+
+    /// Lifecycle tests exercise the exact production reconciliation algorithm by
+    /// calling `reconcile_pending_model_uploads` directly. There is no separate copy
+    /// of the lifecycle logic to drift out of sync with `Renderer`.
+    fn retry_pending_for_lifecycle(
+        manager: &mut AssetManager<MeshAsset>,
+        pending: &mut PendingMap,
+        active_keys: &[(u64, u64)],
+    ) {
+        reconcile_pending_model_uploads(manager, pending, active_keys);
+    }
+
+    /// Build a pending buffer/bind group pair for `mesh` at `key`.
+    fn pending_entry(
+        device: &wgpu::Device,
+        manager: &AssetManager<MeshAsset>,
+        mesh: Handle<MeshAsset>,
+        key: ModelKey,
+        label: &str,
+    ) -> (wgpu::Buffer, wgpu::BindGroup) {
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: 64,
+            usage: wgpu::BufferUsages::UNIFORM,
+            mapped_at_creation: false,
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &manager.get_ref(mesh).unwrap().model_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: buffer.as_entire_binding(),
+            }],
+        });
+        (buffer, bind_group)
+    }
+
+    #[test]
+    fn despawn_removes_key_and_index_reuse_with_new_generation_is_not_aliased() {
+        let (device, mut manager, mesh) = lifecycle_manager();
+        let material = Handle::<MaterialAsset>::default();
+
+        let mut world = World::new();
+        let old = world.spawn((Renderable { mesh, material },)).id();
+        let old_bits = old.to_bits();
+        cache_buffer(&device, &mut manager, mesh, (mesh.id(), old_bits));
+        assert_eq!(
+            collect_renderable_gpu_keys(&mut world),
+            vec![(mesh.id(), old_bits)]
+        );
+
+        world.despawn(old);
+        let removed =
+            cleanup_stale_model_resources(&mut manager, &collect_renderable_gpu_keys(&mut world));
+        assert_eq!(removed, 1);
+
+        // bevy reuses the index with a bumped generation, so the new key differs.
+        let new = world.spawn((Renderable { mesh, material },)).id();
+        assert_eq!(old.index(), new.index());
+        assert_ne!(old_bits, new.to_bits());
+        assert_eq!(
+            collect_renderable_gpu_keys(&mut world),
+            vec![(mesh.id(), new.to_bits())]
+        );
+        let removed =
+            cleanup_stale_model_resources(&mut manager, &collect_renderable_gpu_keys(&mut world));
+        assert_eq!(removed, 0);
+    }
+
+    #[test]
+    fn mesh_swap_on_living_entity_keeps_new_key_and_drops_old_mesh_key() {
+        let (device, mut manager, mesh_a) = lifecycle_manager();
+        let mesh_b = manager.insert("lifecycle-b".to_string(), lifecycle_mesh_for_test(&device));
+
+        let mut world = World::new();
+        let e = world
+            .spawn((Renderable {
+                mesh: mesh_a,
+                material: Handle::default(),
+            },))
+            .id();
+        let bits = e.to_bits();
+        cache_buffer(&device, &mut manager, mesh_a, (mesh_a.id(), bits));
+        cache_buffer(&device, &mut manager, mesh_b, (mesh_b.id(), bits));
+
+        // Swap the mesh while the entity stays alive.
+        world.get_mut::<Renderable>(e).unwrap().mesh = mesh_b;
+        let active = collect_renderable_gpu_keys(&mut world);
+        assert_eq!(active, vec![(mesh_b.id(), bits)]);
+        let removed = cleanup_stale_model_resources(&mut manager, &active);
+        assert_eq!(removed, 1);
+
+        assert!(manager.get_ref(mesh_a).unwrap().model_buffers.is_empty());
+        assert!(
+            manager
+                .get_ref(mesh_b)
+                .unwrap()
+                .model_buffers
+                .contains_key(&(mesh_b.id(), bits))
+        );
+    }
+
+    #[test]
+    fn hidden_living_entity_keeps_cached_buffer_through_cleanup() {
+        let (device, mut manager, mesh) = lifecycle_manager();
+        let mut world = World::new();
+        let hidden = world
+            .spawn((
+                Renderable {
+                    mesh,
+                    material: Handle::default(),
+                },
+                Visible(false),
+            ))
+            .id();
+        let bits = hidden.to_bits();
+        cache_buffer(&device, &mut manager, mesh, (mesh.id(), bits));
+
+        assert!(collect_visible_renderables(&mut world).is_empty());
+        let active = collect_renderable_gpu_keys(&mut world);
+        let removed = cleanup_stale_model_resources(&mut manager, &active);
+        assert_eq!(removed, 0);
+        assert!(
+            manager
+                .get_ref(mesh)
+                .unwrap()
+                .model_buffers
+                .contains_key(&(mesh.id(), bits))
+        );
+    }
+
+    #[test]
+    fn preview_sentinel_survives_cleanup_with_no_living_entities() {
+        let (device, mut manager, mesh) = lifecycle_manager();
+        cache_buffer(&device, &mut manager, mesh, (mesh.id(), 0));
+
+        let mut world = World::new();
+        let removed =
+            cleanup_stale_model_resources(&mut manager, &collect_renderable_gpu_keys(&mut world));
+        assert_eq!(removed, 0);
+        assert!(
+            manager
+                .get_ref(mesh)
+                .unwrap()
+                .model_buffers
+                .contains_key(&(mesh.id(), 0))
+        );
+    }
+
+    /// D2: pending uploads are retried, self-heal after despawn, and are dropped
+    /// (not re-queued forever) when the mesh asset was removed.
+    #[test]
+    fn pending_model_uploads_retry_drop_and_self_heal() {
+        let (device, mut manager, mesh) = lifecycle_manager();
+        let mut pending: PendingMap = HashMap::new();
+        pending.insert(
+            (mesh, (mesh.id(), 7)),
+            pending_entry(&device, &manager, mesh, (mesh.id(), 7), "pending"),
+        );
+
+        // Retry succeeds once the Arc is unique again.
+        retry_pending_for_lifecycle(&mut manager, &mut pending, &[(mesh.id(), 7)]);
+        assert!(pending.is_empty());
+        assert!(
+            manager
+                .get_ref(mesh)
+                .unwrap()
+                .model_buffers
+                .contains_key(&(mesh.id(), 7))
+        );
+
+        // Pending entry for a removed mesh is dropped, not re-queued.
+        let removed_mesh = Handle::<MeshAsset>::from_id(999);
+        pending.insert(
+            (removed_mesh, (999, 1)),
+            pending_entry(&device, &manager, mesh, (999, 1), "pending2"),
+        );
+        retry_pending_for_lifecycle(&mut manager, &mut pending, &[(999, 1)]);
+        assert!(pending.is_empty());
+    }
+
+    /// 1. Repeated sync attempts for the same mesh/entity while the asset is shared
+    /// do not create duplicate pending entries. Exercises the production allocation
+    /// guard `create_and_queue_pending_upload` (used by `sync_mesh_transform`) to
+    /// verify that the closure (resource creation) is invoked exactly once for a new
+    /// key and never for an already-pending key.
+    #[test]
+    fn pending_uploads_are_deduplicated_per_key() {
+        let (device, mut manager, mesh) = lifecycle_manager();
+        let mut pending: PendingMap = HashMap::new();
+        let key = (mesh.id(), 7);
+        let mut alloc_count: u32 = 0;
+
+        // First call: the closure must be invoked (allocation happens).
+        let queued = create_and_queue_pending_upload(&mut pending, mesh, key, || {
+            alloc_count += 1;
+            pending_entry(&device, &manager, mesh, key, "dup")
+        });
+        assert!(queued, "first upload for {key:?} must be queued");
+        assert_eq!(alloc_count, 1, "closure must be invoked exactly once");
+        assert_eq!(pending.len(), 1);
+
+        // Subsequent attempts for the same key: the closure must NOT be called.
+        for _ in 0..3 {
+            let queued = create_and_queue_pending_upload(&mut pending, mesh, key, || {
+                alloc_count += 1;
+                pending_entry(&device, &manager, mesh, key, "dup")
+            });
+            assert!(!queued, "duplicate upload for {key:?} must be rejected");
+        }
+        assert_eq!(alloc_count, 1, "closure must not be called for duplicates");
+        assert_eq!(pending.len(), 1, "still exactly one pending entry");
+
+        // A different key must invoke the closure.
+        let key2 = (mesh.id(), 42);
+        let queued = create_and_queue_pending_upload(&mut pending, mesh, key2, || {
+            alloc_count += 1;
+            pending_entry(&device, &manager, mesh, key2, "dup2")
+        });
+        assert!(queued, "new key {key2:?} must be queued");
+        assert_eq!(alloc_count, 2, "closure must be invoked for a new key");
+        assert_eq!(pending.len(), 2);
+
+        // Both entries are still applied once the Arc becomes unique.
+        retry_pending_for_lifecycle(&mut manager, &mut pending, &[key, key2]);
+        assert!(pending.is_empty());
+        assert!(
+            manager
+                .get_ref(mesh)
+                .unwrap()
+                .model_buffers
+                .contains_key(&key)
+        );
+        assert!(
+            manager
+                .get_ref(mesh)
+                .unwrap()
+                .model_buffers
+                .contains_key(&key2)
+        );
+    }
+
+    /// 2. Once the extra `Arc` is dropped, the pending upload is applied.
+    #[test]
+    fn pending_upload_applies_after_arc_dropped() {
+        let (device, mut manager, mesh) = lifecycle_manager();
+        let key = (mesh.id(), 9);
+        // Hold an extra Arc clone so get_mut would fail.
+        let shared = manager.get(mesh).unwrap();
+        let mut pending: PendingMap = HashMap::new();
+        pending.insert(
+            (mesh, key),
+            pending_entry(&device, &manager, mesh, key, "arc"),
+        );
+
+        // While shared, retry keeps the entry pending.
+        retry_pending_for_lifecycle(&mut manager, &mut pending, &[key]);
+        assert_eq!(pending.len(), 1);
+        assert!(
+            !manager
+                .get_ref(mesh)
+                .unwrap()
+                .model_buffers
+                .contains_key(&key)
+        );
+
+        // Drop the extra Arc; next retry applies it.
+        drop(shared);
+        retry_pending_for_lifecycle(&mut manager, &mut pending, &[key]);
+        assert!(pending.is_empty());
+        assert!(
+            manager
+                .get_ref(mesh)
+                .unwrap()
+                .model_buffers
+                .contains_key(&key)
+        );
+    }
+
+    /// 3. Despawning an entity removes its pending upload.
+    #[test]
+    fn despawn_removes_pending_upload() {
+        let (device, mut manager, mesh) = lifecycle_manager();
+        let key = (mesh.id(), 11);
+        let mut pending: PendingMap = HashMap::new();
+        pending.insert(
+            (mesh, key),
+            pending_entry(&device, &manager, mesh, key, "despawn"),
+        );
+
+        // Entity no longer in the living key set (despawned).
+        retry_pending_for_lifecycle(&mut manager, &mut pending, &[]);
+        assert!(pending.is_empty());
+        assert!(
+            !manager
+                .get_ref(mesh)
+                .unwrap()
+                .model_buffers
+                .contains_key(&key)
+        );
+        assert!(
+            !manager
+                .get_ref(mesh)
+                .unwrap()
+                .model_bind_groups
+                .contains_key(&key)
+        );
+    }
+
+    /// 4. Replacing an entity's mesh removes the old pending upload but preserves
+    /// the new valid one, eventually applying it once the asset becomes unique.
+    #[test]
+    fn mesh_swap_drops_old_pending_keeps_new() {
+        let (device, mut manager, mesh_a) = lifecycle_manager();
+        let mesh_b = manager.insert("lifecycle-b".to_string(), lifecycle_mesh_for_test(&device));
+        let key_a = (mesh_a.id(), 13);
+        let key_b = (mesh_b.id(), 13);
+        let mut pending: PendingMap = HashMap::new();
+        pending.insert(
+            (mesh_a, key_a),
+            pending_entry(&device, &manager, mesh_a, key_a, "a"),
+        );
+        // Hold an extra Arc so mesh_b's pending entry cannot be applied yet.
+        let shared_b = manager.get(mesh_b).unwrap();
+        pending.insert(
+            (mesh_b, key_b),
+            pending_entry(&device, &manager, mesh_b, key_b, "b"),
+        );
+
+        // Entity now references mesh_b only.
+        retry_pending_for_lifecycle(&mut manager, &mut pending, &[key_b]);
+        assert!(!pending.contains_key(&(mesh_a, key_a)));
+        assert!(pending.contains_key(&(mesh_b, key_b)));
+        // The old pending entry produced no GPU objects on mesh_a.
+        assert!(
+            !manager
+                .get_ref(mesh_a)
+                .unwrap()
+                .model_buffers
+                .contains_key(&key_a)
+        );
+        assert!(
+            !manager
+                .get_ref(mesh_a)
+                .unwrap()
+                .model_bind_groups
+                .contains_key(&key_a)
+        );
+
+        // Drop the extra Arc; next retry applies mesh_b's pending upload.
+        drop(shared_b);
+        retry_pending_for_lifecycle(&mut manager, &mut pending, &[key_b]);
+        assert!(pending.is_empty());
+        let mesh_b_ref = manager.get_ref(mesh_b).unwrap();
+        assert!(mesh_b_ref.model_buffers.contains_key(&key_b));
+        assert!(mesh_b_ref.model_bind_groups.contains_key(&key_b));
+    }
+
+    /// 5. Removing a mesh asset discards its pending upload so the GPU buffer and
+    /// bind group are dropped (the map no longer retains them) rather than leaked.
+    #[test]
+    fn removed_mesh_asset_discards_pending_upload() {
+        let (device, mut manager, mesh) = lifecycle_manager();
+        let key = (mesh.id(), 15);
+        let mut pending: PendingMap = HashMap::new();
+        pending.insert(
+            (mesh, key),
+            pending_entry(&device, &manager, mesh, key, "removed"),
+        );
+        assert_eq!(pending.len(), 1);
+
+        // Drop the mesh asset, then retry: entry is discarded even if key is "live".
+        manager.remove(mesh);
+        retry_pending_for_lifecycle(&mut manager, &mut pending, &[key]);
+        // The pending map no longer owns the buffer/bind group: they are dropped.
+        assert!(pending.is_empty());
+        assert!(manager.get_ref(mesh).is_none());
+    }
+
+    /// 6. Entity index/generation reuse does not let an old pending upload attach
+    /// to a new entity (full `to_bits()` key includes generation).
+    #[test]
+    fn generation_reuse_does_not_attach_old_pending() {
+        let (device, mut manager, mesh) = lifecycle_manager();
+        let material = Handle::<MaterialAsset>::default();
+        let mut world = World::new();
+        let old = world.spawn((Renderable { mesh, material },)).id();
+        let old_key = (mesh.id(), old.to_bits());
+        let mut pending: PendingMap = HashMap::new();
+        pending.insert(
+            (mesh, old_key),
+            pending_entry(&device, &manager, mesh, old_key, "gen"),
+        );
+
+        world.despawn(old);
+        let new = world.spawn((Renderable { mesh, material },)).id();
+        assert_eq!(old.index(), new.index());
+        assert_ne!(old.to_bits(), new.to_bits());
+        let new_key = (mesh.id(), new.to_bits());
+
+        // Only the new entity's key is live; old pending must be dropped.
+        retry_pending_for_lifecycle(&mut manager, &mut pending, &[new_key]);
+        assert!(pending.is_empty());
+        assert!(
+            !manager
+                .get_ref(mesh)
+                .unwrap()
+                .model_buffers
+                .contains_key(&old_key)
+        );
+    }
+
+    /// 7. Preview sentinel `(mesh_id, 0)` pending upload is preserved while the mesh
+    /// asset is shared, even with no living entities, and applied once it is unique.
+    #[test]
+    fn preview_sentinel_pending_is_preserved() {
+        let (device, mut manager, mesh) = lifecycle_manager();
+        let sentinel = (mesh.id(), 0);
+        let mut pending: PendingMap = HashMap::new();
+        // Hold an extra Arc so the sentinel cannot be applied on the first retry.
+        let shared = manager.get(mesh).unwrap();
+        pending.insert(
+            (mesh, sentinel),
+            pending_entry(&device, &manager, mesh, sentinel, "sentinel"),
+        );
+
+        // No living entities, but the sentinel survives (kept pending while shared).
+        retry_pending_for_lifecycle(&mut manager, &mut pending, &[]);
+        assert_eq!(pending.len(), 1, "sentinel must stay pending while shared");
+        assert!(
+            !manager
+                .get_ref(mesh)
+                .unwrap()
+                .model_buffers
+                .contains_key(&sentinel)
+        );
+
+        // Drop the extra Arc; next retry applies the sentinel.
+        drop(shared);
+        retry_pending_for_lifecycle(&mut manager, &mut pending, &[]);
+        assert!(pending.is_empty());
+        let mesh_ref = manager.get_ref(mesh).unwrap();
+        assert!(mesh_ref.model_buffers.contains_key(&sentinel));
+        assert!(mesh_ref.model_bind_groups.contains_key(&sentinel));
     }
 
     /// Frustum culling integration tests.
@@ -1168,6 +1730,379 @@ mod visual_tests {
             );
         }
     }
+
+    #[test]
+    fn cleanup_removes_despawned_entity_resources() {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::LowPower,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .unwrap();
+        let (device, _queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).unwrap();
+
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+
+        let mesh = MeshAsset {
+            vertex_buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("vb"),
+                size: 64,
+                usage: wgpu::BufferUsages::VERTEX,
+                mapped_at_creation: false,
+            }),
+            index_buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("ib"),
+                size: 64,
+                usage: wgpu::BufferUsages::INDEX,
+                mapped_at_creation: false,
+            }),
+            index_count: 0,
+            vertex_count: 0,
+            index_format: wgpu::IndexFormat::Uint16,
+            bounds: crate::gltf_importer::MeshBounds {
+                min: [0.0; 3],
+                max: [0.0; 3],
+            },
+            model_layout: layout,
+            model_buffers: HashMap::from([
+                (
+                    (100, 1),
+                    device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("model-a"),
+                        size: 64,
+                        usage: wgpu::BufferUsages::UNIFORM,
+                        mapped_at_creation: false,
+                    }),
+                ),
+                (
+                    (100, 2),
+                    device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("model-b"),
+                        size: 64,
+                        usage: wgpu::BufferUsages::UNIFORM,
+                        mapped_at_creation: false,
+                    }),
+                ),
+            ]),
+            model_bind_groups: HashMap::new(),
+        };
+
+        let mut manager = AssetManager::<MeshAsset>::default();
+        let handle = manager.insert("mesh-7".to_string(), mesh);
+
+        // Entity 1 is active, entity 2 is despawned.
+        let removed = cleanup_stale_model_resources(&mut manager, &[(100, 1)]);
+        assert_eq!(removed, 1);
+
+        let mesh_ref = manager.get_ref(handle).unwrap();
+        assert!(mesh_ref.model_buffers.contains_key(&(100, 1)));
+        assert!(!mesh_ref.model_buffers.contains_key(&(100, 2)));
+    }
+
+    #[test]
+    fn cleanup_preserves_active_resources() {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::LowPower,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .unwrap();
+        let (device, _queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).unwrap();
+
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+
+        let mesh = MeshAsset {
+            vertex_buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("vb"),
+                size: 64,
+                usage: wgpu::BufferUsages::VERTEX,
+                mapped_at_creation: false,
+            }),
+            index_buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("ib"),
+                size: 64,
+                usage: wgpu::BufferUsages::INDEX,
+                mapped_at_creation: false,
+            }),
+            index_count: 0,
+            vertex_count: 0,
+            index_format: wgpu::IndexFormat::Uint16,
+            bounds: crate::gltf_importer::MeshBounds {
+                min: [0.0; 3],
+                max: [0.0; 3],
+            },
+            model_layout: layout,
+            model_buffers: HashMap::from([(
+                (200, 5),
+                device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("model-c"),
+                    size: 64,
+                    usage: wgpu::BufferUsages::UNIFORM,
+                    mapped_at_creation: false,
+                }),
+            )]),
+            model_bind_groups: HashMap::new(),
+        };
+
+        let mut manager = AssetManager::<MeshAsset>::default();
+        let handle = manager.insert("mesh-8".to_string(), mesh);
+
+        // All entities are active — nothing removed.
+        let removed = cleanup_stale_model_resources(&mut manager, &[(200, 5), (200, 6)]);
+        assert_eq!(removed, 0);
+
+        let mesh_ref = manager.get_ref(handle).unwrap();
+        assert!(mesh_ref.model_buffers.contains_key(&(200, 5)));
+    }
+
+    #[test]
+    fn cleanup_mass_despawn_removes_all() {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::LowPower,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .unwrap();
+        let (device, _queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).unwrap();
+
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+
+        let mesh = MeshAsset {
+            vertex_buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("vb"),
+                size: 64,
+                usage: wgpu::BufferUsages::VERTEX,
+                mapped_at_creation: false,
+            }),
+            index_buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("ib"),
+                size: 64,
+                usage: wgpu::BufferUsages::INDEX,
+                mapped_at_creation: false,
+            }),
+            index_count: 0,
+            vertex_count: 0,
+            index_format: wgpu::IndexFormat::Uint16,
+            bounds: crate::gltf_importer::MeshBounds {
+                min: [0.0; 3],
+                max: [0.0; 3],
+            },
+            model_layout: layout,
+            model_buffers: HashMap::from([
+                (
+                    (300, 1),
+                    device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("model-d"),
+                        size: 64,
+                        usage: wgpu::BufferUsages::UNIFORM,
+                        mapped_at_creation: false,
+                    }),
+                ),
+                (
+                    (300, 2),
+                    device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("model-e"),
+                        size: 64,
+                        usage: wgpu::BufferUsages::UNIFORM,
+                        mapped_at_creation: false,
+                    }),
+                ),
+                (
+                    (300, 3),
+                    device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("model-f"),
+                        size: 64,
+                        usage: wgpu::BufferUsages::UNIFORM,
+                        mapped_at_creation: false,
+                    }),
+                ),
+            ]),
+            model_bind_groups: HashMap::new(),
+        };
+
+        let mut manager = AssetManager::<MeshAsset>::default();
+        let handle = manager.insert("mesh-9".to_string(), mesh);
+
+        // No active keys — all removed.
+        let removed = cleanup_stale_model_resources(&mut manager, &[]);
+        assert_eq!(removed, 3);
+
+        let mesh_ref = manager.get_ref(handle).unwrap();
+        assert!(mesh_ref.model_buffers.is_empty());
+    }
+
+    #[test]
+    fn cleanup_no_stale_entries_is_noop() {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::LowPower,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .unwrap();
+        let (device, _queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).unwrap();
+
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+
+        let mesh = MeshAsset {
+            vertex_buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("vb"),
+                size: 64,
+                usage: wgpu::BufferUsages::VERTEX,
+                mapped_at_creation: false,
+            }),
+            index_buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("ib"),
+                size: 64,
+                usage: wgpu::BufferUsages::INDEX,
+                mapped_at_creation: false,
+            }),
+            index_count: 0,
+            vertex_count: 0,
+            index_format: wgpu::IndexFormat::Uint16,
+            bounds: crate::gltf_importer::MeshBounds {
+                min: [0.0; 3],
+                max: [0.0; 3],
+            },
+            model_layout: layout,
+            model_buffers: HashMap::new(),
+            model_bind_groups: HashMap::new(),
+        };
+
+        let mut manager = AssetManager::<MeshAsset>::default();
+        let handle = manager.insert("mesh-10".to_string(), mesh);
+
+        let removed = cleanup_stale_model_resources(&mut manager, &[(400, 1)]);
+        assert_eq!(removed, 0);
+
+        let mesh_ref = manager.get_ref(handle).unwrap();
+        assert!(mesh_ref.model_buffers.is_empty());
+    }
+
+    #[test]
+    fn cleanup_preserves_preview_sentinel_when_no_entities_are_alive() {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::LowPower,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .unwrap();
+        let (device, _queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).unwrap();
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let mesh = MeshAsset {
+            vertex_buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("vb"),
+                size: 64,
+                usage: wgpu::BufferUsages::VERTEX,
+                mapped_at_creation: false,
+            }),
+            index_buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("ib"),
+                size: 64,
+                usage: wgpu::BufferUsages::INDEX,
+                mapped_at_creation: false,
+            }),
+            index_count: 0,
+            vertex_count: 0,
+            index_format: wgpu::IndexFormat::Uint16,
+            bounds: crate::gltf_importer::MeshBounds {
+                min: [0.0; 3],
+                max: [0.0; 3],
+            },
+            model_layout: layout,
+            model_buffers: HashMap::from([(
+                (500, 0),
+                device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("preview"),
+                    size: 64,
+                    usage: wgpu::BufferUsages::UNIFORM,
+                    mapped_at_creation: false,
+                }),
+            )]),
+            model_bind_groups: HashMap::new(),
+        };
+        let mut manager = AssetManager::<MeshAsset>::default();
+        let handle = manager.insert("mesh-preview".to_string(), mesh);
+
+        let removed = cleanup_stale_model_resources(&mut manager, &[]);
+        assert_eq!(removed, 0);
+        assert!(
+            manager
+                .get_ref(handle)
+                .unwrap()
+                .model_buffers
+                .contains_key(&(500, 0))
+        );
+    }
 }
 
 #[derive(Resource)]
@@ -1253,7 +2188,110 @@ pub struct Renderer {
     pub frame_instanced_objects: u64,
     pub frame_visible: u32,
     pub gpu_pass_timings: Option<crate::performance::GpuPassTimings>,
+    /// Model GPU objects created while `Arc<MeshAsset>` was shared. Keyed by
+    /// `(mesh_handle, ModelKey)` so at most one pending upload exists per resource.
+    /// Reconciled against living entity keys and retried by `process_gpu_cleanup`.
+    pub(crate) pending_model_uploads:
+        HashMap<(Handle<MeshAsset>, ModelKey), (wgpu::Buffer, wgpu::BindGroup)>,
     pub _shader_variant: PhantomData<ShaderVariant>,
+}
+
+/// Remove per-entity GPU resources (model buffers / bind groups) whose key is no longer
+/// present in `active_keys`. Returns the number of removed keys.
+pub(crate) fn cleanup_stale_model_resources(
+    mesh_assets: &mut AssetManager<MeshAsset>,
+    active_keys: &[(u64, u64)],
+) -> usize {
+    let active: HashSet<(u64, u64)> = HashSet::from_iter(active_keys.iter().copied());
+
+    let mut removals: Vec<(Handle<MeshAsset>, Vec<ModelKey>)> = Vec::new();
+    for (handle, mesh) in mesh_assets.iter() {
+        let stale: Vec<(u64, u64)> = mesh
+            .model_buffers
+            .keys()
+            .copied()
+            // key.1 == 0 is the non-entity preview sentinel used by render_preview_mesh.
+            // No living Entity encodes to 0, so it must not be treated as despawned.
+            .filter(|key| key.1 != 0 && !active.contains(key))
+            .collect();
+        if !stale.is_empty() {
+            removals.push((*handle, stale));
+        }
+    }
+
+    let mut removed = 0;
+    for (mesh_handle, stale) in removals {
+        let Some(mesh_mut) = mesh_assets.get_mut(mesh_handle) else {
+            continue;
+        };
+        for key in stale {
+            mesh_mut.model_buffers.remove(&key);
+            mesh_mut.model_bind_groups.remove(&key);
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// Reconcile a pending-upload map against the living renderable key set and apply
+/// any entry whose mesh asset is now uniquely mutable. This is the single source of
+/// truth for pending-upload lifecycle; both `Renderer::retry_pending_model_uploads`
+/// and the lifecycle tests call it so the tested algorithm is the one used at runtime.
+///
+/// A pending entry is kept only if its `(mesh_id, entity_bits)` is still live (or is
+/// the preview sentinel `entity_bits == 0`) AND the mesh asset still exists. Entries
+/// that fail either check are dropped (their buffer + bind group are freed together).
+/// While the asset is still shared (`Arc::get_mut` returns `None`) the single entry is
+/// re-queued for a later frame instead of being duplicated or discarded.
+pub(crate) fn reconcile_pending_model_uploads(
+    mesh_assets: &mut AssetManager<MeshAsset>,
+    pending: &mut HashMap<(Handle<MeshAsset>, ModelKey), (wgpu::Buffer, wgpu::BindGroup)>,
+    active_keys: &[(u64, u64)],
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let active: HashSet<(u64, u64)> = HashSet::from_iter(active_keys.iter().copied());
+    let drained: Vec<_> = pending.drain().collect();
+    for ((mesh_handle, key), (buffer, bind_group)) in drained {
+        // Drop pending uploads for unloaded meshes, despawned entities, or entities
+        // that switched to another mesh. The sentinel (key.1 == 0) is always kept.
+        let still_relevant = key.1 == 0 || active.contains(&key);
+        if !still_relevant || mesh_assets.get_ref(mesh_handle).is_none() {
+            continue;
+        }
+        let Some(mesh_mut) = mesh_assets.get_mut(mesh_handle) else {
+            // Asset still shared; keep the single pending entry for a later frame.
+            pending.insert((mesh_handle, key), (buffer, bind_group));
+            continue;
+        };
+        mesh_mut.model_buffers.insert(key, buffer);
+        mesh_mut.model_bind_groups.insert(key, bind_group);
+    }
+}
+
+/// Check whether `(mesh_handle, key)` is already pending; if not, invoke `create_fn`
+/// to produce the GPU resources and insert them. Returns `true` when the closure was
+/// invoked and a new entry was queued; `false` when the key was already pending and
+/// the closure was NOT called (no GPU allocation).
+///
+/// This is the single allocation-guard used by `sync_mesh_transform` at runtime and
+/// by the deduplication test, ensuring the tested path is the one used in production.
+pub(crate) fn create_and_queue_pending_upload<F>(
+    pending: &mut HashMap<(Handle<MeshAsset>, ModelKey), (wgpu::Buffer, wgpu::BindGroup)>,
+    mesh_handle: Handle<MeshAsset>,
+    key: ModelKey,
+    create_fn: F,
+) -> bool
+where
+    F: FnOnce() -> (wgpu::Buffer, wgpu::BindGroup),
+{
+    if pending.contains_key(&(mesh_handle, key)) {
+        return false;
+    }
+    let (buffer, bind_group) = create_fn();
+    pending.insert((mesh_handle, key), (buffer, bind_group));
+    true
 }
 
 impl Renderer {
@@ -2224,6 +3262,7 @@ impl Renderer {
             frame_instanced_objects: 0,
             frame_visible: 0,
             gpu_pass_timings: None,
+            pending_model_uploads: HashMap::new(),
             _shader_variant: PhantomData,
         };
         // Initialize render targets (depth, MSAA, scene texture for post-processing)
@@ -2456,35 +3495,72 @@ impl Renderer {
         transform: Mat4,
     ) {
         let key = (mesh_handle.id(), key_id);
+        // Already deferred for this exact resource? Do not allocate a duplicate
+        // buffer/bind group every frame while the asset stays shared.
+        if self.pending_model_uploads.contains_key(&(mesh_handle, key)) {
+            return;
+        }
         let needs_model_buffer = self
             .mesh_assets
             .get_ref(mesh_handle)
             .is_some_and(|mesh| !mesh.model_buffers.contains_key(&key));
         if needs_model_buffer {
-            let Some(model_layout) = self
-                .mesh_assets
-                .get_ref(mesh_handle)
-                .map(|mesh| &mesh.model_layout)
-            else {
-                return;
-            };
-            let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("model"),
-                size: std::mem::size_of::<ModelUniform>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("model bind group"),
-                layout: model_layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: buffer.as_entire_binding(),
-                }],
-            });
             if let Some(mesh_mut) = self.mesh_assets.get_mut(mesh_handle) {
+                // Asset uniquely owned: create GPU resources and insert directly.
+                let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("model"),
+                    size: std::mem::size_of::<ModelUniform>() as u64,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("model bind group"),
+                    layout: &mesh_mut.model_layout,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: buffer.as_entire_binding(),
+                    }],
+                });
                 mesh_mut.model_buffers.insert(key, buffer);
                 mesh_mut.model_bind_groups.insert(key, bind_group);
+            } else {
+                // Another subsystem temporarily holds an `Arc<MeshAsset>` clone, so
+                // `Arc::get_mut` cannot hand out `&mut`. Keep ownership in the renderer
+                // (at most one entry per key) and retry on a later frame instead of
+                // dropping or duplicating the new GPU objects.
+                //
+                // `create_and_queue_pending_upload` is the single allocation guard:
+                // the closure that creates GPU resources is invoked only when the key
+                // is not already pending, preventing duplicate allocations.
+                let device = &self.device;
+                let mesh_assets = &self.mesh_assets;
+                create_and_queue_pending_upload(
+                    &mut self.pending_model_uploads,
+                    mesh_handle,
+                    key,
+                    || {
+                        let model_layout = &mesh_assets
+                            .get_ref(mesh_handle)
+                            .expect("mesh asset exists for pending upload")
+                            .model_layout;
+                        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                            label: Some("model"),
+                            size: std::mem::size_of::<ModelUniform>() as u64,
+                            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                            mapped_at_creation: false,
+                        });
+                        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("model bind group"),
+                            layout: model_layout,
+                            entries: &[wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: buffer.as_entire_binding(),
+                            }],
+                        });
+                        (buffer, bind_group)
+                    },
+                );
+                return;
             }
         }
         let model = ModelUniform {
@@ -2507,6 +3583,32 @@ impl Renderer {
     /// Sync the per-instance model buffer for one renderable.
     fn sync_model_buffer(&mut self, entity: Entity, renderable: Renderable, transform: Mat4) {
         self.sync_mesh_transform(renderable.mesh, entity.to_bits(), transform);
+    }
+
+    /// Drop per-entity GPU resources whose entity no longer has a `Renderable`.
+    /// `active_keys` must come from living ECS entities, not the visible-frame snapshot.
+    /// The preview sentinel key `(mesh_id, 0)` is preserved.
+    /// Also reconciles and retries deferred model uploads: pending entries for
+    /// despawned entities, swapped meshes, or unloaded mesh assets are dropped;
+    /// valid entries are inserted once the asset becomes uniquely mutable.
+    pub fn process_gpu_cleanup(&mut self, active_keys: &[(u64, u64)]) {
+        self.retry_pending_model_uploads(active_keys);
+        cleanup_stale_model_resources(&mut self.mesh_assets, active_keys);
+    }
+
+    /// Reconcile `pending_model_uploads` against the living renderable key set and
+    /// apply any entry whose mesh asset is now uniquely mutable.
+    ///
+    /// A pending entry is kept only if its `(mesh_id, entity_bits)` is still live
+    /// (or is the preview sentinel `entity_bits == 0`) AND the mesh asset exists.
+    /// Because the key embeds the full `entity.to_bits()` (index + generation), a
+    /// reused index with a bumped generation never matches an old pending entry.
+    fn retry_pending_model_uploads(&mut self, active_keys: &[(u64, u64)]) {
+        reconcile_pending_model_uploads(
+            &mut self.mesh_assets,
+            &mut self.pending_model_uploads,
+            active_keys,
+        );
     }
 
     /// Dynamically upload or reuse a mesh asset on the GPU based on revision.
